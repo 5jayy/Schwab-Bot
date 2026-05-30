@@ -9,6 +9,12 @@ from strategy import get_signal, find_best_covered_call, TRADE_STOCKS
 from telegram import send_alert
 
 load_dotenv()
+def handle_shutdown(signum, frame):
+    print("Shutdown signal received — bot stopping cleanly.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 BASE_URL        = "https://api.schwabapi.com/trader/v1"
 TARGET_ETFS     = [e.strip() for e in os.getenv("TARGET_ETFS", "SCHD,JEPI").split(",")]
