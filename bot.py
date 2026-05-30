@@ -1,6 +1,8 @@
 import os
+import sys
 import json
 import time
+import signal
 import schedule
 import requests
 from dotenv import load_dotenv
@@ -9,6 +11,7 @@ from strategy import get_signal, find_best_covered_call, TRADE_STOCKS
 from telegram import send_alert
 
 load_dotenv()
+
 def handle_shutdown(signum, frame):
     print("Shutdown signal received — bot stopping cleanly.")
     sys.exit(0)
