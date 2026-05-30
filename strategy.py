@@ -7,20 +7,21 @@ load_dotenv()
 
 BASE_URL = "https://api.schwabapi.com/marketdata/v1"
 
-# Tiered stock lists based on account value
-STOCKS_TIER_1 = ["SOFI", "F", "BAC", "VALE", "PLUG"]      # under $5k
-STOCKS_TIER_2 = ["AAPL", "GOOGL", "AMD", "PYPL", "DIS"]   # $5k-$20k
-STOCKS_TIER_3 = ["AMZN", "NVDA", "MSFT", "META", "TSLA"]  # $20k+
+# Tiered stock lists — unlocks based on total portfolio value
+STOCKS_TIER_1 = ["SOFI", "F", "BAC", "VALE", "PLUG"]      # always available
+STOCKS_TIER_2 = ["AAPL", "GOOGL", "AMD", "PYPL", "DIS"]   # unlocks at $5k portfolio
+STOCKS_TIER_3 = ["AMZN", "NVDA", "MSFT", "META", "TSLA"]  # unlocks at $20k portfolio
 
-# Position sizing tiers
-def get_position_size(account_value: float) -> float:
-    if account_value < 5000:
-        return account_value * 0.05   # 5% per trade
-    elif account_value < 20000:
-        return account_value * 0.10   # 10% per trade
+# Position size based on CASH balance — so $500 cash = $150 per trade
+def get_position_size(cash: float) -> float:
+    if cash < 1000:
+        return cash * 0.30    # 30% of cash — e.g. $500 cash = $150 per trade (3-4 trades)
+    elif cash < 5000:
+        return cash * 0.25    # 25% of cash — e.g. $2000 cash = $500 per trade
     else:
-        return account_value * 0.15   # 15% per trade
+        return cash * 0.20    # 20% of cash — e.g. $5000 cash = $1000 per trade
 
+# Stock tier unlocks based on TOTAL portfolio value (ETFs count)
 def get_trade_stocks(account_value: float) -> list:
     if account_value < 5000:
         return STOCKS_TIER_1
@@ -182,10 +183,3 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
     except Exception as e:
         print(f"Option chain error for {symbol}: {e}")
         return None
-
-
-if __name__ == "__main__":
-    print("Tier 1 signals (under $5k):")
-    for sym in STOCKS_TIER_1:
-        sig = get_signal(sym)
-        print(f"  {sym}: {sig['signal']} — {sig['reason']}")

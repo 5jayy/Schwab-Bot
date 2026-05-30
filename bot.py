@@ -124,7 +124,7 @@ def place_equity_order(encrypted: str, symbol: str, quantity: int, instruction: 
 
 def run_stock_strategy(encrypted: str, positions: list, cash: float, account_value: float) -> float:
     trade_stocks  = get_trade_stocks(account_value)
-    position_size = get_position_size(account_value)
+    position_size = get_position_size(cash)
 
     tier = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
     print(f"\n-- Stock signals [{tier}] | Position size: ${position_size:,.2f} --")
