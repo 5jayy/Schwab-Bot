@@ -5,26 +5,47 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL    = "https://api.schwabapi.com/marketdata/v1"
-TRADE_STOCKS = [s.strip() for s in os.getenv("TRADE_STOCKS", "AAPL,AMZN,MSFT,GOOGL,NVDA").split(",")]
+BASE_URL = "https://api.schwabapi.com/marketdata/v1"
 
-# ── Market data ─────────────────────────────────────────────────────────────
+# Tiered stock lists based on account value
+STOCKS_TIER_1 = ["SOFI", "F", "BAC", "VALE", "PLUG"]      # under $5k
+STOCKS_TIER_2 = ["AAPL", "GOOGL", "AMD", "PYPL", "DIS"]   # $5k-$20k
+STOCKS_TIER_3 = ["AMZN", "NVDA", "MSFT", "META", "TSLA"]  # $20k+
+
+# Position sizing tiers
+def get_position_size(account_value: float) -> float:
+    if account_value < 5000:
+        return account_value * 0.05   # 5% per trade
+    elif account_value < 20000:
+        return account_value * 0.10   # 10% per trade
+    else:
+        return account_value * 0.15   # 15% per trade
+
+def get_trade_stocks(account_value: float) -> list:
+    if account_value < 5000:
+        return STOCKS_TIER_1
+    elif account_value < 20000:
+        return STOCKS_TIER_1 + STOCKS_TIER_2
+    else:
+        return STOCKS_TIER_1 + STOCKS_TIER_2 + STOCKS_TIER_3
+
+
+# ── Market data ──────────────────────────────────────────────────────────────
 
 def headers():
     return {"Authorization": f"Bearer {get_valid_token()}"}
 
 
-def get_price_history(symbol: str, period: int = 1, frequency: int = 5) -> list:
-    """Get recent price candles for a symbol. Returns list of close prices."""
+def get_price_history(symbol: str, period: int = 5, frequency: int = 5) -> list:
     resp = requests.get(
         f"{BASE_URL}/pricehistory",
         headers=headers(),
         params={
-            "symbol":          symbol,
-            "periodType":      "day",
-            "period":          period,
-            "frequencyType":   "minute",
-            "frequency":       frequency,
+            "symbol":        symbol,
+            "periodType":    "day",
+            "period":        period,
+            "frequencyType": "minute",
+            "frequency":     frequency,
             "needExtendedHoursData": False,
         }
     )
@@ -34,7 +55,6 @@ def get_price_history(symbol: str, period: int = 1, frequency: int = 5) -> list:
 
 
 def get_quote(symbol: str) -> dict:
-    """Get current quote for a symbol."""
     resp = requests.get(
         f"{BASE_URL}/quotes",
         headers=headers(),
@@ -45,7 +65,6 @@ def get_quote(symbol: str) -> dict:
 
 
 def get_option_chain(symbol: str, strike_count: int = 5) -> dict:
-    """Get option chain for a symbol."""
     resp = requests.get(
         f"{BASE_URL}/chains",
         headers=headers(),
@@ -64,7 +83,6 @@ def get_option_chain(symbol: str, strike_count: int = 5) -> dict:
 # ── Technical indicators ─────────────────────────────────────────────────────
 
 def ema(prices: list, period: int) -> float:
-    """Calculate EMA for a list of prices."""
     if len(prices) < period:
         return None
     k = 2 / (period + 1)
@@ -75,7 +93,6 @@ def ema(prices: list, period: int) -> float:
 
 
 def rsi(prices: list, period: int = 14) -> float:
-    """Calculate RSI for a list of prices."""
     if len(prices) < period + 1:
         return None
     gains, losses = [], []
@@ -94,11 +111,6 @@ def rsi(prices: list, period: int = 14) -> float:
 # ── Signal generation ────────────────────────────────────────────────────────
 
 def get_signal(symbol: str) -> dict:
-    """
-    Returns a trading signal for a symbol.
-    Signal: BUY, SELL, or HOLD
-    Uses EMA9 > EMA21 for trend + RSI for entry/exit timing.
-    """
     try:
         prices = get_price_history(symbol, period=5, frequency=5)
         if len(prices) < 25:
@@ -111,11 +123,8 @@ def get_signal(symbol: str) -> dict:
 
         reason = f"EMA9={ema9:.2f} EMA21={ema21:.2f} RSI={rsi14:.1f} Price={price:.2f}"
 
-        # BUY: uptrend (EMA9 > EMA21) and RSI not overbought
         if ema9 > ema21 and rsi14 < 65:
             return {"symbol": symbol, "signal": "BUY", "reason": reason, "price": price}
-
-        # SELL: downtrend (EMA9 < EMA21) or RSI overbought
         if ema9 < ema21 or rsi14 > 75:
             return {"symbol": symbol, "signal": "SELL", "reason": reason, "price": price}
 
@@ -125,17 +134,11 @@ def get_signal(symbol: str) -> dict:
         return {"symbol": symbol, "signal": "HOLD", "reason": f"Error: {e}"}
 
 
-# ── Options: best covered call to sell ──────────────────────────────────────
+# ── Covered call finder ──────────────────────────────────────────────────────
 
 def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
-    """
-    Find the best covered call to sell on a stock we own.
-    Looks for OTM calls expiring in 14-30 days with decent premium.
-    Returns None if no good option found.
-    """
     if shares_owned < 100:
-        return None  # Need at least 100 shares for 1 contract
-
+        return None
     try:
         chain = get_option_chain(symbol)
         underlying_price = chain.get("underlyingPrice", 0)
@@ -143,38 +146,27 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
 
         best = None
         for expiry, strikes in call_map.items():
-            # Parse days to expiration from key like "2024-01-19:30"
             try:
                 dte = int(expiry.split(":")[1])
             except Exception:
                 continue
-
-            # Only look at 14-30 DTE
             if not (14 <= dte <= 30):
                 continue
-
             for strike_str, options in strikes.items():
                 strike = float(strike_str)
-                # Only OTM calls (strike > current price by 2-5%)
                 if not (underlying_price * 1.02 <= strike <= underlying_price * 1.06):
                     continue
-
                 opt = options[0] if options else None
                 if not opt:
                     continue
-
                 bid     = opt.get("bid", 0)
                 ask     = opt.get("ask", 0)
                 premium = (bid + ask) / 2
                 volume  = opt.get("totalVolume", 0)
-
-                # Minimum $0.50 premium and some volume
                 if premium < 0.50 or volume < 10:
                     continue
-
-                contracts = shares_owned // 100
+                contracts     = shares_owned // 100
                 total_premium = premium * 100 * contracts
-
                 if best is None or premium > best["premium"]:
                     best = {
                         "symbol":        symbol,
@@ -186,16 +178,14 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
                         "contracts":     contracts,
                         "description":   opt.get("description", ""),
                     }
-
         return best
-
     except Exception as e:
         print(f"Option chain error for {symbol}: {e}")
         return None
 
 
 if __name__ == "__main__":
-    print("Scanning signals for:", TRADE_STOCKS)
-    for sym in TRADE_STOCKS:
+    print("Tier 1 signals (under $5k):")
+    for sym in STOCKS_TIER_1:
         sig = get_signal(sym)
-        print(f"{sym}: {sig['signal']} — {sig['reason']}")
+        print(f"  {sym}: {sig['signal']} — {sig['reason']}")
