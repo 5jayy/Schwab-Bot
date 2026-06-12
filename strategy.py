@@ -7,21 +7,19 @@ load_dotenv()
 
 BASE_URL = "https://api.schwabapi.com/marketdata/v1"
 
-# Tiered stock lists — unlocks based on total portfolio value
-STOCKS_TIER_1 = ["SOFI", "F", "BAC", "VALE", "PLUG"]      # always available
-STOCKS_TIER_2 = ["AAPL", "GOOGL", "AMD", "PYPL", "DIS"]   # unlocks at $5k portfolio
-STOCKS_TIER_3 = ["AMZN", "NVDA", "MSFT", "META", "TSLA"]  # unlocks at $20k portfolio
+# Expanded stock lists by tier
+STOCKS_TIER_1 = ["SOFI", "F", "BAC", "VALE", "PLUG", "AAL", "RIOT", "MARA", "NIO", "PLTR"]
+STOCKS_TIER_2 = ["AAPL", "GOOGL", "AMD", "PYPL", "DIS", "INTC", "SNAP", "UBER", "SQ", "COIN"]
+STOCKS_TIER_3 = ["AMZN", "NVDA", "MSFT", "META", "TSLA", "NFLX", "CRM", "SHOP", "BABA", "SPY"]
 
-# Position size based on CASH balance — so $500 cash = $150 per trade
 def get_position_size(cash: float) -> float:
     if cash < 1000:
-        return cash * 0.30    # 30% of cash — e.g. $500 cash = $150 per trade (3-4 trades)
+        return cash * 0.30
     elif cash < 5000:
-        return cash * 0.25    # 25% of cash — e.g. $2000 cash = $500 per trade
+        return cash * 0.25
     else:
-        return cash * 0.20    # 20% of cash — e.g. $5000 cash = $1000 per trade
+        return cash * 0.20
 
-# Stock tier unlocks based on TOTAL portfolio value (ETFs count)
 def get_trade_stocks(account_value: float) -> list:
     if account_value < 5000:
         return STOCKS_TIER_1
@@ -109,8 +107,6 @@ def rsi(prices: list, period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
-# ── Signal generation ────────────────────────────────────────────────────────
-
 def get_signal(symbol: str) -> dict:
     try:
         prices = get_price_history(symbol, period=5, frequency=5)
@@ -135,8 +131,6 @@ def get_signal(symbol: str) -> dict:
         return {"symbol": symbol, "signal": "HOLD", "reason": f"Error: {e}"}
 
 
-# ── Covered call finder ──────────────────────────────────────────────────────
-
 def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
     if shares_owned < 100:
         return None
@@ -144,7 +138,6 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
         chain = get_option_chain(symbol)
         underlying_price = chain.get("underlyingPrice", 0)
         call_map = chain.get("callExpDateMap", {})
-
         best = None
         for expiry, strikes in call_map.items():
             try:
