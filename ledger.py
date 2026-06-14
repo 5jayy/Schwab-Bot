@@ -14,16 +14,36 @@ BOT_STOCKS = [
     "JOBY", "OPEN", "HOOD", "CLSK", "TLRY", "SIRI", "NOK", "SPCE"
 ]
 
+ETF_MIN_SWEEP = 50.0  # minimum profit before buying an ETF share
+
 
 def headers():
     return {"Authorization": f"Bearer {get_valid_token()}"}
 
 
 def load_ledger() -> dict:
+    default = {
+        "deposits":         0.0,
+        "trading_capital":  0.0,
+        "profit_bucket":    0.0,
+        "etf_bucket":       0.0,
+        "cash_bucket":      0.0,
+        "bot_bucket":       0.0,
+        "total_withdrawn":  0.0,
+        "total_etf_bought": 0.0,
+        "open_trades":      {},
+        "closed_trades":    [],
+        "last_known_cash":  0.0,
+        "last_synced":      ""
+    }
     if not os.path.exists(LEDGER_FILE):
-        return None
+        return default
     with open(LEDGER_FILE) as f:
-        return json.load(f)
+        data = json.load(f)
+    # Fill in any missing keys from default (safe for updates)
+    for key, val in default.items():
+        data.setdefault(key, val)
+    return data
 
 
 def save_ledger(ledger: dict):
@@ -33,42 +53,40 @@ def save_ledger(ledger: dict):
 
 def sync_ledger_from_schwab(encrypted: str) -> dict:
     """
-    Auto-syncs ledger with actual Schwab positions on every startup.
-    Picks up any positions already in account and registers them.
-    Never resets profit bucket or closed trades.
+    Runs on every startup and every strategy check.
+    Picks up any existing positions automatically.
+    Never wipes profit bucket, closed trades, or history.
+    Safe to run after every update.
     """
-    resp = requests.get(
-        f"https://api.schwabapi.com/trader/v1/accounts/{encrypted}?fields=positions",
-        headers=headers()
-    )
-    resp.raise_for_status()
-    account   = resp.json()
-    cash      = account["securitiesAccount"]["currentBalances"]["cashBalance"]
-    positions = account["securitiesAccount"].get("positions", [])
+    try:
+        resp = requests.get(
+            f"https://api.schwabapi.com/trader/v1/accounts/{encrypted}?fields=positions",
+            headers=headers(),
+            timeout=15
+        )
+        resp.raise_for_status()
+        account   = resp.json()
+        cash      = account["securitiesAccount"]["currentBalances"]["cashBalance"]
+        positions = account["securitiesAccount"].get("positions", [])
+    except Exception as e:
+        print(f"Ledger sync error: {e}")
+        return load_ledger()
 
-    existing = load_ledger() or {}
-
-    # Keep existing profit bucket and closed trades
-    profit_bucket    = existing.get("profit_bucket", 0.0)
-    closed_trades    = existing.get("closed_trades", [])
-    total_withdrawn  = existing.get("total_withdrawn", 0.0)
-    total_etf_bought = existing.get("total_etf_bought", 0.0)
-
-    # Rebuild open trades from actual Schwab positions
-    open_trades    = existing.get("open_trades", {})
-    bot_value      = 0.0
-    new_positions  = []
+    ledger      = load_ledger()
+    open_trades = ledger.get("open_trades", {})
+    bot_value   = 0.0
+    new_found   = []
 
     for p in positions:
         sym = p["instrument"]["symbol"]
         if sym not in BOT_STOCKS:
             continue
-        qty = p["longQuantity"]
-        avg = p["averagePrice"]
+        qty  = p["longQuantity"]
+        avg  = p["averagePrice"]
         cost = qty * avg
         bot_value += cost
 
-        # Only add if not already tracked
+        # Register position if not already tracked
         if sym not in open_trades:
             open_trades[sym] = {
                 "quantity":  qty,
@@ -76,46 +94,62 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
                 "cost":      cost,
                 "bought_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
-            new_positions.append(sym)
+            new_found.append(sym)
+        else:
+            # Update quantity in case partial fills or adjustments
+            open_trades[sym]["quantity"]  = qty
+            open_trades[sym]["buy_price"] = avg
+            open_trades[sym]["cost"]      = cost
 
-    # Trading capital = cash + all bot stock positions
+    # Remove positions from ledger that no longer exist in Schwab
+    symbols_in_schwab = {p["instrument"]["symbol"] for p in positions if p["instrument"]["symbol"] in BOT_STOCKS}
+    stale = [s for s in open_trades if s not in symbols_in_schwab]
+    for s in stale:
+        print(f"Removing stale position from ledger: {s}")
+        del open_trades[s]
+
     trading_capital = cash + bot_value
+    deposits        = max(ledger.get("deposits", 0.0), trading_capital)
 
-    # Deposits = max of existing deposits or current trading capital
-    deposits = max(existing.get("deposits", 0.0), trading_capital)
-
-    ledger = {
-        "deposits":         deposits,
-        "trading_capital":  trading_capital,
-        "profit_bucket":    profit_bucket,
-        "total_withdrawn":  total_withdrawn,
-        "total_etf_bought": total_etf_bought,
-        "open_trades":      open_trades,
-        "closed_trades":    closed_trades,
-        "last_known_cash":  cash,
-        "last_synced":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    }
-
+    ledger["open_trades"]     = open_trades
+    ledger["trading_capital"] = trading_capital
+    ledger["deposits"]        = deposits
+    ledger["last_known_cash"] = cash
+    ledger["last_synced"]     = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     save_ledger(ledger)
 
-    print(f"Ledger synced — Cash: ${cash:.2f} | Bot positions: ${bot_value:.2f} | Trading capital: ${trading_capital:.2f}")
-    if new_positions:
-        print(f"New positions registered: {new_positions}")
+    print(f"Ledger synced — Cash: ${cash:.2f} | Positions: ${bot_value:.2f} | Capital: ${trading_capital:.2f}")
+    if new_found:
+        print(f"New positions registered: {new_found}")
+    if stale:
+        print(f"Removed stale: {stale}")
 
     return ledger
 
 
 def get_profit_bucket() -> float:
-    return load_ledger().get("profit_bucket", 0.0) if load_ledger() else 0.0
+    return load_ledger().get("profit_bucket", 0.0)
+
+
+def get_etf_bucket() -> float:
+    return load_ledger().get("etf_bucket", 0.0)
+
+
+def get_cash_bucket() -> float:
+    return load_ledger().get("cash_bucket", 0.0)
+
+
+def get_bot_bucket() -> float:
+    return load_ledger().get("bot_bucket", 0.0)
 
 
 def get_trading_capital() -> float:
-    return load_ledger().get("trading_capital", 0.0) if load_ledger() else 0.0
+    return load_ledger().get("trading_capital", 0.0)
 
 
 def record_buy(symbol: str, quantity: int, price: float, cost: float):
-    ledger = load_ledger() or {}
-    ledger.setdefault("open_trades", {})[symbol] = {
+    ledger = load_ledger()
+    ledger["open_trades"][symbol] = {
         "quantity":  quantity,
         "buy_price": price,
         "cost":      cost,
@@ -124,15 +158,22 @@ def record_buy(symbol: str, quantity: int, price: float, cost: float):
     save_ledger(ledger)
 
 
-def record_sell(symbol: str, quantity: int, sell_price: float, proceeds: float) -> float:
-    ledger = load_ledger() or {}
+def record_sell_and_split(symbol: str, quantity: int, sell_price: float, proceeds: float,
+                           etf_pct: float, cash_pct: float, bot_pct: float) -> dict:
+    """
+    Records a sell, calculates profit, and immediately splits it 60/30/10.
+    Returns split breakdown.
+    """
+    ledger = load_ledger()
     profit = 0.0
-    open_trades = ledger.get("open_trades", {})
-    if symbol in open_trades:
-        trade  = open_trades[symbol]
+    cost   = 0.0
+
+    if symbol in ledger["open_trades"]:
+        trade  = ledger["open_trades"][symbol]
         cost   = trade["cost"]
         profit = proceeds - cost
-        ledger.setdefault("closed_trades", []).append({
+
+        ledger["closed_trades"].append({
             "symbol":     symbol,
             "quantity":   quantity,
             "buy_price":  trade["buy_price"],
@@ -142,24 +183,46 @@ def record_sell(symbol: str, quantity: int, sell_price: float, proceeds: float) 
             "profit":     profit,
             "closed_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         })
-        del open_trades[symbol]
-        if profit > 0:
-            ledger["profit_bucket"] = ledger.get("profit_bucket", 0.0) + profit
-        # Update trading capital
-        ledger["trading_capital"] = ledger.get("trading_capital", 0.0) - trade["cost"] + proceeds
-    ledger["open_trades"] = open_trades
+        del ledger["open_trades"][symbol]
+
+    # Split profit immediately on every sell
+    if profit > 0:
+        etf_cut  = profit * etf_pct
+        cash_cut = profit * cash_pct
+        bot_cut  = profit * bot_pct
+
+        ledger["profit_bucket"]    = ledger.get("profit_bucket", 0.0) + profit
+        ledger["etf_bucket"]       = ledger.get("etf_bucket", 0.0) + etf_cut
+        ledger["cash_bucket"]      = ledger.get("cash_bucket", 0.0) + cash_cut
+        ledger["bot_bucket"]       = ledger.get("bot_bucket", 0.0) + bot_cut
+        ledger["trading_capital"]  = ledger.get("trading_capital", 0.0) + bot_cut
+        ledger["total_withdrawn"]  = ledger.get("total_withdrawn", 0.0) + cash_cut
+    else:
+        etf_cut  = 0.0
+        cash_cut = 0.0
+        bot_cut  = 0.0
+
     save_ledger(ledger)
-    return profit
+
+    return {
+        "profit":   profit,
+        "cost":     cost,
+        "etf_cut":  etf_cut,
+        "cash_cut": cash_cut,
+        "bot_cut":  bot_cut,
+    }
 
 
-def deduct_profit_bucket(amount: float):
-    ledger = load_ledger() or {}
-    ledger["profit_bucket"] = max(ledger.get("profit_bucket", 0.0) - amount, 0.0)
+def deduct_etf_bucket(amount: float):
+    ledger = load_ledger()
+    ledger["etf_bucket"]       = max(ledger.get("etf_bucket", 0.0) - amount, 0.0)
+    ledger["total_etf_bought"] = ledger.get("total_etf_bought", 0.0) + amount
     save_ledger(ledger)
 
 
-def detect_deposit(cash: float) -> bool:
-    ledger = load_ledger() or {}
+def detect_deposit(cash: float) -> float:
+    """Returns deposit amount if detected, 0 otherwise."""
+    ledger = load_ledger()
     last   = ledger.get("last_known_cash", cash)
     if cash > last + 50:
         deposit = cash - last
@@ -167,7 +230,7 @@ def detect_deposit(cash: float) -> bool:
         ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
         ledger["last_known_cash"] = cash
         save_ledger(ledger)
-        return True
+        return deposit
     ledger["last_known_cash"] = cash
     save_ledger(ledger)
-    return False
+    return 0.0

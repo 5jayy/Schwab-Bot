@@ -7,13 +7,15 @@ import requests
 from dotenv import load_dotenv
 from auth import get_valid_token
 from scanner import scan_best_stocks, scan_best_etfs
-from strategy import find_best_covered_call, get_trade_stocks
+from strategy import find_best_covered_call, get_trade_stocks, get_signal
 from telegram import send_alert
 from ledger import (
-    sync_ledger_from_schwab,
-    record_buy, record_sell,
+    sync_ledger_from_schwab, load_ledger, save_ledger,
+    record_buy, record_sell_and_split,
     get_profit_bucket, get_trading_capital,
-    deduct_profit_bucket, detect_deposit
+    get_etf_bucket, get_cash_bucket, get_bot_bucket,
+    deduct_etf_bucket, detect_deposit,
+    BOT_STOCKS, ETF_MIN_SWEEP
 )
 
 load_dotenv()
@@ -26,7 +28,6 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 BASE_URL       = "https://api.schwabapi.com/trader/v1"
-ETF_THRESHOLD  = float(os.getenv("ETF_THRESHOLD", 1000))
 ETF_PCT        = float(os.getenv("ETF_PCT", 0.60))
 CASH_PCT       = float(os.getenv("CASH_PCT", 0.30))
 BOT_PCT        = float(os.getenv("BOT_PCT", 0.10))
@@ -104,51 +105,75 @@ def place_equity_order(encrypted: str, symbol: str, quantity: int, instruction: 
     return resp
 
 
+# ── Sell with immediate profit split ────────────────────────────────────────
+
+def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash: float) -> float:
+    try:
+        place_equity_order(encrypted, symbol, quantity, "SELL")
+        proceeds = quantity * price
+        split    = record_sell_and_split(symbol, quantity, price, proceeds, ETF_PCT, CASH_PCT, BOT_PCT)
+        cash    += proceeds
+        profit   = split["profit"]
+        label    = "PROFIT" if profit > 0 else "LOSS"
+
+        if profit > 0:
+            send_alert(
+                f"*Stock Sell — {label} 💰*\n"
+                f"Symbol: {symbol}\n"
+                f"Shares: {quantity}\n"
+                f"Price: ${price:.2f}\n"
+                f"Proceeds: ${proceeds:,.2f}\n"
+                f"Profit: +${profit:,.2f}\n\n"
+                f"*Split immediately:*\n"
+                f"→ ETF bucket: +${split['etf_cut']:,.2f} (60%)\n"
+                f"→ Your cash: +${split['cash_cut']:,.2f} (30%)\n"
+                f"→ Bot capital: +${split['bot_cut']:,.2f} (10%)\n\n"
+                f"ETF bucket total: ${get_etf_bucket():,.2f}\n"
+                f"All-time profit: ${get_profit_bucket():,.2f}"
+            )
+        else:
+            send_alert(
+                f"*Stock Sell — {label}*\n"
+                f"Symbol: {symbol}\n"
+                f"Shares: {quantity}\n"
+                f"Price: ${price:.2f}\n"
+                f"Proceeds: ${proceeds:,.2f}\n"
+                f"Loss: ${profit:,.2f}"
+            )
+        print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f}")
+    except Exception as e:
+        send_alert(f"*Sell error* {symbol}: {e}")
+    return cash
+
+
 # ── Stock strategy ───────────────────────────────────────────────────────────
 
 def run_stock_strategy(encrypted: str, positions: list, cash: float, account_value: float) -> float:
+    tier          = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
+    position_size = cash * 0.30
+    bought_this_run = set()
+
+    # Always check existing positions for sell signals regardless of cash
+    for position in positions:
+        sym = position["instrument"]["symbol"]
+        if sym not in BOT_STOCKS:
+            continue
+        sig = get_signal(sym)
+        if sig["signal"] == "SELL":
+            quantity = int(position.get("longQuantity", 0))
+            price    = sig.get("price", 0)
+            if quantity < 1:
+                continue
+            cash = execute_sell(encrypted, sym, quantity, price, cash)
+
+    # Only buy if we have enough cash
     if cash < 10:
-        print("Not enough cash to trade.")
+        print("Not enough cash to buy — monitoring positions only.")
         return cash
 
-    position_size   = cash * 0.30
-    bought_this_run = set()
-    tier = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
-
     top_stocks = scan_best_stocks(cash, top_n=5)
-
     if not top_stocks:
-        print("No buy signals — checking existing positions for sells.")
-        trade_stocks = get_trade_stocks(account_value)
-        for symbol in trade_stocks:
-            position = get_position_for(positions, symbol)
-            if not position:
-                continue
-            from strategy import get_signal
-            sig = get_signal(symbol)
-            if sig["signal"] == "SELL":
-                quantity = int(position.get("longQuantity", 0))
-                price    = sig.get("price", 0)
-                if quantity < 1:
-                    continue
-                try:
-                    place_equity_order(encrypted, symbol, quantity, "SELL")
-                    proceeds = quantity * price
-                    profit   = record_sell(symbol, quantity, price, proceeds)
-                    cash    += proceeds
-                    bucket   = get_profit_bucket()
-                    label    = "PROFIT" if profit > 0 else "LOSS"
-                    send_alert(
-                        f"*Stock Sell — {label}*\n"
-                        f"Symbol: {symbol}\n"
-                        f"Shares: {quantity}\n"
-                        f"Price: ${price:.2f}\n"
-                        f"Proceeds: ${proceeds:,.2f}\n"
-                        f"{'Profit' if profit > 0 else 'Loss'}: ${profit:+,.2f}\n"
-                        f"Profit bucket: ${bucket:,.2f}"
-                    )
-                except Exception as e:
-                    send_alert(f"*Sell error* {symbol}: {e}")
+        print("No buy signals found in scan.")
         return cash
 
     print(f"\n-- Buying scanner picks [{tier}] | Position size: ${position_size:,.2f} --")
@@ -160,32 +185,9 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
         if symbol in bought_this_run:
             continue
 
+        # Skip if already own it
         position = get_position_for(positions, symbol)
         if position:
-            from strategy import get_signal
-            sig = get_signal(symbol)
-            if sig["signal"] == "SELL":
-                quantity = int(position.get("longQuantity", 0))
-                if quantity < 1:
-                    continue
-                try:
-                    place_equity_order(encrypted, symbol, quantity, "SELL")
-                    proceeds = quantity * price
-                    profit   = record_sell(symbol, quantity, price, proceeds)
-                    cash    += proceeds
-                    bucket   = get_profit_bucket()
-                    label    = "PROFIT" if profit > 0 else "LOSS"
-                    send_alert(
-                        f"*Stock Sell — {label}*\n"
-                        f"Symbol: {symbol}\n"
-                        f"Shares: {quantity}\n"
-                        f"Price: ${price:.2f}\n"
-                        f"Proceeds: ${proceeds:,.2f}\n"
-                        f"{'Profit' if profit > 0 else 'Loss'}: ${profit:+,.2f}\n"
-                        f"Profit bucket: ${bucket:,.2f}"
-                    )
-                except Exception as e:
-                    send_alert(f"*Sell error* {symbol}: {e}")
             continue
 
         if cash < price:
@@ -241,80 +243,44 @@ def run_options_strategy(encrypted: str, positions: list, account_value: float):
         )
 
 
-# ── Profit split 60/30/10 ────────────────────────────────────────────────────
+# ── ETF sweep from ETF bucket ────────────────────────────────────────────────
 
-def run_profit_split(encrypted: str):
-    bucket = get_profit_bucket()
-    print(f"\n-- Profit split | Bucket: ${bucket:,.2f} | Threshold: ${ETF_THRESHOLD:,.2f} --")
+def run_etf_sweep(encrypted: str):
+    etf_bucket = get_etf_bucket()
+    print(f"\n-- ETF bucket: ${etf_bucket:,.2f} | Min to sweep: ${ETF_MIN_SWEEP:,.2f} --")
 
-    if bucket < ETF_THRESHOLD:
-        print("Profit bucket below threshold — holding.")
+    if etf_bucket < ETF_MIN_SWEEP:
+        print("ETF bucket below minimum — accumulating.")
         return
 
-    etf_amount  = bucket * ETF_PCT
-    cash_amount = bucket * CASH_PCT
-    bot_amount  = bucket * BOT_PCT
+    best_etfs = scan_best_etfs(etf_bucket, top_n=2)
+    if not best_etfs:
+        print("No ETF signals found.")
+        return
 
-    send_alert(
-        f"*Profit Target Hit! 💰*\n"
-        f"Total profit: ${bucket:,.2f}\n\n"
-        f"Splitting 60/30/10:\n"
-        f"→ ETFs: ${etf_amount:,.2f} (60%)\n"
-        f"→ Your cash: ${cash_amount:,.2f} (30%)\n"
-        f"→ Bot capital: ${bot_amount:,.2f} (10%)\n\n"
-        f"Buying best ETFs now..."
-    )
-
-    best_etfs = scan_best_etfs(etf_amount, top_n=2)
-    etf_spent = 0.0
-    if best_etfs:
-        per_etf = etf_amount / len(best_etfs)
-        for etf in best_etfs:
-            symbol   = etf["symbol"]
-            price    = etf["price"]
-            quantity = int(per_etf // price)
-            if quantity < 1:
-                continue
-            try:
-                place_equity_order(encrypted, symbol, quantity, "BUY")
-                cost      = quantity * price
-                etf_spent += cost
-                deduct_profit_bucket(cost)
-                send_alert(
-                    f"*ETF Buy (60% of profits)*\n"
-                    f"Symbol: {symbol}\n"
-                    f"Shares: {quantity}\n"
-                    f"Price: ${price:.2f}\n"
-                    f"Total: ${cost:,.2f}\n"
-                    f"Score: {etf['score']:.1f}"
-                )
-            except Exception as e:
-                send_alert(f"*ETF buy error* {symbol}: {e}")
-
-    send_alert(
-        f"*Your Cash Payout 💵*\n"
-        f"${cash_amount:,.2f} available in your Schwab cash\n"
-        f"Transfer to bank or funded account anytime\n"
-        f"This is YOUR profit — 30% of ${bucket:,.2f}"
-    )
-
-    deduct_profit_bucket(bucket - etf_spent)
-
-    from ledger import load_ledger, save_ledger
-    ledger = load_ledger()
-    ledger["trading_capital"]  = ledger.get("trading_capital", 0.0) + bot_amount
-    ledger["total_withdrawn"]  = ledger.get("total_withdrawn", 0.0) + cash_amount
-    ledger["total_etf_bought"] = ledger.get("total_etf_bought", 0.0) + etf_spent
-    save_ledger(ledger)
-
-    send_alert(
-        f"*Bot Capital Boost 🤖*\n"
-        f"+${bot_amount:,.2f} added to trading capital\n"
-        f"New trading capital: ${ledger['trading_capital']:,.2f}\n\n"
-        f"*All time stats:*\n"
-        f"Total withdrawn: ${ledger['total_withdrawn']:,.2f}\n"
-        f"Total ETFs bought: ${ledger['total_etf_bought']:,.2f}"
-    )
+    per_etf = etf_bucket / len(best_etfs)
+    for etf in best_etfs:
+        symbol   = etf["symbol"]
+        price    = etf["price"]
+        quantity = int(per_etf // price)
+        if quantity < 1:
+            continue
+        try:
+            place_equity_order(encrypted, symbol, quantity, "BUY")
+            cost = quantity * price
+            deduct_etf_bucket(cost)
+            send_alert(
+                f"*ETF Buy (from profits)*\n"
+                f"Symbol: {symbol}\n"
+                f"Shares: {quantity}\n"
+                f"Price: ${price:.2f}\n"
+                f"Total: ${cost:,.2f}\n"
+                f"Score: {etf['score']:.1f}\n"
+                f"ETF bucket remaining: ${get_etf_bucket():,.2f}"
+            )
+            print(f"Swept ${cost:,.2f} into {symbol}")
+        except Exception as e:
+            send_alert(f"*ETF sweep error* {symbol}: {e}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -329,25 +295,39 @@ def run_strategy():
         account_value = get_portfolio_value(account)
         positions     = get_positions(account)
 
-        # Auto sync ledger with Schwab every run
+        # Always sync ledger with Schwab — picks up portfolio after every update
         sync_ledger_from_schwab(encrypted)
 
-        bucket  = get_profit_bucket()
-        capital = get_trading_capital()
-        tier    = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
-        print(f"Account: ${account_value:,.2f} | Cash: ${cash:,.2f} | Profit bucket: ${bucket:,.2f} | Capital: ${capital:,.2f} | {tier}")
+        capital    = get_trading_capital()
+        bucket     = get_profit_bucket()
+        etf_bucket = get_etf_bucket()
+        cash_bucket = get_cash_bucket()
+        tier       = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
 
+        print(f"Account: ${account_value:,.2f} | Cash: ${cash:,.2f} | Capital: ${capital:,.2f} | Profit: ${bucket:,.2f} | ETF bucket: ${etf_bucket:,.2f} | {tier}")
+
+        # Detect new deposits
         deposit = detect_deposit(cash)
-        if deposit:
+        if deposit > 0:
             send_alert(
-                f"*New Deposit Detected*\n"
-                f"Trading capital updated to: ${get_trading_capital():,.2f}\n"
+                f"*New Deposit Detected 💵*\n"
+                f"Amount: ${deposit:,.2f}\n"
+                f"Trading capital: ${get_trading_capital():,.2f}\n"
                 f"Scanning for best stocks now..."
             )
 
         cash = run_stock_strategy(encrypted, positions, cash, account_value)
         run_options_strategy(encrypted, positions, account_value)
-        run_profit_split(encrypted)
+        run_etf_sweep(encrypted)
+
+        # Remind about cash payout if accumulated
+        if cash_bucket > 20:
+            send_alert(
+                f"*Your Cash Payout Available 💵*\n"
+                f"${cash_bucket:,.2f} earned from profits\n"
+                f"Sitting in your Schwab cash balance\n"
+                f"Transfer to bank or funded account anytime!"
+            )
 
     except Exception as e:
         msg = f"*Bot error*: {e}"
@@ -363,24 +343,25 @@ def main():
         cash          = get_cash_balance(account)
         account_value = get_portfolio_value(account)
 
-        # Auto sync on every startup — picks up existing positions automatically
         print("Syncing ledger with Schwab account...")
         sync_ledger_from_schwab(encrypted)
 
-        bucket  = get_profit_bucket()
-        capital = get_trading_capital()
-        tier    = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
+        capital    = get_trading_capital()
+        bucket     = get_profit_bucket()
+        etf_bucket = get_etf_bucket()
+        tier       = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
 
         send_alert(
-            f"*Schwab Bot Started*\n"
+            f"*Schwab Bot Started ✅*\n"
             f"Account: ${account_value:,.2f}\n"
             f"Cash: ${cash:,.2f}\n"
             f"Trading capital: ${capital:,.2f}\n"
-            f"Profit bucket: ${bucket:,.2f}\n"
-            f"Profit split: 60% ETFs / 30% Cash / 10% Bot\n"
-            f"Sweep at: ${ETF_THRESHOLD:,.2f} profit\n"
+            f"All-time profit: ${bucket:,.2f}\n"
+            f"ETF bucket: ${etf_bucket:,.2f}\n"
+            f"Split: 60% ETFs / 30% Cash / 10% Bot\n"
+            f"Splits on every profitable sell\n"
             f"Tier: {tier}\n"
-            f"Scanner active — finding best stocks every {CHECK_INTERVAL} min"
+            f"Scanner active every {CHECK_INTERVAL} min"
         )
     except Exception as e:
         print(f"Startup error: {e}")
