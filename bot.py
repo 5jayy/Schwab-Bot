@@ -1,15 +1,20 @@
 import os
 import sys
-import json
-import time
 import signal
 import schedule
+import time
 import requests
 from dotenv import load_dotenv
 from auth import get_valid_token
 from scanner import scan_best_stocks, scan_best_etfs
 from strategy import find_best_covered_call, get_trade_stocks
 from telegram import send_alert
+from ledger import (
+    sync_ledger_from_schwab,
+    record_buy, record_sell,
+    get_profit_bucket, get_trading_capital,
+    deduct_profit_bucket, detect_deposit
+)
 
 load_dotenv()
 
@@ -20,101 +25,12 @@ def handle_shutdown(signum, frame):
 signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
-BASE_URL        = "https://api.schwabapi.com/trader/v1"
-ETF_THRESHOLD   = float(os.getenv("ETF_THRESHOLD", 1000))
-ETF_PCT         = float(os.getenv("ETF_PCT", 0.60))       # 60% to ETFs
-CASH_PCT        = float(os.getenv("CASH_PCT", 0.30))       # 30% to your cash
-BOT_PCT         = float(os.getenv("BOT_PCT", 0.10))        # 10% back to bot capital
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
-LEDGER_FILE     = "trade_ledger.json"
-
-
-# ── Trade ledger ─────────────────────────────────────────────────────────────
-
-def load_ledger() -> dict:
-    if not os.path.exists(LEDGER_FILE):
-        return {
-            "deposits": 0.0,
-            "trading_capital": 0.0,
-            "profit_bucket": 0.0,
-            "total_withdrawn": 0.0,
-            "total_etf_bought": 0.0,
-            "open_trades": {},
-            "closed_trades": [],
-            "last_known_cash": 0.0
-        }
-    with open(LEDGER_FILE) as f:
-        return json.load(f)
-
-
-def save_ledger(ledger: dict):
-    with open(LEDGER_FILE, "w") as f:
-        json.dump(ledger, f, indent=2)
-
-
-def record_buy(symbol: str, quantity: int, price: float, cost: float):
-    ledger = load_ledger()
-    ledger["open_trades"][symbol] = {
-        "quantity":  quantity,
-        "buy_price": price,
-        "cost":      cost,
-        "bought_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    }
-    save_ledger(ledger)
-
-
-def record_sell(symbol: str, quantity: int, sell_price: float, proceeds: float) -> float:
-    ledger = load_ledger()
-    profit = 0.0
-    if symbol in ledger["open_trades"]:
-        trade  = ledger["open_trades"][symbol]
-        cost   = trade["cost"]
-        profit = proceeds - cost
-        ledger["closed_trades"].append({
-            "symbol":     symbol,
-            "quantity":   quantity,
-            "buy_price":  trade["buy_price"],
-            "sell_price": sell_price,
-            "cost":       cost,
-            "proceeds":   proceeds,
-            "profit":     profit,
-            "closed_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        })
-        del ledger["open_trades"][symbol]
-        if profit > 0:
-            ledger["profit_bucket"] = ledger.get("profit_bucket", 0.0) + profit
-    save_ledger(ledger)
-    return profit
-
-
-def get_profit_bucket() -> float:
-    return load_ledger().get("profit_bucket", 0.0)
-
-
-def get_trading_capital() -> float:
-    return load_ledger().get("trading_capital", 0.0)
-
-
-def detect_deposit(cash: float):
-    ledger = load_ledger()
-    last   = ledger.get("last_known_cash", cash)
-    if cash > last + 50:
-        deposit = cash - last
-        ledger["deposits"]        = ledger.get("deposits", 0.0) + deposit
-        ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
-        ledger["last_known_cash"] = cash
-        save_ledger(ledger)
-        send_alert(
-            f"*New Deposit Detected*\n"
-            f"Amount: ${deposit:,.2f}\n"
-            f"Trading capital: ${ledger['trading_capital']:,.2f}\n"
-            f"Total deposits: ${ledger['deposits']:,.2f}\n"
-            f"Scanning for best stocks now..."
-        )
-        return True
-    ledger["last_known_cash"] = cash
-    save_ledger(ledger)
-    return False
+BASE_URL       = "https://api.schwabapi.com/trader/v1"
+ETF_THRESHOLD  = float(os.getenv("ETF_THRESHOLD", 1000))
+ETF_PCT        = float(os.getenv("ETF_PCT", 0.60))
+CASH_PCT       = float(os.getenv("CASH_PCT", 0.30))
+BOT_PCT        = float(os.getenv("BOT_PCT", 0.10))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 
 # ── Schwab API helpers ───────────────────────────────────────────────────────
@@ -332,12 +248,12 @@ def run_profit_split(encrypted: str):
     print(f"\n-- Profit split | Bucket: ${bucket:,.2f} | Threshold: ${ETF_THRESHOLD:,.2f} --")
 
     if bucket < ETF_THRESHOLD:
-        print(f"Profit bucket below threshold — holding.")
+        print("Profit bucket below threshold — holding.")
         return
 
-    etf_amount     = bucket * ETF_PCT    # 60%
-    cash_amount    = bucket * CASH_PCT   # 30%
-    bot_amount     = bucket * BOT_PCT    # 10%
+    etf_amount  = bucket * ETF_PCT
+    cash_amount = bucket * CASH_PCT
+    bot_amount  = bucket * BOT_PCT
 
     send_alert(
         f"*Profit Target Hit! 💰*\n"
@@ -349,9 +265,8 @@ def run_profit_split(encrypted: str):
         f"Buying best ETFs now..."
     )
 
-    # 60% — buy best ETFs
-    best_etfs  = scan_best_etfs(etf_amount, top_n=2)
-    etf_spent  = 0.0
+    best_etfs = scan_best_etfs(etf_amount, top_n=2)
+    etf_spent = 0.0
     if best_etfs:
         per_etf = etf_amount / len(best_etfs)
         for etf in best_etfs:
@@ -364,6 +279,7 @@ def run_profit_split(encrypted: str):
                 place_equity_order(encrypted, symbol, quantity, "BUY")
                 cost      = quantity * price
                 etf_spent += cost
+                deduct_profit_bucket(cost)
                 send_alert(
                     f"*ETF Buy (60% of profits)*\n"
                     f"Symbol: {symbol}\n"
@@ -375,20 +291,20 @@ def run_profit_split(encrypted: str):
             except Exception as e:
                 send_alert(f"*ETF buy error* {symbol}: {e}")
 
-    # 30% — notify cash available for withdrawal
     send_alert(
         f"*Your Cash Payout 💵*\n"
-        f"${cash_amount:,.2f} is sitting in your Schwab cash balance\n"
-        f"Transfer to your bank or funded account anytime\n"
+        f"${cash_amount:,.2f} available in your Schwab cash\n"
+        f"Transfer to bank or funded account anytime\n"
         f"This is YOUR profit — 30% of ${bucket:,.2f}"
     )
 
-    # 10% — add to bot trading capital
+    deduct_profit_bucket(bucket - etf_spent)
+
+    from ledger import load_ledger, save_ledger
     ledger = load_ledger()
     ledger["trading_capital"]  = ledger.get("trading_capital", 0.0) + bot_amount
     ledger["total_withdrawn"]  = ledger.get("total_withdrawn", 0.0) + cash_amount
     ledger["total_etf_bought"] = ledger.get("total_etf_bought", 0.0) + etf_spent
-    ledger["profit_bucket"]    = 0.0  # reset after split
     save_ledger(ledger)
 
     send_alert(
@@ -412,13 +328,23 @@ def run_strategy():
         cash          = get_cash_balance(account)
         account_value = get_portfolio_value(account)
         positions     = get_positions(account)
-        bucket        = get_profit_bucket()
-        capital       = get_trading_capital()
 
-        tier = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
+        # Auto sync ledger with Schwab every run
+        sync_ledger_from_schwab(encrypted)
+
+        bucket  = get_profit_bucket()
+        capital = get_trading_capital()
+        tier    = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
         print(f"Account: ${account_value:,.2f} | Cash: ${cash:,.2f} | Profit bucket: ${bucket:,.2f} | Capital: ${capital:,.2f} | {tier}")
 
-        detect_deposit(cash)
+        deposit = detect_deposit(cash)
+        if deposit:
+            send_alert(
+                f"*New Deposit Detected*\n"
+                f"Trading capital updated to: ${get_trading_capital():,.2f}\n"
+                f"Scanning for best stocks now..."
+            )
+
         cash = run_stock_strategy(encrypted, positions, cash, account_value)
         run_options_strategy(encrypted, positions, account_value)
         run_profit_split(encrypted)
@@ -436,9 +362,14 @@ def main():
         account       = get_account(encrypted)
         cash          = get_cash_balance(account)
         account_value = get_portfolio_value(account)
-        bucket        = get_profit_bucket()
-        capital       = get_trading_capital()
-        tier = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
+
+        # Auto sync on every startup — picks up existing positions automatically
+        print("Syncing ledger with Schwab account...")
+        sync_ledger_from_schwab(encrypted)
+
+        bucket  = get_profit_bucket()
+        capital = get_trading_capital()
+        tier    = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
 
         send_alert(
             f"*Schwab Bot Started*\n"
@@ -446,7 +377,7 @@ def main():
             f"Cash: ${cash:,.2f}\n"
             f"Trading capital: ${capital:,.2f}\n"
             f"Profit bucket: ${bucket:,.2f}\n"
-            f"Profit split: 60% ETFs / 30% Your cash / 10% Bot\n"
+            f"Profit split: 60% ETFs / 30% Cash / 10% Bot\n"
             f"Sweep at: ${ETF_THRESHOLD:,.2f} profit\n"
             f"Tier: {tier}\n"
             f"Scanner active — finding best stocks every {CHECK_INTERVAL} min"
