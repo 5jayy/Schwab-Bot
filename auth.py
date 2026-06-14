@@ -18,9 +18,12 @@ TOKEN_URL     = "https://api.schwabapi.com/v1/oauth/token"
 
 
 def _basic_header():
-    creds = f"{CLIENT_ID}:{CLIENT_SECRET}"
+    creds   = f"{CLIENT_ID}:{CLIENT_SECRET}"
     encoded = base64.b64encode(creds.encode()).decode()
-    return {"Authorization": f"Basic {encoded}", "Content-Type": "application/x-www-form-urlencoded"}
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type":  "application/x-www-form-urlencoded"
+    }
 
 
 def save_tokens(tokens: dict):
@@ -56,7 +59,7 @@ def refresh_access_token() -> dict:
 def get_valid_token() -> str:
     tokens = load_tokens()
     if not tokens:
-        raise RuntimeError("No tokens found. Run first_time_login() first.")
+        raise RuntimeError("No tokens found. Run python3 auth.py first.")
     saved_at   = tokens.get("saved_at", 0)
     expires_in = tokens.get("expires_in", 1800)
     if time.time() - saved_at > (expires_in - 300):
@@ -81,13 +84,11 @@ def first_time_login():
     print("\nBrowser opened — log in, click Allow, then come straight back here.")
     redirected_url = input("Paste the full redirect URL here: ").strip()
 
-    # Decode URL encoding (%40 -> @, etc)
     redirected_url = unquote(redirected_url)
 
     if "code=" not in redirected_url:
-        raise ValueError("No auth code found. Make sure you copied the full URL from the address bar.")
+        raise ValueError("No auth code found. Make sure you copied the full URL.")
 
-    # Parse code properly
     parsed = urlparse(redirected_url)
     params = parse_qs(parsed.query)
     code   = params.get("code", [None])[0]
@@ -111,7 +112,8 @@ def first_time_login():
     tokens = resp.json()
     save_tokens(tokens)
     print("\nTokens saved to tokens.json")
-    print("You won't need to do this again — the bot will auto-refresh from now on.")
+    print("The bot will auto-refresh your access token every 25 minutes.")
+    print("You only need to run this again if you see a token expired alert on Telegram.")
     return tokens
 
 

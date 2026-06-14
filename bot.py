@@ -9,6 +9,7 @@ from auth import get_valid_token
 from scanner import scan_best_stocks, scan_best_etfs
 from strategy import find_best_covered_call, get_trade_stocks, get_signal
 from telegram import send_alert
+from token_manager import check_token_health
 from ledger import (
     sync_ledger_from_schwab, load_ledger, save_ledger,
     record_buy, record_sell_and_split,
@@ -308,6 +309,9 @@ def run_strategy():
 
         # Detect new deposits
         deposit = detect_deposit(cash)
+
+        # Check token health every run
+        check_token_health()
         if deposit > 0:
             send_alert(
                 f"*New Deposit Detected 💵*\n"
