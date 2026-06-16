@@ -14,7 +14,7 @@ SCAN_UNIVERSE = [
     "DKNG", "PENN", "LYFT", "ABNB", "DASH", "RIVN", "LCID", "AFRM", "UPST", "SOFI",
     # Tier 3 — large cap
     "AMZN", "NVDA", "MSFT", "META", "TSLA", "NFLX", "CRM", "SHOP", "BABA", "SPY",
-    "QQQ", "ARKK", "XLF", "XLE", "GLD", "SLV", "TQQQ", "SQQQ", "SPXL", "SPXS"
+    "QQQ", "ARKK", "XLF", "XLE", "GLD", "SLV"
 ]
 
 # ETF candidates to scan for best dividend/growth
