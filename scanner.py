@@ -165,7 +165,13 @@ def scan_best_stocks(cash: float, top_n: int = 5) -> list:
         time.sleep(0.1)  # rate limit protection
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    top = results[:top_n]
+    seen = set()
+    unique = []
+    for r in results:
+        if r["symbol"] not in seen:
+            seen.add(r["symbol"])
+            unique.append(r)
+    top = unique[:top_n]
 
     print(f"Top {len(top)} stocks found:")
     for r in top:
@@ -189,7 +195,13 @@ def scan_best_etfs(profit_amount: float, top_n: int = 2) -> list:
         time.sleep(0.1)
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    top = results[:top_n]
+    seen = set()
+    unique = []
+    for r in results:
+        if r["symbol"] not in seen:
+            seen.add(r["symbol"])
+            unique.append(r)
+    top = unique[:top_n]
 
     print(f"Top {len(top)} ETFs found:")
     for r in top:
