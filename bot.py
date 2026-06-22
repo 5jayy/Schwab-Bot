@@ -7,7 +7,8 @@ import requests
 from dotenv import load_dotenv
 from auth import get_valid_token
 from scanner import scan_best_stocks, scan_best_etfs
-from strategy import find_best_covered_call, get_trade_stocks, get_signal
+from strategy import get_trade_stocks, get_signal
+from options import find_best_covered_call, place_covered_call, check_covered_call_already_open
 from telegram import send_alert
 from token_manager import check_token_health
 from ledger import (
@@ -222,26 +223,58 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
 # ── Options strategy ─────────────────────────────────────────────────────────
 
 def run_options_strategy(encrypted: str, positions: list, account_value: float):
-    trade_stocks = get_trade_stocks(account_value)
     print("\n-- Covered calls --")
-    for symbol in trade_stocks:
-        position = get_position_for(positions, symbol)
-        if not position:
+    for position in positions:
+        symbol = position["instrument"]["symbol"]
+        if position["instrument"].get("assetType") != "EQUITY":
             continue
         shares = int(position.get("longQuantity", 0))
         if shares < 100:
             continue
+
+        # Skip if already have open covered call on this stock
+        if check_covered_call_already_open(encrypted, symbol):
+            print(f"  {symbol}: covered call already open")
+            continue
+
         best_call = find_best_covered_call(symbol, shares)
         if not best_call:
+            print(f"  {symbol}: no good covered call found")
             continue
-        send_alert(
-            f"*Covered Call Opportunity*\n"
-            f"Stock: {symbol} ({shares} shares)\n"
-            f"Strike: ${best_call['strike']}\n"
-            f"Expiry: {best_call['expiry']} ({best_call['dte']} DTE)\n"
-            f"Premium: ${best_call['premium']:.2f}/share\n"
-            f"Total income: ${best_call['total_premium']:,.2f}"
-        )
+
+        print(f"  {symbol}: placing covered call strike ${best_call['strike']} exp {best_call['expiry']} premium ${best_call['premium']:.2f}")
+
+        try:
+            place_covered_call(encrypted, best_call["option_symbol"], best_call["contracts"], best_call["premium"])
+            total    = best_call["total_premium"]
+            etf_cut  = total * 0.60
+            cash_cut = total * 0.30
+            bot_cut  = total * 0.10
+
+            from ledger import load_ledger, save_ledger
+            ledger = load_ledger()
+            ledger["profit_bucket"]   = ledger.get("profit_bucket", 0.0) + total
+            ledger["etf_bucket"]      = ledger.get("etf_bucket", 0.0) + etf_cut
+            ledger["cash_bucket"]     = ledger.get("cash_bucket", 0.0) + cash_cut
+            ledger["bot_bucket"]      = ledger.get("bot_bucket", 0.0) + bot_cut
+            ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + bot_cut
+            ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + cash_cut
+            save_ledger(ledger)
+
+            send_alert(
+                f"*Covered Call Placed 📈*\n"
+                f"Stock: {symbol} ({shares} shares)\n"
+                f"Strike: ${best_call['strike']:.2f}\n"
+                f"Expiry: {best_call['expiry']} ({best_call['dte']} DTE)\n"
+                f"Premium: ${best_call['premium']:.2f}/share\n"
+                f"Total income: ${total:,.2f}\n\n"
+                f"*Split immediately:*\n"
+                f"→ ETF bucket: +${etf_cut:,.2f} (60%)\n"
+                f"→ Your cash: +${cash_cut:,.2f} (30%)\n"
+                f"→ Bot capital: +${bot_cut:,.2f} (10%)"
+            )
+        except Exception as e:
+            send_alert(f"*Covered call error* {symbol}: {e}")
 
 
 # ── ETF sweep from ETF bucket ────────────────────────────────────────────────
