@@ -281,16 +281,11 @@ def run_options_strategy(encrypted: str, positions: list, account_value: float):
 # ── Cash secured puts ────────────────────────────────────────────────────────
 
 def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
-    """
-    When we have enough cash, sell puts on stocks the scanner likes.
-    Gets paid premium to potentially buy stocks at a discount.
-    """
     if cash < 200:
         print("Not enough cash for cash secured puts.")
         return
 
-    print(f"
--- Cash secured puts | Cash available: ${cash:,.2f} --")
+    print("\n-- Cash secured puts | Cash available: $" + f"{cash:,.2f} --")
 
     from scanner import scan_best_stocks
     candidates = scan_best_stocks(cash, top_n=3)
@@ -299,7 +294,6 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
         symbol = stock["symbol"]
         price  = stock["price"]
 
-        # Skip if already have a put open on this stock
         if check_put_already_open(encrypted, symbol):
             print(f"  {symbol}: put already open")
             continue
@@ -308,8 +302,6 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
         if not best_put:
             print(f"  {symbol}: no good put found")
             continue
-
-        print(f"  {symbol}: placing put strike ${best_put['strike']} exp {best_put['expiry']} premium ${best_put['premium']:.2f}")
 
         try:
             place_cash_secured_put(encrypted, best_put["option_symbol"], best_put["premium"])
@@ -328,34 +320,20 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
             ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + cash_cut
             save_ledger(ledger)
 
-            send_alert(
-                f"*Cash Secured Put Placed 📉*
-"
-                f"Stock: {symbol}
-"
-                f"Current price: ${best_put['underlying_price']:.2f}
-"
-                f"Strike: ${best_put['strike']:.2f} (buying at discount if assigned)
-"
-                f"Expiry: {best_put['expiry']} ({best_put['dte']} DTE)
-"
-                f"Premium: ${best_put['premium']:.2f}/share
-"
-                f"Total income: ${total:,.2f}
-"
-                f"Cash secured: ${best_put['cash_needed']:,.2f}
-
-"
-                f"*Split immediately:*
-"
-                f"→ ETF bucket: +${etf_cut:,.2f} (60%)
-"
-                f"→ Your cash: +${cash_cut:,.2f} (30%)
-"
-                f"→ Bot capital: +${bot_cut:,.2f} (10%)"
+            msg = (
+                "*Cash Secured Put Placed*\n"
+                f"Stock: {symbol}\n"
+                f"Price: ${best_put['underlying_price']:.2f}\n"
+                f"Strike: ${best_put['strike']:.2f}\n"
+                f"Expiry: {best_put['expiry']} ({best_put['dte']} DTE)\n"
+                f"Premium: ${best_put['premium']:.2f}/share\n"
+                f"Total: ${total:,.2f}\n"
+                f"ETF bucket: +${etf_cut:,.2f} | Cash: +${cash_cut:,.2f} | Bot: +${bot_cut:,.2f}"
             )
+            send_alert(msg)
         except Exception as e:
             send_alert(f"*Put error* {symbol}: {e}")
+
 
 # ── ETF sweep from ETF bucket ────────────────────────────────────────────────
 
