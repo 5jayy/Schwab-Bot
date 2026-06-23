@@ -4,7 +4,7 @@ import time
 import requests
 from auth import get_valid_token
 
-LEDGER_FILE = "trade_ledger.json"
+LEDGER_FILE = "/data/trade_ledger.json"
 
 BOT_STOCKS = [
     "SOFI", "F", "BAC", "VALE", "PLUG", "AAL", "RIOT", "MARA", "NIO", "PLTR",

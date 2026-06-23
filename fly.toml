@@ -13,3 +13,7 @@ primary_region = 'iad'
 
 [machines]
   auto_stop = false
+
+[mounts]
+  source = "schwab_bot_data"
+  destination = "/data"

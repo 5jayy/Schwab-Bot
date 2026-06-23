@@ -12,7 +12,7 @@ load_dotenv()
 CLIENT_ID     = os.getenv("SCHWAB_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SCHWAB_CLIENT_SECRET")
 REDIRECT_URI  = os.getenv("SCHWAB_REDIRECT_URI", "https://127.0.0.1")
-TOKEN_FILE    = "tokens.json"
+TOKEN_FILE    = "/data/tokens.json"
 AUTH_URL      = "https://api.schwabapi.com/v1/oauth/authorize"
 TOKEN_URL     = "https://api.schwabapi.com/v1/oauth/token"
 
