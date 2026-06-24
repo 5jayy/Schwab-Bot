@@ -4,6 +4,8 @@ import signal
 import schedule
 import time
 import requests
+from datetime import datetime
+import pytz
 from dotenv import load_dotenv
 from auth import get_valid_token
 from scanner import scan_best_stocks, scan_best_etfs
@@ -21,6 +23,18 @@ from ledger import (
 )
 
 load_dotenv()
+
+
+def is_market_open() -> bool:
+    """Check if US stock market is currently open."""
+    et = pytz.timezone('America/New_York')
+    now = datetime.now(et)
+    # Monday=0, Friday=4
+    if now.weekday() > 4:
+        return False
+    market_open  = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
 
 def handle_shutdown(signum, frame):
     print("Shutdown signal received — bot stopping cleanly.")
