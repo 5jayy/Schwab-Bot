@@ -4,7 +4,8 @@ import time
 import requests
 from auth import get_valid_token
 
-LEDGER_FILE = "/data/trade_ledger.json"
+import os as _os
+LEDGER_FILE = "/data/trade_ledger.json" if _os.path.exists("/data") else "trade_ledger.json"
 
 BOT_STOCKS = [
     "SOFI", "F", "BAC", "VALE", "PLUG", "AAL", "RIOT", "MARA", "NIO", "PLTR",
@@ -234,3 +235,44 @@ def detect_deposit(cash: float) -> float:
     ledger["last_known_cash"] = cash
     save_ledger(ledger)
     return 0.0
+
+
+def detect_withdrawal(cash: float) -> float:
+    """
+    Detects when cash drops significantly — user withdrew money.
+    Returns withdrawal amount if detected, 0 otherwise.
+    Persists withdrawal history across deploys via /data volume.
+    """
+    ledger = load_ledger()
+    last   = ledger.get("last_known_cash", cash)
+
+    # Only count as withdrawal if cash dropped more than 0
+    # and it wasnt just the bot spending on trades
+    if last - cash > 20:
+        withdrawal = last - cash
+
+        # Track withdrawal history
+        ledger.setdefault("withdrawal_history", []).append({
+            "amount":      withdrawal,
+            "cash_before": last,
+            "cash_after":  cash,
+            "timestamp":   __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+        })
+        ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
+        ledger["last_known_cash"] = cash
+        save_ledger(ledger)
+        return withdrawal
+
+    ledger["last_known_cash"] = cash
+    save_ledger(ledger)
+    return 0.0
+
+
+def get_withdrawal_stats() -> dict:
+    """Returns withdrawal history and totals."""
+    ledger = load_ledger()
+    return {
+        "total_withdrawn":    ledger.get("total_withdrawn", 0.0),
+        "cash_bucket":        ledger.get("cash_bucket", 0.0),
+        "withdrawal_history": ledger.get("withdrawal_history", [])
+    }

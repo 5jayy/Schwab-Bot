@@ -18,8 +18,8 @@ from ledger import (
     record_buy, record_sell_and_split,
     get_profit_bucket, get_trading_capital,
     get_etf_bucket, get_cash_bucket, get_bot_bucket,
-    deduct_etf_bucket, detect_deposit,
-    BOT_STOCKS, ETF_MIN_SWEEP
+    deduct_etf_bucket, detect_deposit, detect_withdrawal,
+    get_withdrawal_stats, BOT_STOCKS, ETF_MIN_SWEEP
 )
 
 load_dotenv()
