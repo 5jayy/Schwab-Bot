@@ -73,8 +73,12 @@ def get_account(encrypted: str) -> dict:
 
 
 def get_cash_balance(account: dict) -> float:
+    """Only use settled cash — never margin or buying power."""
     try:
-        return account["securitiesAccount"]["currentBalances"]["cashBalance"]
+        balances = account["securitiesAccount"]["currentBalances"]
+        cash = balances.get("cashBalance", 0.0)
+        # Never use negative cash (margin)
+        return max(cash, 0.0)
     except KeyError:
         return 0.0
 
