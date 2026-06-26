@@ -184,6 +184,10 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
             price    = sig.get("price", 0)
             if quantity < 1:
                 continue
+            # Never sell a stock that has an open covered call
+            if check_covered_call_already_open(encrypted, sym):
+                print(f"  {sym}: skipping sell — covered call open")
+                continue
             cash = execute_sell(encrypted, sym, quantity, price, cash)
 
     # Only buy if we have enough cash
