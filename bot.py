@@ -29,12 +29,16 @@ def is_market_open() -> bool:
     """Check if US stock market is currently open."""
     et = pytz.timezone('America/New_York')
     now = datetime.now(et)
-    # Monday=0, Friday=4
+    # Monday=0, Friday=4 — no weekends
     if now.weekday() > 4:
+        print(f"Market closed — weekend ({now.strftime('%A')})")
         return False
     market_open  = now.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    if not (market_open <= now <= market_close):
+        print(f"Market closed — outside hours ({now.strftime('%H:%M')} ET)")
+        return False
+    return True
 
 def handle_shutdown(signum, frame):
     print("Shutdown signal received — bot stopping cleanly.")
@@ -174,9 +178,12 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
     bought_this_run = set()
 
     # Always check existing positions for sell signals regardless of cash
+    sold_this_run = set()
     for position in positions:
         sym = position["instrument"]["symbol"]
         if sym not in BOT_STOCKS:
+            continue
+        if sym in sold_this_run:
             continue
         sig = get_signal(sym)
         if sig["signal"] == "SELL":
@@ -188,6 +195,7 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
             if check_covered_call_already_open(encrypted, sym):
                 print(f"  {sym}: skipping sell — covered call open")
                 continue
+            sold_this_run.add(sym)
             cash = execute_sell(encrypted, sym, quantity, price, cash)
 
     # Only buy if we have enough cash
