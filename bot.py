@@ -408,6 +408,8 @@ def run_etf_sweep(encrypted: str):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_strategy():
+    if not is_market_open():
+        return
     print("\n=== Strategy check ===")
     try:
         accounts      = get_account_numbers()
@@ -492,7 +494,8 @@ def main():
     except Exception as e:
         print(f"Startup error: {e}")
 
-    run_strategy()
+    if is_market_open():
+        run_strategy()
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy)
     while True:
         schedule.run_pending()
