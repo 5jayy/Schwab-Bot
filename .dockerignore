@@ -5,3 +5,4 @@ __pycache__/
 trade_ledger.json
 .git/
 *.log
+tokens.json
