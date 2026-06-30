@@ -129,6 +129,27 @@ def place_equity_order(encrypted: str, symbol: str, quantity: int, instruction: 
     return resp
 
 
+def check_order_filled(encrypted: str, order_location: str) -> dict:
+    """
+    Check if an order actually filled or got rejected/canceled.
+    order_location is the Location header from the order POST response.
+    Returns dict with status and statusDescription.
+    """
+    import time
+    time.sleep(1.5)  # give Schwab a moment to process
+    try:
+        resp = requests.get(order_location, headers=headers(), timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "status":      data.get("status", "UNKNOWN"),
+            "description": data.get("statusDescription", ""),
+            "filled":      data.get("status") == "FILLED"
+        }
+    except Exception as e:
+        return {"status": "UNKNOWN", "description": str(e), "filled": False}
+
+
 # ── Sell with immediate profit split ────────────────────────────────────────
 
 def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash: float) -> float:
@@ -229,8 +250,23 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
             continue
 
         try:
-            place_equity_order(encrypted, symbol, quantity, "BUY")
-            cost  = quantity * price
+            order_resp = place_equity_order(encrypted, symbol, quantity, "BUY")
+            order_location = order_resp.headers.get("Location", "")
+            cost = quantity * price
+
+            if order_location:
+                check = check_order_filled(encrypted, order_location)
+                if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
+                    send_alert(
+                        f"*Order Canceled ❌*\n"
+                        f"Symbol: {symbol}\n"
+                        f"Shares: {quantity}\n"
+                        f"Reason: {check['description']}\n"
+                        f"Cash available: ${cash:,.2f}"
+                    )
+                    bought_this_run.add(symbol)  # don't retry this run
+                    continue
+
             cash -= cost
             bought_this_run.add(symbol)
             record_buy(symbol, quantity, price, cost)
