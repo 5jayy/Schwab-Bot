@@ -11,6 +11,7 @@ from auth import get_valid_token
 from scanner import scan_best_stocks, scan_best_etfs
 from strategy import get_trade_stocks, get_signal
 from options import find_best_covered_call, place_covered_call, check_covered_call_already_open, find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
+from dividends import get_recent_dividends
 from telegram import send_alert
 from token_manager import check_token_health
 from ledger import (
@@ -19,7 +20,8 @@ from ledger import (
     get_profit_bucket, get_trading_capital,
     get_etf_bucket, get_cash_bucket, get_bot_bucket,
     deduct_etf_bucket, detect_deposit, detect_withdrawal,
-    get_withdrawal_stats, BOT_STOCKS, ETF_MIN_SWEEP
+    get_withdrawal_stats, record_dividend, get_dividend_stats,
+    mark_dividend_seen, BOT_STOCKS, ETF_MIN_SWEEP
 )
 
 load_dotenv()
@@ -467,6 +469,35 @@ def run_etf_sweep(encrypted: str):
             send_alert(f"*ETF sweep error* {symbol}: {e}")
 
 
+
+# ── Dividend tracking ────────────────────────────────────────────────────────
+
+def check_dividends(encrypted: str):
+    """Check for new dividend payments and record them."""
+    dividends = get_recent_dividends(encrypted, days_back=2)
+    seen_ids = get_dividend_stats()["seen_dividend_ids"]
+
+    for div in dividends:
+        txn_id = div["transaction_id"]
+        if txn_id in seen_ids:
+            continue
+
+        record_dividend(div["symbol"], div["amount"], div["reinvested"])
+        mark_dividend_seen(txn_id)
+
+        stats = get_dividend_stats()
+        label = "Reinvested 🔄" if div["reinvested"] else "Cash 💵"
+        send_alert(
+            f"*Dividend Received {label}*\n"
+            f"Symbol: {div['symbol']}\n"
+            f"Amount: ${div['amount']:,.2f}\n\n"
+            f"All-time dividends: ${stats['total_dividends']:,.2f}\n"
+            f"Reinvested total: ${stats['dividends_reinvested']:,.2f}\n"
+            f"Cash total: ${stats['dividends_cash']:,.2f}"
+        )
+        print(f"  Dividend: {div['symbol']} ${div['amount']:.2f} ({'reinvested' if div['reinvested'] else 'cash'})")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_strategy():
@@ -504,6 +535,8 @@ def run_strategy():
                 f"Trading capital: ${get_trading_capital():,.2f}\n"
                 f"Scanning for best stocks now..."
             )
+
+        check_dividends(encrypted)
 
         cash = run_stock_strategy(encrypted, positions, cash, account_value)
         run_options_strategy(encrypted, positions, account_value)

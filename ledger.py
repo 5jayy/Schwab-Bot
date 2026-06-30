@@ -148,6 +148,43 @@ def get_trading_capital() -> float:
     return load_ledger().get("trading_capital", 0.0)
 
 
+def record_dividend(symbol: str, amount: float, reinvested: bool):
+    """Records a dividend payment, tracking total dividends and whether reinvested."""
+    ledger = load_ledger()
+    ledger.setdefault("dividend_history", []).append({
+        "symbol":     symbol,
+        "amount":     amount,
+        "reinvested": reinvested,
+        "timestamp":  __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+    })
+    ledger["total_dividends"] = ledger.get("total_dividends", 0.0) + amount
+    if reinvested:
+        ledger["dividends_reinvested"] = ledger.get("dividends_reinvested", 0.0) + amount
+    else:
+        ledger["dividends_cash"] = ledger.get("dividends_cash", 0.0) + amount
+    save_ledger(ledger)
+
+
+def get_dividend_stats() -> dict:
+    ledger = load_ledger()
+    return {
+        "total_dividends":      ledger.get("total_dividends", 0.0),
+        "dividends_reinvested": ledger.get("dividends_reinvested", 0.0),
+        "dividends_cash":       ledger.get("dividends_cash", 0.0),
+        "seen_dividend_ids":    ledger.get("seen_dividend_ids", [])
+    }
+
+
+def mark_dividend_seen(transaction_id: str):
+    ledger = load_ledger()
+    seen = ledger.setdefault("seen_dividend_ids", [])
+    if transaction_id not in seen:
+        seen.append(transaction_id)
+        # Keep only last 200 to avoid unbounded growth
+        ledger["seen_dividend_ids"] = seen[-200:]
+        save_ledger(ledger)
+
+
 def record_buy(symbol: str, quantity: int, price: float, cost: float):
     ledger = load_ledger()
     ledger["open_trades"][symbol] = {
