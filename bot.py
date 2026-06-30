@@ -311,7 +311,20 @@ def run_options_strategy(encrypted: str, positions: list, account_value: float):
         print(f"  {symbol}: placing covered call strike ${best_call['strike']} exp {best_call['expiry']} premium ${best_call['premium']:.2f}")
 
         try:
-            place_covered_call(encrypted, best_call["option_symbol"], best_call["contracts"], best_call["premium"])
+            cc_resp = place_covered_call(encrypted, best_call["option_symbol"], best_call["contracts"], best_call["premium"])
+            cc_location = cc_resp.headers.get("Location", "")
+
+            if cc_location:
+                check = check_order_filled(encrypted, cc_location)
+                if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
+                    send_alert(
+                        f"*Covered Call Canceled ❌*\n"
+                        f"Symbol: {symbol}\n"
+                        f"Strike: ${best_call['strike']:.2f}\n"
+                        f"Reason: {check['description']}"
+                    )
+                    continue
+
             total    = best_call["total_premium"]
             etf_cut  = total * 0.60
             cash_cut = total * 0.30
@@ -370,7 +383,20 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
             continue
 
         try:
-            place_cash_secured_put(encrypted, best_put["option_symbol"], best_put["premium"])
+            put_resp = place_cash_secured_put(encrypted, best_put["option_symbol"], best_put["premium"])
+            put_location = put_resp.headers.get("Location", "")
+
+            if put_location:
+                check = check_order_filled(encrypted, put_location)
+                if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
+                    send_alert(
+                        f"*Cash Secured Put Canceled ❌*\n"
+                        f"Symbol: {symbol}\n"
+                        f"Strike: ${best_put['strike']:.2f}\n"
+                        f"Reason: {check['description']}"
+                    )
+                    continue
+
             total    = best_put["total_premium"]
             etf_cut  = total * 0.60
             cash_cut = total * 0.30
