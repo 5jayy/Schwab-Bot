@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN_FILE    = "/data/tokens.json"
+import os as _os
+TOKEN_FILE    = "/data/tokens.json" if _os.path.exists("/data") else "tokens.json"
 TOKEN_URL     = "https://api.schwabapi.com/v1/oauth/token"
 CLIENT_ID     = os.getenv("SCHWAB_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SCHWAB_CLIENT_SECRET")

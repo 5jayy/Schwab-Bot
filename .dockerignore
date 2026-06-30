@@ -6,3 +6,4 @@ trade_ledger.json
 .git/
 *.log
 tokens.json
+sunday_login.sh

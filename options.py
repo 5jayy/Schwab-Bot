@@ -401,3 +401,24 @@ def check_put_already_open(encrypted: str, symbol: str) -> bool:
             if "P" in opt_symbol[-10:]:
                 return True
     return False
+
+
+def check_covered_call_already_open(encrypted: str, symbol: str) -> bool:
+    """Check if we already have an open covered call on this stock."""
+    open_options = get_open_options(encrypted)
+    for opt in open_options:
+        opt_symbol = opt["instrument"].get("symbol", "")
+        if opt_symbol.startswith(symbol) and opt.get("shortQuantity", 0) > 0:
+            return True
+    return False
+
+
+def check_put_already_open(encrypted: str, symbol: str) -> bool:
+    """Check if we already have an open cash secured put on this stock."""
+    open_options = get_open_options(encrypted)
+    for opt in open_options:
+        opt_symbol = opt["instrument"].get("symbol", "")
+        if opt_symbol.startswith(symbol) and opt.get("shortQuantity", 0) > 0:
+            if "P" in opt_symbol[-10:]:
+                return True
+    return False
