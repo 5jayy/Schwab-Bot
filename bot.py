@@ -21,7 +21,8 @@ from ledger import (
     get_etf_bucket, get_cash_bucket, get_bot_bucket,
     deduct_etf_bucket, detect_deposit, detect_withdrawal,
     get_withdrawal_stats, record_dividend, get_dividend_stats,
-    mark_dividend_seen, BOT_STOCKS, ETF_MIN_SWEEP
+    mark_dividend_seen, update_high_price, get_trailing_stop_info,
+    BOT_STOCKS, ETF_MIN_SWEEP
 )
 
 load_dotenv()
@@ -50,6 +51,7 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 BASE_URL       = "https://api.schwabapi.com/trader/v1"
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))  # 7% drop from peak triggers sell
 ETF_PCT        = float(os.getenv("ETF_PCT", 0.60))
 CASH_PCT       = float(os.getenv("CASH_PCT", 0.30))
 BOT_PCT        = float(os.getenv("BOT_PCT", 0.10))
@@ -154,7 +156,7 @@ def check_order_filled(encrypted: str, order_location: str) -> dict:
 
 # ── Sell with immediate profit split ────────────────────────────────────────
 
-def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash: float) -> float:
+def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash: float, reason: str = "signal") -> float:
     try:
         place_equity_order(encrypted, symbol, quantity, "SELL")
         proceeds = quantity * price
@@ -162,6 +164,7 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
         cash    += proceeds
         profit   = split["profit"]
         label    = "PROFIT" if profit > 0 else "LOSS"
+        tag      = "🛑 Trailing Stop" if reason == "trailing_stop" else "Signal"
 
         if profit > 0:
             send_alert(
@@ -170,7 +173,8 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
                 f"Shares: {quantity}\n"
                 f"Price: ${price:.2f}\n"
                 f"Proceeds: ${proceeds:,.2f}\n"
-                f"Profit: +${profit:,.2f}\n\n"
+                f"Profit: +${profit:,.2f}\n"
+                f"Trigger: {tag}\n\n"
                 f"*Split immediately:*\n"
                 f"→ ETF bucket: +${split['etf_cut']:,.2f} (60%)\n"
                 f"→ Your cash: +${split['cash_cut']:,.2f} (30%)\n"
@@ -185,9 +189,10 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
                 f"Shares: {quantity}\n"
                 f"Price: ${price:.2f}\n"
                 f"Proceeds: ${proceeds:,.2f}\n"
-                f"Loss: ${profit:,.2f}"
+                f"Loss: ${profit:,.2f}\n"
+                f"Trigger: {tag}"
             )
-        print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f}")
+        print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {tag}")
     except Exception as e:
         send_alert(f"*Sell error* {symbol}: {e}")
     return cash
@@ -208,18 +213,37 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
             continue
         if sym in sold_this_run:
             continue
-        sig = get_signal(sym)
+
+        sig   = get_signal(sym)
+        price = sig.get("price", 0)
+        quantity = int(position.get("longQuantity", 0))
+        if quantity < 1 or price <= 0:
+            continue
+
+        # Update peak price tracker for trailing stop
+        update_high_price(sym, price)
+        trail_info = get_trailing_stop_info(sym)
+
+        trigger_reason = None
+
         if sig["signal"] == "SELL":
-            quantity = int(position.get("longQuantity", 0))
-            price    = sig.get("price", 0)
-            if quantity < 1:
-                continue
+            trigger_reason = "signal"
+        elif trail_info:
+            high = trail_info["high_price"]
+            drop_pct = (high - price) / high if high > 0 else 0
+            if drop_pct >= TRAILING_STOP_PCT:
+                trigger_reason = "trailing_stop"
+
+        if trigger_reason:
             # Never sell a stock that has an open covered call
             if check_covered_call_already_open(encrypted, sym):
                 print(f"  {sym}: skipping sell — covered call open")
                 continue
             sold_this_run.add(sym)
-            cash = execute_sell(encrypted, sym, quantity, price, cash)
+            if trigger_reason == "trailing_stop":
+                high = trail_info["high_price"]
+                print(f"  {sym}: trailing stop triggered — peak ${high:.2f} now ${price:.2f} ({(high-price)/high*100:.1f}% drop)")
+            cash = execute_sell(encrypted, sym, quantity, price, cash, trigger_reason)
 
     # Only buy if we have enough cash
     if cash < 10:

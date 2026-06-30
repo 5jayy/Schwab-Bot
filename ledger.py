@@ -90,10 +90,11 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
         # Register position if not already tracked
         if sym not in open_trades:
             open_trades[sym] = {
-                "quantity":  qty,
-                "buy_price": avg,
-                "cost":      cost,
-                "bought_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                "quantity":   qty,
+                "buy_price":  avg,
+                "cost":       cost,
+                "high_price": avg,  # initialize peak price at registration
+                "bought_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
             new_found.append(sym)
         else:
@@ -188,12 +189,36 @@ def mark_dividend_seen(transaction_id: str):
 def record_buy(symbol: str, quantity: int, price: float, cost: float):
     ledger = load_ledger()
     ledger["open_trades"][symbol] = {
-        "quantity":  quantity,
-        "buy_price": price,
-        "cost":      cost,
-        "bought_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        "quantity":    quantity,
+        "buy_price":   price,
+        "cost":        cost,
+        "high_price":  price,  # track peak price for trailing stop
+        "bought_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
     save_ledger(ledger)
+
+
+def update_high_price(symbol: str, current_price: float):
+    """Update the tracked peak price for trailing stop calculations."""
+    ledger = load_ledger()
+    if symbol in ledger.get("open_trades", {}):
+        trade = ledger["open_trades"][symbol]
+        if current_price > trade.get("high_price", trade["buy_price"]):
+            trade["high_price"] = current_price
+            save_ledger(ledger)
+
+
+def get_trailing_stop_info(symbol: str) -> dict | None:
+    """Returns high_price and buy_price for a symbol, or None if not tracked."""
+    ledger = load_ledger()
+    trade = ledger.get("open_trades", {}).get(symbol)
+    if not trade:
+        return None
+    return {
+        "buy_price":  trade["buy_price"],
+        "high_price": trade.get("high_price", trade["buy_price"]),
+        "quantity":   trade["quantity"]
+    }
 
 
 def record_sell_and_split(symbol: str, quantity: int, sell_price: float, proceeds: float,
