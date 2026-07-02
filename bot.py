@@ -659,15 +659,16 @@ def main():
     except Exception as e:
         print(f"Startup error: {e}")
 
-    # Run balance check immediately on startup
+    # Run balance check immediately on startup — always runs regardless of market hours
     check_balance_24_7()
 
     if is_market_open():
         run_strategy()
 
-    # 24/7 balance monitoring — runs every 30 min regardless of market hours
-    schedule.every(CHECK_INTERVAL).minutes.do(run_strategy)
+    # Schedule both — trading only runs during market hours (check inside run_strategy)
+    # Balance monitoring runs 24/7
     schedule.every(CHECK_INTERVAL).minutes.do(check_balance_24_7)
+    schedule.every(CHECK_INTERVAL).minutes.do(run_strategy)
 
     while True:
         schedule.run_pending()
