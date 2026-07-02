@@ -81,16 +81,22 @@ def get_account(encrypted: str) -> dict:
 
 
 def get_cash_balance(account: dict) -> float:
-    """Use cash actually available for trading — excludes put collateral and unsettled funds."""
+    """Returns total cash balance for deposit/withdrawal tracking."""
     try:
         balances = account["securitiesAccount"]["currentBalances"]
-        # cashAvailableForTrading excludes collateral locked in puts and unsettled cash
+        return max(balances.get("cashBalance", 0.0), 0.0)
+    except KeyError:
+        return 0.0
+
+
+def get_available_cash(account: dict) -> float:
+    """Returns cash actually available for trading — excludes put collateral and unsettled funds."""
+    try:
+        balances = account["securitiesAccount"]["currentBalances"]
         available = balances.get("cashAvailableForTrading", None)
         if available is not None:
             return max(available, 0.0)
-        # Fallback to cashBalance if field not present
-        cash = balances.get("cashBalance", 0.0)
-        return max(cash, 0.0)
+        return max(balances.get("cashBalance", 0.0), 0.0)
     except KeyError:
         return 0.0
 
@@ -578,7 +584,7 @@ def run_strategy():
         accounts      = get_account_numbers()
         encrypted     = accounts[0]["hashValue"]
         account       = get_account(encrypted)
-        cash          = get_cash_balance(account)
+        cash          = get_available_cash(account)  # trading cash excludes put collateral
         account_value = get_portfolio_value(account)
         positions     = get_positions(account)
 
