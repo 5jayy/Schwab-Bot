@@ -629,6 +629,10 @@ def run_strategy():
 
 
 def main():
+    # Run balance check FIRST before anything else — catches deposits/withdrawals
+    # that happened since last run, comparing against last_known_cash in ledger
+    check_balance_24_7()
+
     try:
         accounts      = get_account_numbers()
         encrypted     = accounts[0]["hashValue"]
@@ -658,9 +662,6 @@ def main():
         )
     except Exception as e:
         print(f"Startup error: {e}")
-
-    # Run balance check immediately on startup — always runs regardless of market hours
-    check_balance_24_7()
 
     if is_market_open():
         run_strategy()
