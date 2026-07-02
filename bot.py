@@ -629,16 +629,52 @@ def run_strategy():
 
 
 def main():
-    # Run balance check FIRST before anything else — catches deposits/withdrawals
-    # that happened since last run, comparing against last_known_cash in ledger
-    check_balance_24_7()
-
     try:
         accounts      = get_account_numbers()
         encrypted     = accounts[0]["hashValue"]
         account       = get_account(encrypted)
         cash          = get_cash_balance(account)
         account_value = get_portfolio_value(account)
+
+        # Run balance check BEFORE ledger sync — detects deposits/withdrawals
+        # detect_deposit/withdraw compares cash vs last_known_cash saved in ledger
+        from ledger import load_ledger
+        ledger = load_ledger()
+        last_cash = ledger.get("last_known_cash", cash)
+        print(f"Balance check — last: ${last_cash:.2f} | current: ${cash:.2f}")
+
+        if cash > last_cash + 1:
+            deposit = cash - last_cash
+            ledger["deposits"] = ledger.get("deposits", 0.0) + deposit
+            ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
+            ledger["last_known_cash"] = cash
+            from ledger import save_ledger
+            save_ledger(ledger)
+            send_alert(
+                f"*New Deposit Detected 💵*\n"
+                f"Amount: ${deposit:,.2f}\n"
+                f"Cash now available for trading!"
+            )
+        elif last_cash - cash > 1:
+            withdrawal = last_cash - cash
+            ledger.setdefault("withdrawal_history", []).append({
+                "amount": withdrawal,
+                "timestamp": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+            })
+            ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
+            ledger["last_known_cash"] = cash
+            from ledger import save_ledger
+            save_ledger(ledger)
+            send_alert(
+                f"*Withdrawal Detected 🏦*\n"
+                f"Amount: ${withdrawal:,.2f}\n"
+                f"Total withdrawn all time: ${ledger['total_withdrawn']:,.2f}\n"
+                f"Remaining cash: ${cash:,.2f}"
+            )
+        else:
+            ledger["last_known_cash"] = cash
+            from ledger import save_ledger
+            save_ledger(ledger)
 
         print("Syncing ledger with Schwab account...")
         sync_ledger_from_schwab(encrypted)
