@@ -287,7 +287,7 @@ def detect_deposit(cash: float) -> float:
     """Returns deposit amount if detected, 0 otherwise."""
     ledger = load_ledger()
     last   = ledger.get("last_known_cash", cash)
-    if cash > last + 50:
+    if cash > last + 1:
         deposit = cash - last
         ledger["deposits"]        = ledger.get("deposits", 0.0) + deposit
         ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit

@@ -659,6 +659,9 @@ def main():
     except Exception as e:
         print(f"Startup error: {e}")
 
+    # Run balance check immediately on startup
+    check_balance_24_7()
+
     if is_market_open():
         run_strategy()
 
