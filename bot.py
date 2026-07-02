@@ -544,33 +544,52 @@ def check_dividends(encrypted: str):
 
 def check_balance_24_7():
     """
-    Runs every 30 minutes around the clock.
+    Runs every 5 minutes around the clock.
     Only checks for deposits and withdrawals — no trading.
     """
     try:
+        from ledger import load_ledger, save_ledger
         accounts  = get_account_numbers()
         encrypted = accounts[0]["hashValue"]
         account   = get_account(encrypted)
-        cash      = get_cash_balance(account)
+        cash      = get_cash_balance(account)  # total cashBalance
 
-        deposit = detect_deposit(cash)
-        if deposit > 0:
+        ledger    = load_ledger()
+        last_cash = ledger.get("last_known_cash", cash)
+
+        print(f"Balance check — last: ${last_cash:.2f} | current: ${cash:.2f}")
+
+        if cash > last_cash + 1:
+            deposit = cash - last_cash
+            ledger["deposits"]        = ledger.get("deposits", 0.0) + deposit
+            ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
+            ledger["last_known_cash"] = cash
+            save_ledger(ledger)
             send_alert(
                 f"*New Deposit Detected 💵*\n"
                 f"Amount: ${deposit:,.2f}\n"
                 f"Trading capital: ${get_trading_capital():,.2f}\n"
                 f"Cash now available for trading!"
             )
-
-        withdrawal = detect_withdrawal(cash)
-        if withdrawal > 0:
-            stats = get_withdrawal_stats()
+        elif last_cash - cash > 1:
+            withdrawal = last_cash - cash
+            ledger.setdefault("withdrawal_history", []).append({
+                "amount":    withdrawal,
+                "timestamp": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+            })
+            ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
+            ledger["last_known_cash"] = cash
+            save_ledger(ledger)
             send_alert(
                 f"*Withdrawal Detected 🏦*\n"
                 f"Amount: ${withdrawal:,.2f}\n"
-                f"Total withdrawn all time: ${stats['total_withdrawn']:,.2f}\n"
+                f"Total withdrawn all time: ${ledger['total_withdrawn']:,.2f}\n"
                 f"Remaining cash: ${cash:,.2f}"
             )
+        else:
+            ledger["last_known_cash"] = cash
+            save_ledger(ledger)
+
     except Exception as e:
         print(f"Balance check error: {e}")
 
