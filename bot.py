@@ -666,10 +666,10 @@ def main():
     if is_market_open():
         run_strategy()
 
-    # Schedule both — trading only runs during market hours (check inside run_strategy)
-    # Balance monitoring runs 24/7
-    schedule.every(CHECK_INTERVAL).minutes.do(check_balance_24_7)
+    # Trading — only during market hours (checked inside run_strategy)
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy)
+    # Balance monitoring — 24/7 every 5 minutes (lightweight cash check only)
+    schedule.every(5).minutes.do(check_balance_24_7)
 
     while True:
         schedule.run_pending()
