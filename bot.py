@@ -206,7 +206,14 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
 
 def run_stock_strategy(encrypted: str, positions: list, cash: float, account_value: float) -> float:
     tier          = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
-    position_size = cash * 0.30
+    # Position sizing by tier — matches scanner budget
+    if account_value < 5000:
+        pos_pct = 0.30
+    elif account_value < 20000:
+        pos_pct = 0.25
+    else:
+        pos_pct = 0.20
+    position_size = cash * pos_pct
     bought_this_run = set()
 
     # Always check existing positions for sell signals regardless of cash
@@ -526,6 +533,41 @@ def check_dividends(encrypted: str):
         print(f"  Dividend: {div['symbol']} ${div['amount']:.2f} ({'reinvested' if div['reinvested'] else 'cash'})")
 
 
+
+# ── 24/7 Balance Monitor ─────────────────────────────────────────────────────
+
+def check_balance_24_7():
+    """
+    Runs every 30 minutes around the clock.
+    Only checks for deposits and withdrawals — no trading.
+    """
+    try:
+        accounts  = get_account_numbers()
+        encrypted = accounts[0]["hashValue"]
+        account   = get_account(encrypted)
+        cash      = get_cash_balance(account)
+
+        deposit = detect_deposit(cash)
+        if deposit > 0:
+            send_alert(
+                f"*New Deposit Detected 💵*\n"
+                f"Amount: ${deposit:,.2f}\n"
+                f"Trading capital: ${get_trading_capital():,.2f}\n"
+                f"Cash now available for trading!"
+            )
+
+        withdrawal = detect_withdrawal(cash)
+        if withdrawal > 0:
+            stats = get_withdrawal_stats()
+            send_alert(
+                f"*Withdrawal Detected 🏦*\n"
+                f"Amount: ${withdrawal:,.2f}\n"
+                f"Total withdrawn all time: ${stats['total_withdrawn']:,.2f}\n"
+                f"Remaining cash: ${cash:,.2f}"
+            )
+    except Exception as e:
+        print(f"Balance check error: {e}")
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_strategy():
@@ -619,7 +661,11 @@ def main():
 
     if is_market_open():
         run_strategy()
+
+    # 24/7 balance monitoring — runs every 30 min regardless of market hours
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy)
+    schedule.every(CHECK_INTERVAL).minutes.do(check_balance_24_7)
+
     while True:
         schedule.run_pending()
         time.sleep(60)
