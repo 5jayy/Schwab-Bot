@@ -545,14 +545,25 @@ def check_balance_24_7():
 
         print(f"Balance check — last: ${last_cash:.2f} | current: ${cash:.2f}")
 
-        # Deposit detection
+        # Deposit detection — ignore if cash increase matches put collateral release
         if cash > last_cash + 1:
             deposit = cash - last_cash
-            ledger["deposits"]        = ledger.get("deposits", 0.0) + deposit
-            ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
-            ledger["last_known_cash"] = cash
-            save_ledger(ledger)
-            send_alert(f"💵 +${deposit:,.2f} deposited")
+            last_hold = ledger.get("last_cash_on_hold", 0.0)
+            curr_hold = balances.get("cash_on_hold", 0.0) if balances else last_hold
+            hold_released = max(last_hold - curr_hold, 0.0)
+
+            # If cash increase is mostly from collateral release — not a real deposit
+            if deposit <= hold_released + 5:
+                print(f"Cash increase ${deposit:.2f} matches collateral release ${hold_released:.2f} — skipping deposit alert")
+                ledger["last_known_cash"] = cash
+                save_ledger(ledger)
+            else:
+                real_deposit = deposit - hold_released
+                ledger["deposits"]        = ledger.get("deposits", 0.0) + real_deposit
+                ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + real_deposit
+                ledger["last_known_cash"] = cash
+                save_ledger(ledger)
+                send_alert(f"💵 +${real_deposit:,.2f} deposited")
 
         # Withdrawal detection
         elif last_cash - cash > 1:
@@ -714,9 +725,19 @@ def main():
             for t in _ledger.get("closed_trades", [])
             if _now - _time.mktime(_time.strptime(t.get("sold_at", "2000-01-01T00:00:00Z"), "%Y-%m-%dT%H:%M:%SZ")) < 86400
         )
-        send_alert(
-            f"✅ Bot online | Cap ${capital:,.0f} | Cash ${cash:,.0f} | 24h ${_24h_profit:,.0f}"
-        )
+        # Get cash on hold (put collateral)
+        _balances = get_full_balances(account)
+        _on_hold  = _balances.get("cash_on_hold", 0.0)
+        _avail    = _balances.get("cash_available_trade", cash)
+
+        if _on_hold > 0:
+            send_alert(
+                f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 🔒 ${_on_hold:,.0f} hold | 24h ${_24h_profit:,.0f}"
+            )
+        else:
+            send_alert(
+                f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 24h ${_24h_profit:,.0f}"
+            )
     except Exception as e:
         print(f"Startup error: {e}")
 
