@@ -474,10 +474,21 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
 
 def run_etf_sweep(encrypted: str):
     etf_bucket = get_etf_bucket()
-    print(f"\n-- ETF bucket: ${etf_bucket:,.2f} | Min to sweep: ${ETF_MIN_SWEEP:,.2f} --")
 
-    if etf_bucket < ETF_MIN_SWEEP:
-        print("ETF bucket below minimum — accumulating.")
+    # Dynamic threshold — scan first to find cheapest ETF price
+    # Only sweep when we can actually afford at least 1 share
+    probe = scan_best_etfs(etf_bucket, top_n=1)
+    if not probe:
+        # No signals yet — use fallback minimum
+        min_threshold = ETF_MIN_SWEEP
+    else:
+        # Threshold = price of best available ETF (need at least 1 share)
+        min_threshold = probe[0]["price"]
+
+    print(f"\n-- ETF bucket: ${etf_bucket:,.2f} | Dynamic threshold: ${min_threshold:,.2f} --")
+
+    if etf_bucket < min_threshold:
+        print("ETF bucket accumulating — not enough for 1 share yet.")
         return
 
     best_etfs = scan_best_etfs(etf_bucket, top_n=2)
@@ -523,20 +534,33 @@ def check_dividends(encrypted: str):
         if txn_id in seen_ids:
             continue
 
+        from scanner import get_etf_category, ETF_DIVIDEND_RULES
+        cat          = get_etf_category(div["symbol"])
+        rule         = ETF_DIVIDEND_RULES.get(cat, {"reinvest": 0.5, "cash": 0.5})
+        reinvest_amt = div["amount"] * rule["reinvest"]
+        cash_amt     = div["amount"] * rule["cash"]
+
         record_dividend(div["symbol"], div["amount"], div["reinvested"])
         mark_dividend_seen(txn_id)
 
-        stats = get_dividend_stats()
-        label = "Reinvested 🔄" if div["reinvested"] else "Cash 💵"
-        send_alert(
-            f"*Dividend Received {label}*\n"
-            f"Symbol: {div['symbol']}\n"
-            f"Amount: ${div['amount']:,.2f}\n\n"
-            f"All-time dividends: ${stats['total_dividends']:,.2f}\n"
-            f"Reinvested total: ${stats['dividends_reinvested']:,.2f}\n"
-            f"Cash total: ${stats['dividends_cash']:,.2f}"
-        )
-        print(f"  Dividend: {div['symbol']} ${div['amount']:.2f} ({'reinvested' if div['reinvested'] else 'cash'})")
+        if reinvest_amt > 0 and cash_amt > 0:
+            send_alert(
+                f"*{div['symbol']} Dividend 💵*\n"
+                f"Amount: ${div['amount']:,.2f}\n"
+                f"→ ${reinvest_amt:,.2f} reinvested\n"
+                f"→ ${cash_amt:,.2f} to your cash"
+            )
+        elif reinvest_amt > 0:
+            send_alert(
+                f"*{div['symbol']} Dividend 🔄*\n"
+                f"${div['amount']:,.2f} reinvested"
+            )
+        else:
+            send_alert(
+                f"*{div['symbol']} Dividend 💵*\n"
+                f"${div['amount']:,.2f} to your cash"
+            )
+        print(f"  Dividend: {div['symbol']} ${div['amount']:.2f} | reinvest=${reinvest_amt:.2f} cash=${cash_amt:.2f}")
 
 
 
