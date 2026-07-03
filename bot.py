@@ -498,23 +498,54 @@ def check_dividends(encrypted: str):
 
 # ── 24/7 Balance Monitor ─────────────────────────────────────────────────────
 
+def get_full_balances(account: dict) -> dict:
+    """Extract all balance fields from Schwab account."""
+    try:
+        b = account["securitiesAccount"]["currentBalances"]
+        p = account["securitiesAccount"].get("projectedBalances", {})
+        pos = account["securitiesAccount"].get("positions", [])
+
+        # Options P&L from positions
+        options_pl = sum(
+            p.get("currentDayProfitLoss", 0)
+            for p in pos
+            if p.get("instrument", {}).get("assetType") == "OPTION"
+        )
+
+        return {
+            "cash_balance":          b.get("cashBalance", 0.0),
+            "cash_available_trade":  b.get("cashAvailableForTrading", b.get("cashBalance", 0.0)),
+            "cash_available_withdraw": b.get("cashAvailableForWithdrawal", 0.0),
+            "cash_on_hold":          b.get("cashEquityPut", 0.0),
+            "settled_funds":         b.get("settledCashAvailableForTrading", 0.0),
+            "options_value":         b.get("optionShortValue", 0.0),
+            "options_pl":            options_pl,
+            "total_securities":      b.get("longStockValue", 0.0),
+            "account_value":         b.get("liquidationValue", 0.0),
+        }
+    except Exception:
+        return {}
+
+
 def check_balance_24_7():
     """
     Runs every 5 minutes around the clock.
-    Only checks for deposits and withdrawals — no trading.
+    Tracks deposits, withdrawals, options P&L changes, and cash on hold changes.
     """
     try:
         from ledger import load_ledger, save_ledger
         accounts  = get_account_numbers()
         encrypted = accounts[0]["hashValue"]
         account   = get_account(encrypted)
-        cash      = get_cash_balance(account)  # total cashBalance
+        cash      = get_cash_balance(account)
+        balances  = get_full_balances(account)
 
         ledger    = load_ledger()
         last_cash = ledger.get("last_known_cash", cash)
 
         print(f"Balance check — last: ${last_cash:.2f} | current: ${cash:.2f}")
 
+        # Deposit detection
         if cash > last_cash + 1:
             deposit = cash - last_cash
             ledger["deposits"]        = ledger.get("deposits", 0.0) + deposit
@@ -522,6 +553,8 @@ def check_balance_24_7():
             ledger["last_known_cash"] = cash
             save_ledger(ledger)
             send_alert(f"💵 +${deposit:,.2f} deposited")
+
+        # Withdrawal detection
         elif last_cash - cash > 1:
             withdrawal = last_cash - cash
             ledger.setdefault("withdrawal_history", []).append({
@@ -535,6 +568,36 @@ def check_balance_24_7():
         else:
             ledger["last_known_cash"] = cash
             save_ledger(ledger)
+
+        # Track options P&L and cash on hold — only notify on significant 24h changes
+        if balances:
+            import time as _t
+
+            # Options P&L — only notify if changed more than $5 since last 24h snapshot
+            curr_options_pl   = balances.get("options_pl", 0.0)
+            last_options_pl   = ledger.get("last_options_pl", curr_options_pl)
+            last_options_time = ledger.get("last_options_notify_time", 0)
+
+            if abs(curr_options_pl - last_options_pl) > 5 and _t.time() - last_options_time > 86400:
+                direction = "📈" if curr_options_pl > last_options_pl else "📉"
+                send_alert(f"{direction} Options ${curr_options_pl:,.0f}")
+                ledger["last_options_pl"] = curr_options_pl
+                ledger["last_options_notify_time"] = _t.time()
+                save_ledger(ledger)
+            else:
+                ledger["last_options_pl"] = curr_options_pl
+                save_ledger(ledger)
+
+            # Cash on hold — only notify when it actually changes (put placed or released)
+            curr_hold = balances.get("cash_on_hold", 0.0)
+            last_hold = ledger.get("last_cash_on_hold", curr_hold)
+            if abs(curr_hold - last_hold) > 1:
+                if curr_hold > last_hold:
+                    send_alert(f"🔒 +${curr_hold - last_hold:,.0f} on hold")
+                else:
+                    send_alert(f"🔓 ${last_hold - curr_hold:,.0f} released")
+                ledger["last_cash_on_hold"] = curr_hold
+                save_ledger(ledger)
 
     except Exception as e:
         print(f"Balance check error: {e}")
