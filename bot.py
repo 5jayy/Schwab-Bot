@@ -744,9 +744,9 @@ def main():
     if is_market_open():
         run_strategy()
 
-    # Trading — only during market hours (checked inside run_strategy)
+    # Schedule next runs — first one fires after CHECK_INTERVAL minutes
+    # so startup run and first scheduled run don't overlap
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy)
-    # Balance monitoring — 24/7 every 5 minutes (lightweight cash check only)
     schedule.every(5).minutes.do(check_balance_24_7)
 
     while True:

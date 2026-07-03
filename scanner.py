@@ -208,6 +208,8 @@ def score_stock(symbol: str, max_price: float = 99999) -> dict | None:
 
     if price <= 0 or price > max_price:
         return None
+    if price < 2.0:  # no penny stocks under $2
+        return None
     if volume < 500000:
         return None
 
@@ -307,27 +309,123 @@ def scan_best_stocks(cash: float, top_n: int = 5) -> list:
     return top
 
 
-def scan_best_etfs(profit_amount: float, top_n: int = 2) -> list:
-    print(f"\n-- Scanning {len(ETF_UNIVERSE)} ETFs | Profit available: ${profit_amount:,.2f} --")
-    results = []
-    for symbol in ETF_UNIVERSE:
-        result = score_stock(symbol, max_price=profit_amount)
-        if result:
-            results.append(result)
-        time.sleep(0.1)
+# ETF categories — each has a role, bot picks best from each dynamically
+ETF_CATEGORIES = {
+    "growth":     ["VOO", "QQQ", "SCHG", "SCHB", "VTI"],        # long term compounders
+    "income":     ["SCHD", "JEPI", "JEPQ", "VYM", "HDV", "DGRO", "DIVO", "VIG"],  # dividend payers
+    "stable":     ["SGOV", "USFR", "JPST", "FLOT"],             # tax/savings, capital preservation
+    "international": ["VEA", "VWO", "SCHF"],                     # global diversification
+}
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+# Dividend handling per category
+# growth = reinvest all, income = split, stable = cash out
+ETF_DIVIDEND_RULES = {
+    "growth":        {"reinvest": 1.0,  "cash": 0.0},
+    "income":        {"reinvest": 0.5,  "cash": 0.5},
+    "stable":        {"reinvest": 0.0,  "cash": 1.0},
+    "international": {"reinvest": 0.75, "cash": 0.25},
+}
+
+
+def get_etf_category(symbol: str) -> str:
+    for cat, symbols in ETF_CATEGORIES.items():
+        if symbol in symbols:
+            return cat
+    return "growth"
+
+
+def score_etf(symbol: str, max_price: float, category: str) -> dict | None:
+    """
+    Score an ETF with looser filters than stocks.
+    ETFs move slower — we want stability + momentum, not aggressive signals.
+    """
+    quote = get_quote(symbol)
+    if not quote:
+        return None
+    try:
+        price      = quote["quote"]["lastPrice"]
+        volume     = quote["quote"]["totalVolume"]
+        change_pct = quote["quote"].get("netPercentChangeInDouble", 0)
+    except (KeyError, TypeError):
+        return None
+
+    if price <= 0 or price > max_price:
+        return None
+    if volume < 100000:  # ETFs need less volume than stocks
+        return None
+
+    candles = get_price_history(symbol, period=20)  # longer lookback for ETFs
+    if len(candles) < 20:
+        return None
+
+    closes = [c["close"] for c in candles]
+    ema9  = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    rsi14 = rsi(closes, 14)
+
+    if not ema9 or not ema21 or not rsi14:
+        return None
+
+    # ETFs — looser RSI range, we just want uptrend not overbought
+    if rsi14 >= 78 or rsi14 <= 25:
+        return None
+
+    # Uptrend preferred but not required for stable category
+    trend_ok = ema9 > ema21
+    if category == "stable":
+        trend_ok = True  # stable ETFs don't need uptrend
+
+    if not trend_ok:
+        return None
+
+    # Score — weight stability for income/stable, momentum for growth
+    trend_score = ((ema9 - ema21) / ema21) * 100 if ema21 > 0 else 0
+    rsi_score   = 100 - abs(rsi14 - 55)
+    mom_score   = change_pct
+
+    if category in ("income", "stable"):
+        # Prefer stability — lower volatility bonus
+        total = (trend_score * 20) + (rsi_score * 0.5) + (mom_score * 5)
+    else:
+        # Growth — prefer momentum
+        total = (trend_score * 35) + (rsi_score * 0.35) + (mom_score * 15)
+
+    return {
+        "symbol":   symbol,
+        "price":    price,
+        "volume":   volume,
+        "rsi":      rsi14,
+        "category": category,
+        "score":    total,
+        "dividend_rule": ETF_DIVIDEND_RULES.get(category, ETF_DIVIDEND_RULES["growth"])
+    }
+
+
+def scan_best_etfs(profit_amount: float, top_n: int = 1) -> list:
+    """
+    Dynamically scan ETFs by category and pick the best overall.
+    Long term holds — not trading in and out.
+    """
+    all_etfs = []
+    for cat, symbols in ETF_CATEGORIES.items():
+        for symbol in symbols:
+            result = score_etf(symbol, profit_amount, cat)
+            if result:
+                all_etfs.append(result)
+            time.sleep(0.1)
+
+    all_etfs.sort(key=lambda x: x["score"], reverse=True)
     seen = set()
     unique = []
-    for r in results:
+    for r in all_etfs:
         if r["symbol"] not in seen:
             seen.add(r["symbol"])
             unique.append(r)
     top = unique[:top_n]
 
-    print(f"Top {len(top)} ETFs found:")
+    print(f"\n-- ETF scan complete | ${profit_amount:,.2f} available --")
     for r in top:
-        print(f"  {r['symbol']}: score={r['score']:.1f} price=${r['price']:.2f}")
+        print(f"  {r['symbol']} ({r['category']}): score={r['score']:.1f} price=${r['price']:.2f}")
 
     return top
 
