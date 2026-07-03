@@ -178,30 +178,11 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
 
         if profit > 0:
             send_alert(
-                f"*Stock Sell — {label} 💰*\n"
-                f"Symbol: {symbol}\n"
-                f"Shares: {quantity}\n"
-                f"Price: ${price:.2f}\n"
-                f"Proceeds: ${proceeds:,.2f}\n"
-                f"Profit: +${profit:,.2f}\n"
-                f"Trigger: {tag}\n\n"
-                f"*Split immediately:*\n"
-                f"→ ETF bucket: +${split['etf_cut']:,.2f} (60%)\n"
-                f"→ Your cash: +${split['cash_cut']:,.2f} (30%)\n"
-                f"→ Bot capital: +${split['bot_cut']:,.2f} (10%)\n\n"
-                f"ETF bucket total: ${get_etf_bucket():,.2f}\n"
-                f"All-time profit: ${get_profit_bucket():,.2f}"
+                f"💰 Sold {symbol} x{quantity} @ ${price:.2f} | +${profit:,.2f}\n"
+                f"→ ETF ${split['etf_cut']:,.0f} | Cash ${split['cash_cut']:,.0f} | Bot ${split['bot_cut']:,.0f}"
             )
         else:
-            send_alert(
-                f"*Stock Sell — {label}*\n"
-                f"Symbol: {symbol}\n"
-                f"Shares: {quantity}\n"
-                f"Price: ${price:.2f}\n"
-                f"Proceeds: ${proceeds:,.2f}\n"
-                f"Loss: ${profit:,.2f}\n"
-                f"Trigger: {tag}"
-            )
+            send_alert(f"📉 Sold {symbol} x{quantity} @ ${price:.2f} | ${profit:,.2f}")
         print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {tag}")
     except Exception as e:
         send_alert(f"*Sell error* {symbol}: {e}")
@@ -300,28 +281,14 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
             if order_location:
                 check = check_order_filled(encrypted, order_location)
                 if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
-                    send_alert(
-                        f"*Order Canceled ❌*\n"
-                        f"Symbol: {symbol}\n"
-                        f"Shares: {quantity}\n"
-                        f"Reason: {check['description']}\n"
-                        f"Cash available: ${cash:,.2f}"
-                    )
+                    send_alert(f"❌ {symbol} canceled — {check['description'][:50]}")
                     bought_this_run.add(symbol)  # don't retry this run
                     continue
 
             cash -= cost
             bought_this_run.add(symbol)
             record_buy(symbol, quantity, price, cost)
-            send_alert(
-                f"*Stock Buy (scanner pick)*\n"
-                f"Symbol: {symbol}\n"
-                f"Shares: {quantity}\n"
-                f"Price: ${price:.2f}\n"
-                f"Cost: ${cost:,.2f}\n"
-                f"Score: {stock['score']:.1f} | RSI: {stock['rsi']:.1f}\n"
-                f"Tier: {tier}"
-            )
+            send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f}")
             print(f"  Bought {quantity} {symbol} @ ${price:.2f}")
         except Exception as e:
             send_alert(f"*Buy error* {symbol}: {e}")
@@ -360,12 +327,7 @@ def run_options_strategy(encrypted: str, positions: list, account_value: float):
             if cc_location:
                 check = check_order_filled(encrypted, cc_location)
                 if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
-                    send_alert(
-                        f"*Covered Call Canceled ❌*\n"
-                        f"Symbol: {symbol}\n"
-                        f"Strike: ${best_call['strike']:.2f}\n"
-                        f"Reason: {check['description']}"
-                    )
+                    send_alert(f"❌ {symbol} call canceled — {check['description'][:50]}")
                     continue
 
             total    = best_call["total_premium"]
@@ -384,16 +346,7 @@ def run_options_strategy(encrypted: str, positions: list, account_value: float):
             save_ledger(ledger)
 
             send_alert(
-                f"*Covered Call Placed 📈*\n"
-                f"Stock: {symbol} ({shares} shares)\n"
-                f"Strike: ${best_call['strike']:.2f}\n"
-                f"Expiry: {best_call['expiry']} ({best_call['dte']} DTE)\n"
-                f"Premium: ${best_call['premium']:.2f}/share\n"
-                f"Total income: ${total:,.2f}\n\n"
-                f"*Split immediately:*\n"
-                f"→ ETF bucket: +${etf_cut:,.2f} (60%)\n"
-                f"→ Your cash: +${cash_cut:,.2f} (30%)\n"
-                f"→ Bot capital: +${bot_cut:,.2f} (10%)"
+                f"📝 {symbol} call ${best_call['strike']:.2f} {best_call['expiry']} | +${total:,.2f} premium"
             )
         except Exception as e:
             send_alert(f"*Covered call error* {symbol}: {e}")
@@ -432,12 +385,7 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
             if put_location:
                 check = check_order_filled(encrypted, put_location)
                 if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
-                    send_alert(
-                        f"*Cash Secured Put Canceled ❌*\n"
-                        f"Symbol: {symbol}\n"
-                        f"Strike: ${best_put['strike']:.2f}\n"
-                        f"Reason: {check['description']}"
-                    )
+                    send_alert(f"❌ {symbol} put canceled — {check['description'][:50]}")
                     continue
 
             total    = best_put["total_premium"]
@@ -455,17 +403,9 @@ def run_cash_secured_puts(encrypted: str, cash: float, account_value: float):
             ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + cash_cut
             save_ledger(ledger)
 
-            msg = (
-                "*Cash Secured Put Placed*\n"
-                f"Stock: {symbol}\n"
-                f"Price: ${best_put['underlying_price']:.2f}\n"
-                f"Strike: ${best_put['strike']:.2f}\n"
-                f"Expiry: {best_put['expiry']} ({best_put['dte']} DTE)\n"
-                f"Premium: ${best_put['premium']:.2f}/share\n"
-                f"Total: ${total:,.2f}\n"
-                f"ETF bucket: +${etf_cut:,.2f} | Cash: +${cash_cut:,.2f} | Bot: +${bot_cut:,.2f}"
+            send_alert(
+                f"📝 {symbol} put ${best_put['strike']:.2f} {best_put['expiry']} | +${total:,.2f} premium"
             )
-            send_alert(msg)
         except Exception as e:
             send_alert(f"*Put error* {symbol}: {e}")
 
@@ -507,15 +447,7 @@ def run_etf_sweep(encrypted: str):
             place_equity_order(encrypted, symbol, quantity, "BUY")
             cost = quantity * price
             deduct_etf_bucket(cost)
-            send_alert(
-                f"*ETF Buy (from profits)*\n"
-                f"Symbol: {symbol}\n"
-                f"Shares: {quantity}\n"
-                f"Price: ${price:.2f}\n"
-                f"Total: ${cost:,.2f}\n"
-                f"Score: {etf['score']:.1f}\n"
-                f"ETF bucket remaining: ${get_etf_bucket():,.2f}"
-            )
+            send_alert(f"📊 Bought {quantity} {symbol} @ ${price:.2f} from profits")
             print(f"Swept ${cost:,.2f} into {symbol}")
         except Exception as e:
             send_alert(f"*ETF sweep error* {symbol}: {e}")
@@ -589,12 +521,7 @@ def check_balance_24_7():
             ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
             ledger["last_known_cash"] = cash
             save_ledger(ledger)
-            send_alert(
-                f"*New Deposit Detected 💵*\n"
-                f"Amount: ${deposit:,.2f}\n"
-                f"Trading capital: ${get_trading_capital():,.2f}\n"
-                f"Cash now available for trading!"
-            )
+            send_alert(f"💵 +${deposit:,.2f} deposited")
         elif last_cash - cash > 1:
             withdrawal = last_cash - cash
             ledger.setdefault("withdrawal_history", []).append({
@@ -604,12 +531,7 @@ def check_balance_24_7():
             ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
             ledger["last_known_cash"] = cash
             save_ledger(ledger)
-            send_alert(
-                f"*Withdrawal Detected 🏦*\n"
-                f"Amount: ${withdrawal:,.2f}\n"
-                f"Total withdrawn all time: ${ledger['total_withdrawn']:,.2f}\n"
-                f"Remaining cash: ${cash:,.2f}"
-            )
+            send_alert(f"🏦 -${withdrawal:,.2f} withdrawn")
         else:
             ledger["last_known_cash"] = cash
             save_ledger(ledger)
@@ -664,12 +586,7 @@ def run_strategy():
 
         # Remind about cash payout if accumulated
         if cash_bucket > 20:
-            send_alert(
-                f"*Your Cash Payout Available 💵*\n"
-                f"${cash_bucket:,.2f} earned from profits\n"
-                f"Sitting in your Schwab cash balance\n"
-                f"Transfer to bank or funded account anytime!"
-            )
+            send_alert(f"💵 ${cash_bucket:,.0f} profit cash ready to withdraw")
 
     except Exception as e:
         msg = f"*Bot error*: {e}"
@@ -699,11 +616,7 @@ def main():
             ledger["last_known_cash"] = cash
             from ledger import save_ledger
             save_ledger(ledger)
-            send_alert(
-                f"*New Deposit Detected 💵*\n"
-                f"Amount: ${deposit:,.2f}\n"
-                f"Cash now available for trading!"
-            )
+            send_alert(f"💵 +${deposit:,.2f} deposited")
         elif last_cash - cash > 1:
             withdrawal = last_cash - cash
             ledger.setdefault("withdrawal_history", []).append({
@@ -714,12 +627,7 @@ def main():
             ledger["last_known_cash"] = cash
             from ledger import save_ledger
             save_ledger(ledger)
-            send_alert(
-                f"*Withdrawal Detected 🏦*\n"
-                f"Amount: ${withdrawal:,.2f}\n"
-                f"Total withdrawn all time: ${ledger['total_withdrawn']:,.2f}\n"
-                f"Remaining cash: ${cash:,.2f}"
-            )
+            send_alert(f"🏦 -${withdrawal:,.2f} withdrawn")
         else:
             ledger["last_known_cash"] = cash
             from ledger import save_ledger
@@ -733,17 +641,18 @@ def main():
         etf_bucket = get_etf_bucket()
         tier       = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
 
+        # Calculate last 24h profit from closed trades
+        import time as _time
+        from ledger import load_ledger as _ll
+        _ledger = _ll()
+        _now = _time.time()
+        _24h_profit = sum(
+            t.get("profit", 0)
+            for t in _ledger.get("closed_trades", [])
+            if _now - _time.mktime(_time.strptime(t.get("sold_at", "2000-01-01T00:00:00Z"), "%Y-%m-%dT%H:%M:%SZ")) < 86400
+        )
         send_alert(
-            f"*Schwab Bot Started ✅*\n"
-            f"Account: ${account_value:,.2f}\n"
-            f"Cash: ${cash:,.2f}\n"
-            f"Trading capital: ${capital:,.2f}\n"
-            f"All-time profit: ${bucket:,.2f}\n"
-            f"ETF bucket: ${etf_bucket:,.2f}\n"
-            f"Split: 60% ETFs / 30% Cash / 10% Bot\n"
-            f"Splits on every profitable sell\n"
-            f"Tier: {tier}\n"
-            f"Scanner active every {CHECK_INTERVAL} min"
+            f"✅ Bot online | Cap ${capital:,.0f} | Cash ${cash:,.0f} | 24h ${_24h_profit:,.0f}"
         )
     except Exception as e:
         print(f"Startup error: {e}")
