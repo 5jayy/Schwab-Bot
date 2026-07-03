@@ -29,19 +29,55 @@ load_dotenv()
 
 
 def is_market_open() -> bool:
-    """Check if US stock market is currently open."""
-    et = pytz.timezone('America/New_York')
-    now = datetime.now(et)
-    # Monday=0, Friday=4 — no weekends
-    if now.weekday() > 4:
-        print(f"Market closed — weekend ({now.strftime('%A')})")
+    """Check market hours using Schwab API — handles holidays and half days automatically."""
+    try:
+        from datetime import date as _date
+        today = _date.today().strftime("%Y-%m-%d")
+        resp = requests.get(
+            f"https://api.schwabapi.com/marketdata/v1/markets",
+            headers={"Authorization": f"Bearer {get_valid_token()}"},
+            params={"markets": "equity", "date": today},
+            timeout=10
+        )
+        if not resp.ok:
+            raise Exception(f"API error {resp.status_code}")
+
+        data = resp.json()
+        # Navigate to equity market hours
+        equity = data.get("equity", {})
+        for session_type in ["EQ", "equity"]:
+            if session_type in equity:
+                market = equity[session_type]
+                is_open = market.get("isOpen", False)
+                if not is_open:
+                    print(f"Market closed — Schwab API says closed today")
+                    return False
+                # Check if current time is within session hours
+                et = pytz.timezone("America/New_York")
+                now = datetime.now(et)
+                session = market.get("sessionHours", {}).get("regularMarket", [{}])[0]
+                start_str = session.get("start", "")
+                end_str   = session.get("end", "")
+                if start_str and end_str:
+                    from datetime import datetime as _dt
+                    start = _dt.fromisoformat(start_str).astimezone(et)
+                    end   = _dt.fromisoformat(end_str).astimezone(et)
+                    if not (start <= now <= end):
+                        print(f"Market closed — outside hours ({now.strftime('%H:%M')} ET)")
+                        return False
+                return True
+        print("Market closed — could not determine hours")
         return False
-    market_open  = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    if not (market_open <= now <= market_close):
-        print(f"Market closed — outside hours ({now.strftime('%H:%M')} ET)")
-        return False
-    return True
+    except Exception as e:
+        # Fallback to pytz-based check if API fails
+        print(f"Market hours API error: {e} — using fallback")
+        et = pytz.timezone("America/New_York")
+        now = datetime.now(et)
+        if now.weekday() > 4:
+            return False
+        market_open  = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+        return market_open <= now <= market_close
 
 def handle_shutdown(signum, frame):
     print("Shutdown signal received — bot stopping cleanly.")
@@ -615,9 +651,19 @@ def check_balance_24_7():
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+# Track last strategy run time to prevent duplicates
+_last_strategy_run = 0
+
 def run_strategy():
+    global _last_strategy_run
+    import time as _t
+    # Prevent duplicate runs within 60 seconds
+    if _t.time() - _last_strategy_run < 60:
+        print("Strategy already ran recently — skipping duplicate")
+        return
     if not is_market_open():
         return
+    _last_strategy_run = _t.time()
     print("\n=== Strategy check ===")
     try:
         accounts      = get_account_numbers()
