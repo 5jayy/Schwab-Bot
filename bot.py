@@ -784,9 +784,9 @@ def main():
         _cash_ready = get_cash_bucket()
 
         if _on_hold > 0:
-            msg = f"✅ Bot online | Cap ${capital:,.0f} | 💵 ${_cash_ready:,.0f} ready | 🔒 ${_on_hold:,.0f} | 24h ${_24h_profit:,.0f}"
+            msg = f"✅ Bot online | 💵 ${_cash_ready:,.0f} ready | 🔒 ${_on_hold:,.0f} | 24h ${_24h_profit:,.0f}"
         else:
-            msg = f"✅ Bot online | Cap ${capital:,.0f} | 💵 ${_cash_ready:,.0f} ready | 24h ${_24h_profit:,.0f}"
+            msg = f"✅ Bot online | 💵 ${_cash_ready:,.0f} ready | 24h ${_24h_profit:,.0f}"
 
         if _pulse:
             msg += f"\n{_pulse}"
