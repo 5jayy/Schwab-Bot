@@ -42,6 +42,27 @@ def get_movers(index: str = "$SPX", direction: str = "up", top: int = 50) -> lis
         return []
 
 
+def get_market_pulse() -> str:
+    """
+    Returns a one-line summary of what's hot in the market right now.
+    Uses live Schwab movers data — no fixed list, pure live data.
+    """
+    try:
+        spx_up   = get_movers("$SPX",   "up",   5)
+        comp_up  = get_movers("$COMPX", "up",   5)
+        spx_down = get_movers("$SPX",   "down", 3)
+
+        top_gainers = list(dict.fromkeys(spx_up + comp_up))[:5]
+        top_losers  = spx_down[:3]
+
+        gainers_str = " ".join(top_gainers) if top_gainers else "none"
+        losers_str  = " ".join(top_losers)  if top_losers  else "none"
+
+        return f"🔥 Hot: {gainers_str} | 📉 Cold: {losers_str}"
+    except Exception as e:
+        return f"Market pulse unavailable: {e}"
+
+
 def get_dynamic_universe() -> list:
     """
     Build a fresh scan universe every cycle from Schwab's live movers.

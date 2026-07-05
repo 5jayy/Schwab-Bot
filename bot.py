@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 from auth import get_valid_token
-from scanner import scan_best_stocks, scan_best_etfs
+from scanner import scan_best_stocks, scan_best_etfs, get_market_pulse
 from strategy import get_trade_stocks, get_signal
 from options import find_best_covered_call, place_covered_call, check_covered_call_already_open, find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
 from dividends import get_recent_dividends
@@ -776,14 +776,17 @@ def main():
         _on_hold  = _balances.get("cash_on_hold", 0.0)
         _avail    = _balances.get("cash_available_trade", cash)
 
+        # Only show market pulse during market hours
+        _pulse = get_market_pulse() if is_market_open() else ""
+
         if _on_hold > 0:
-            send_alert(
-                f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 🔒 ${_on_hold:,.0f} hold | 24h ${_24h_profit:,.0f}"
-            )
+            msg = f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 🔒 ${_on_hold:,.0f} hold | 24h ${_24h_profit:,.0f}"
         else:
-            send_alert(
-                f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 24h ${_24h_profit:,.0f}"
-            )
+            msg = f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 24h ${_24h_profit:,.0f}"
+
+        if _pulse:
+            msg += f"\n{_pulse}"
+        send_alert(msg)
     except Exception as e:
         print(f"Startup error: {e}")
 
