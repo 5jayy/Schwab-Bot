@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 from auth import get_valid_token
-from scanner import scan_best_stocks, scan_best_etfs, get_market_pulse, get_tier
+from scanner import scan_best_stocks, scan_best_etfs, get_market_pulse, get_tier, get_etf_level, BOT_PROFIT_SPLIT, ETF_LEVEL_SETTINGS
 from strategy import get_trade_stocks, get_signal
 from options import find_best_covered_call, place_covered_call, check_covered_call_already_open, find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
 from dividends import get_recent_dividends
@@ -284,7 +284,7 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
         print("Not enough cash to buy — monitoring positions only.")
         return cash
 
-    top_stocks = scan_best_stocks(cash, account_value=account_value)
+    top_stocks = scan_best_stocks(cash, account_value=capital)
     if not top_stocks:
         print("No buy signals found in scan.")
         return cash
@@ -680,7 +680,8 @@ def run_strategy():
         bucket     = get_profit_bucket()
         etf_bucket = get_etf_bucket()
         cash_bucket = get_cash_bucket()
-        tier       = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
+        _t, _tc    = get_tier(capital)
+        tier       = f"{_t} — {_tc['label']}"
 
         print(f"Account: ${account_value:,.2f} | Cash: ${cash:,.2f} | Capital: ${capital:,.2f} | Profit: ${bucket:,.2f} | ETF bucket: ${etf_bucket:,.2f} | {tier}")
 
@@ -759,7 +760,8 @@ def main():
         capital    = get_trading_capital()
         bucket     = get_profit_bucket()
         etf_bucket = get_etf_bucket()
-        tier       = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
+        _t, _tc    = get_tier(capital)
+        tier       = f"{_t} — {_tc['label']}"
 
         # Calculate last 24h profit from closed trades
         import time as _time
