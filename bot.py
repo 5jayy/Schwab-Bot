@@ -779,10 +779,12 @@ def main():
         # Only show market pulse during market hours
         _pulse = get_market_pulse() if is_market_open() else ""
 
+        _cash_ready = get_cash_bucket()
+
         if _on_hold > 0:
-            msg = f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 🔒 ${_on_hold:,.0f} hold | 24h ${_24h_profit:,.0f}"
+            msg = f"✅ Bot online | Cap ${capital:,.0f} | 💵 ${_cash_ready:,.0f} ready | 🔒 ${_on_hold:,.0f} | 24h ${_24h_profit:,.0f}"
         else:
-            msg = f"✅ Bot online | Cap ${capital:,.0f} | Cash ${_avail:,.0f} | 24h ${_24h_profit:,.0f}"
+            msg = f"✅ Bot online | Cap ${capital:,.0f} | 💵 ${_cash_ready:,.0f} ready | 24h ${_24h_profit:,.0f}"
 
         if _pulse:
             msg += f"\n{_pulse}"
