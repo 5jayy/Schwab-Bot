@@ -42,6 +42,43 @@ def get_movers(index: str = "$SPX", direction: str = "up", top: int = 50) -> lis
         return []
 
 
+# ── Bot Capital Tiers ─────────────────────────────────────────────────────────
+BOT_TIER_SETTINGS = {
+    "Tier 1": {"min_price": 2.0, "min_adx": 18, "rsi_low": 25, "rsi_high": 75, "min_volume": 300_000, "top_n": 3, "pos_pct": 0.30, "label": "Building (<$5k)"},
+    "Tier 2": {"min_price": 2.0, "min_adx": 20, "rsi_low": 28, "rsi_high": 72, "min_volume": 500_000, "top_n": 5, "pos_pct": 0.25, "label": "Growth ($5k-$15k)"},
+    "Tier 3": {"min_price": 5.0, "min_adx": 23, "rsi_low": 30, "rsi_high": 70, "min_volume": 750_000, "top_n": 7, "pos_pct": 0.20, "label": "Scaling ($15k-$50k)"},
+    "Tier 4": {"min_price": 10.0, "min_adx": 25, "rsi_low": 32, "rsi_high": 68, "min_volume": 1_000_000, "top_n": 10, "pos_pct": 0.15, "label": "Income ($50k+)"},
+}
+
+ETF_LEVEL_SETTINGS = {
+    "Level 1": {"bot_feed": 0.60, "cash": 0.30, "etf_reinvest": 0.10, "label": "Accumulating (<$10k)"},
+    "Level 2": {"bot_feed": 0.50, "cash": 0.30, "etf_reinvest": 0.20, "label": "Growing ($10k-$30k)"},
+    "Level 3": {"bot_feed": 0.30, "cash": 0.40, "etf_reinvest": 0.30, "label": "Mature ($30k+)"},
+}
+
+BOT_PROFIT_SPLIT = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
+
+
+def get_tier(bot_capital: float) -> tuple:
+    if bot_capital < 5000:
+        return "Tier 1", BOT_TIER_SETTINGS["Tier 1"]
+    elif bot_capital < 15000:
+        return "Tier 2", BOT_TIER_SETTINGS["Tier 2"]
+    elif bot_capital < 50000:
+        return "Tier 3", BOT_TIER_SETTINGS["Tier 3"]
+    else:
+        return "Tier 4", BOT_TIER_SETTINGS["Tier 4"]
+
+
+def get_etf_level(etf_capital: float) -> tuple:
+    if etf_capital < 10000:
+        return "Level 1", ETF_LEVEL_SETTINGS["Level 1"]
+    elif etf_capital < 30000:
+        return "Level 2", ETF_LEVEL_SETTINGS["Level 2"]
+    else:
+        return "Level 3", ETF_LEVEL_SETTINGS["Level 3"]
+
+
 def get_market_pulse() -> str:
     """
     Returns a one-line summary of what's hot in the market right now.

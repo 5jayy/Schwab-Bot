@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 from auth import get_valid_token
-from scanner import scan_best_stocks, scan_best_etfs, get_market_pulse, get_tier, get_etf_level, BOT_PROFIT_SPLIT, ETF_LEVEL_SETTINGS
+from scanner import scan_best_stocks, scan_best_etfs, get_market_pulse, get_tier, get_etf_level
 from strategy import get_trade_stocks, get_signal
 from options import find_best_covered_call, place_covered_call, check_covered_call_already_open, find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
 from dividends import get_recent_dividends
