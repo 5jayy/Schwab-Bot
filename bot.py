@@ -228,15 +228,6 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
 # ── Stock strategy ───────────────────────────────────────────────────────────
 
 def run_stock_strategy(encrypted: str, positions: list, cash: float, account_value: float) -> float:
-    tier          = "Tier 1 (<$5k)" if account_value < 5000 else "Tier 2 (<$20k)" if account_value < 20000 else "Tier 3 ($20k+)"
-    # Position sizing by tier — matches scanner budget
-    if account_value < 5000:
-        pos_pct = 0.30
-    elif account_value < 20000:
-        pos_pct = 0.25
-    else:
-        pos_pct = 0.20
-    position_size = cash * pos_pct
     bought_this_run = set()
 
     # Always check existing positions for sell signals regardless of cash
