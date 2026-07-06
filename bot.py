@@ -228,6 +228,10 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
 # ── Stock strategy ───────────────────────────────────────────────────────────
 
 def run_stock_strategy(encrypted: str, positions: list, cash: float, account_value: float) -> float:
+    capital       = get_trading_capital()
+    tier_name, tier_cfg = get_tier(capital)
+    tier          = tier_cfg["label"]
+    position_size = cash * tier_cfg["pos_pct"]
     bought_this_run = set()
 
     # Always check existing positions for sell signals regardless of cash
@@ -695,27 +699,17 @@ def run_strategy():
         # Always sync ledger with Schwab — picks up portfolio after every update
         sync_ledger_from_schwab(encrypted)
 
-        capital    = get_trading_capital()
-        bucket     = get_profit_bucket()
-        etf_bucket = get_etf_bucket()
+        capital     = get_trading_capital()
+        bucket      = get_profit_bucket()
+        etf_bucket  = get_etf_bucket()
         cash_bucket = get_cash_bucket()
-        _t, _tc    = get_tier(capital)
-        tier       = f"{_t} — {_tc['label']}"
+        t_name, t_cfg = get_tier(capital)
+        tier        = t_cfg["label"]
 
         print(f"Account: ${account_value:,.2f} | Cash: ${cash:,.2f} | Capital: ${capital:,.2f} | Profit: ${bucket:,.2f} | ETF bucket: ${etf_bucket:,.2f} | {tier}")
 
-        # Detect new deposits
-        deposit = detect_deposit(cash)
-
         # Check token health every run
         check_token_health()
-        if deposit > 0:
-            send_alert(
-                f"*New Deposit Detected 💵*\n"
-                f"Amount: ${deposit:,.2f}\n"
-                f"Trading capital: ${get_trading_capital():,.2f}\n"
-                f"Scanning for best stocks now..."
-            )
 
         check_dividends(encrypted)
 
@@ -751,8 +745,8 @@ def main():
         capital    = get_trading_capital()
         bucket     = get_profit_bucket()
         etf_bucket = get_etf_bucket()
-        _t, _tc    = get_tier(capital)
-        tier       = f"{_t} — {_tc['label']}"
+        _tn, _tc   = get_tier(capital)
+        tier       = _tc["label"]
 
         # Calculate last 24h profit from closed trades
         import time as _time
