@@ -563,10 +563,39 @@ def get_full_balances(account: dict) -> dict:
         return {}
 
 
+def get_schwab_transactions(encrypted: str, days_back: int = 1) -> list:
+    """
+    Pull real transaction history from Schwab API.
+    Types: TRADE, CASH_IN_OR_CASH_OUT, DIVIDEND_OR_INTEREST, DIVIDEND_REINVESTMENT
+    This is the source of truth — eliminates false deposit/withdrawal alerts.
+    """
+    from datetime import datetime, timedelta
+    end   = datetime.utcnow()
+    start = end - timedelta(days=days_back)
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/accounts/{encrypted}/transactions",
+            headers=headers(),
+            params={
+                "startDate": start.strftime("%Y-%m-%dT00:00:00.000Z"),
+                "endDate":   end.strftime("%Y-%m-%dT23:59:59.000Z"),
+                "types":     "CASH_IN_OR_CASH_OUT"
+            },
+            timeout=15
+        )
+        if resp.ok:
+            return resp.json() if isinstance(resp.json(), list) else []
+        return []
+    except Exception as e:
+        print(f"Transaction fetch error: {e}")
+        return []
+
+
 def check_balance_24_7():
     """
     Runs every 5 minutes around the clock.
-    Tracks deposits, withdrawals, options P&L changes, and cash on hold changes.
+    Uses Schwab transaction history for accurate deposit/withdrawal detection.
+    No more false alerts from put collateral changes.
     """
     try:
         from ledger import load_ledger, save_ledger
@@ -574,6 +603,7 @@ def check_balance_24_7():
         encrypted = accounts[0]["hashValue"]
         account   = get_account(encrypted)
         cash      = get_cash_balance(account)
+        capital   = get_trading_capital()
         balances  = get_full_balances(account)
 
         ledger    = load_ledger()
@@ -581,40 +611,38 @@ def check_balance_24_7():
 
         print(f"Balance check — last: ${last_cash:.2f} | current: ${cash:.2f}")
 
-        # Deposit detection — ignore if cash increase matches put collateral release
-        if cash > last_cash + 1:
-            deposit = cash - last_cash
-            last_hold = ledger.get("last_cash_on_hold", 0.0)
-            curr_hold = balances.get("cash_on_hold", 0.0) if balances else last_hold
-            hold_released = max(last_hold - curr_hold, 0.0)
+        # Use Schwab transaction history for accurate deposit/withdrawal detection
+        # This eliminates false alerts from put collateral changes
+        seen_txn_ids = set(ledger.get("seen_cash_txn_ids", []))
+        transactions = get_schwab_transactions(encrypted, days_back=1)
 
-            # If cash increase is mostly from collateral release — not a real deposit
-            if deposit <= hold_released + 5:
-                print(f"Cash increase ${deposit:.2f} matches collateral release ${hold_released:.2f} — skipping deposit alert")
-                ledger["last_known_cash"] = cash
-                save_ledger(ledger)
-            else:
-                real_deposit = deposit - hold_released
-                ledger["deposits"]        = ledger.get("deposits", 0.0) + real_deposit
-                ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + real_deposit
-                ledger["last_known_cash"] = cash
-                save_ledger(ledger)
-                send_alert(f"💵 +${real_deposit:,.2f} deposited")
+        for txn in transactions:
+            txn_id = str(txn.get("activityId", txn.get("transactionId", "")))
+            if txn_id in seen_txn_ids:
+                continue
 
-        # Withdrawal detection
-        elif last_cash - cash > 1:
-            withdrawal = last_cash - cash
-            ledger.setdefault("withdrawal_history", []).append({
-                "amount":    withdrawal,
-                "timestamp": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
-            })
-            ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
-            ledger["last_known_cash"] = cash
-            save_ledger(ledger)
-            send_alert(f"🏦 -${withdrawal:,.2f} withdrawn")
-        else:
-            ledger["last_known_cash"] = cash
-            save_ledger(ledger)
+            amount    = txn.get("netAmount", 0.0)
+            desc      = txn.get("description", "")
+            seen_txn_ids.add(txn_id)
+
+            if amount > 1:  # real deposit
+                ledger["deposits"]        = ledger.get("deposits", 0.0) + amount
+                ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + amount
+                send_alert(f"💵 +${amount:,.2f} deposited")
+                print(f"Deposit detected via transactions: ${amount:.2f}")
+            elif amount < -1:  # real withdrawal
+                withdrawal = abs(amount)
+                ledger.setdefault("withdrawal_history", []).append({
+                    "amount":    withdrawal,
+                    "timestamp": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+                })
+                ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
+                send_alert(f"🏦 -${withdrawal:,.2f} withdrawn")
+                print(f"Withdrawal detected via transactions: ${withdrawal:.2f}")
+
+        ledger["seen_cash_txn_ids"] = list(seen_txn_ids)[-200:]  # keep last 200
+        ledger["last_known_cash"]   = cash
+        save_ledger(ledger)
 
         # Track options P&L and cash on hold — only notify on significant 24h changes
         if balances:
@@ -723,36 +751,8 @@ def main():
         cash          = get_cash_balance(account)
         account_value = get_portfolio_value(account)
 
-        # Run balance check BEFORE ledger sync — detects deposits/withdrawals
-        # detect_deposit/withdraw compares cash vs last_known_cash saved in ledger
-        from ledger import load_ledger
-        ledger = load_ledger()
-        last_cash = ledger.get("last_known_cash", cash)
-        print(f"Balance check — last: ${last_cash:.2f} | current: ${cash:.2f}")
-
-        if cash > last_cash + 1:
-            deposit = cash - last_cash
-            ledger["deposits"] = ledger.get("deposits", 0.0) + deposit
-            ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + deposit
-            ledger["last_known_cash"] = cash
-            from ledger import save_ledger
-            save_ledger(ledger)
-            send_alert(f"💵 +${deposit:,.2f} deposited")
-        elif last_cash - cash > 1:
-            withdrawal = last_cash - cash
-            ledger.setdefault("withdrawal_history", []).append({
-                "amount": withdrawal,
-                "timestamp": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
-            })
-            ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + withdrawal
-            ledger["last_known_cash"] = cash
-            from ledger import save_ledger
-            save_ledger(ledger)
-            send_alert(f"🏦 -${withdrawal:,.2f} withdrawn")
-        else:
-            ledger["last_known_cash"] = cash
-            from ledger import save_ledger
-            save_ledger(ledger)
+        # Run balance check on startup using transaction API
+        check_balance_24_7()
 
         print("Syncing ledger with Schwab account...")
         sync_ledger_from_schwab(encrypted)
