@@ -22,7 +22,7 @@ from ledger import (
     deduct_etf_bucket, detect_deposit, detect_withdrawal,
     get_withdrawal_stats, record_dividend, get_dividend_stats,
     mark_dividend_seen, update_high_price, get_trailing_stop_info,
-    BOT_STOCKS, ETF_MIN_SWEEP
+    get_dynamic_stop, BOT_STOCKS, ETF_MIN_SWEEP
 )
 
 load_dotenv()
@@ -249,7 +249,7 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
         if quantity < 1 or price <= 0:
             continue
 
-        # Update peak price tracker for trailing stop
+        # Update peak price tracker
         update_high_price(sym, price)
         trail_info = get_trailing_stop_info(sym)
 
@@ -258,10 +258,15 @@ def run_stock_strategy(encrypted: str, positions: list, cash: float, account_val
         if sig["signal"] == "SELL":
             trigger_reason = "signal"
         elif trail_info:
-            high = trail_info["high_price"]
-            drop_pct = (high - price) / high if high > 0 else 0
-            if drop_pct >= TRAILING_STOP_PCT:
-                trigger_reason = "trailing_stop"
+            stop_info = get_dynamic_stop(
+                trail_info["buy_price"],
+                trail_info["high_price"],
+                price,
+                TRAILING_STOP_PCT
+            )
+            if price <= stop_info["stop_price"]:
+                trigger_reason = stop_info["reason"]
+                print(f"  {sym}: {stop_info['reason']} triggered | profit {stop_info['profit_pct']*100:.1f}% | stop ${stop_info['stop_price']:.2f}")
 
         if trigger_reason:
             # Never sell a stock that has an open covered call

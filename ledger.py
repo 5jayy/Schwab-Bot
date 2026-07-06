@@ -209,7 +209,7 @@ def update_high_price(symbol: str, current_price: float):
 
 
 def get_trailing_stop_info(symbol: str) -> dict | None:
-    """Returns high_price and buy_price for a symbol, or None if not tracked."""
+    """Returns full stop info for a symbol, or None if not tracked."""
     ledger = load_ledger()
     trade = ledger.get("open_trades", {}).get(symbol)
     if not trade:
@@ -218,6 +218,51 @@ def get_trailing_stop_info(symbol: str) -> dict | None:
         "buy_price":  trade["buy_price"],
         "high_price": trade.get("high_price", trade["buy_price"]),
         "quantity":   trade["quantity"]
+    }
+
+
+def get_dynamic_stop(buy_price: float, high_price: float, current_price: float, base_trail: float = 0.07) -> dict:
+    """
+    Dynamic stop — tightens as profit grows, activates breakeven at 2% gain.
+    
+    Profit tiers:
+    - 0-2%   → 7% trail (base)
+    - 2-5%   → breakeven (stop = buy price)
+    - 5-10%  → 5% trail
+    - 10-20% → 4% trail
+    - 20%+   → 3% trail (lock big gains)
+    """
+    if buy_price <= 0:
+        return {"stop_price": 0, "trail_pct": base_trail, "reason": "invalid", "profit_pct": 0}
+
+    profit_pct = (current_price - buy_price) / buy_price
+
+    if profit_pct >= 0.20:
+        trail_pct  = 0.03
+        reason     = "trail_tight_3pct"
+        stop_price = high_price * (1 - trail_pct)
+    elif profit_pct >= 0.10:
+        trail_pct  = 0.04
+        reason     = "trail_tight_4pct"
+        stop_price = high_price * (1 - trail_pct)
+    elif profit_pct >= 0.05:
+        trail_pct  = 0.05
+        reason     = "trail_tight_5pct"
+        stop_price = high_price * (1 - trail_pct)
+    elif profit_pct >= 0.02:
+        trail_pct  = base_trail
+        stop_price = buy_price  # breakeven — never lose on a winner
+        reason     = "breakeven"
+    else:
+        trail_pct  = base_trail
+        stop_price = high_price * (1 - trail_pct)
+        reason     = "trail_base"
+
+    return {
+        "stop_price": stop_price,
+        "trail_pct":  trail_pct,
+        "reason":     reason,
+        "profit_pct": profit_pct
     }
 
 
