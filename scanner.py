@@ -29,6 +29,13 @@ ETF_CATEGORIES = {
 ETF_DIVIDEND_RULES = {cat: {"reinvest": v["reinvest"], "cash": v["cash"]} for cat, v in ETF_CATEGORIES.items()}
 
 
+# Blacklist — securities Schwab restricts from opening transactions
+RESTRICTED_SECURITIES = {
+    "VRAX", "SPCE", "NKLA", "WKHS", "GOEV", "XELA", "CLOV", "SAVA",
+    "PROG", "TTOO", "ATNX", "MNKD", "CTIC", "GSAT"
+}
+
+
 def get_tier(bot_capital: float) -> tuple:
     """Smooth tier — blends settings as capital grows, no hard jumps."""
     tiers = list(BOT_TIERS.items())
@@ -212,6 +219,10 @@ def volume_ok(candles: list, period: int = 20) -> bool:
 
 def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     """Score a stock using live Schwab data. All filters dynamic via tier_cfg."""
+    # Skip known restricted securities
+    if symbol in RESTRICTED_SECURITIES:
+        return None
+
     quote = get_quote(symbol)
     if not quote:
         return None
