@@ -120,11 +120,11 @@ def get_dynamic_universe() -> list:
 
 
 def get_market_pulse() -> str:
-    """One-line market summary using live Schwab movers."""
+    """One-line market summary using live Schwab movers. No overlap between hot/cold."""
     try:
         gainers = list(dict.fromkeys(get_movers("$SPX", "up", 5) + get_movers("$COMPX", "up", 5)))[:5]
-        losers  = get_movers("$SPX", "down", 3)
-        return f"🔥 {' '.join(gainers) or 'none'} | 📉 {' '.join(losers) or 'none'}"
+        losers  = [s for s in get_movers("$SPX", "down", 3) if s not in gainers][:3]
+        return f"🔥 {' '.join(gainers) or 'none'} | 📉 {' '.join(losers) or 'quiet'}"
     except Exception:
         return ""
 
