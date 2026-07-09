@@ -228,6 +228,9 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         return None
     if volume < tier_cfg["min_volume"]:
         return None
+    # Hard minimums regardless of tier — avoid restricted/halted securities
+    if price < 1.50 or volume < 200_000:
+        return None
 
     candles = get_price_history(symbol)
     if len(candles) < 30:

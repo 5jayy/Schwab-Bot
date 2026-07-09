@@ -433,10 +433,19 @@ def run_strategy():
         # ── ETF sweep ──
         run_etf_sweep(encrypted)
 
-        # ── Cash ready reminder ──
+        # ── Cash ready reminder — once per day only ──
         cash_bucket = get_cash_bucket()
         if cash_bucket > 20:
-            send_alert(f"💵 ${cash_bucket:,.0f} profit cash ready to withdraw")
+            import time as _t2
+            ledger2 = load_ledger()
+            last_reminder = ledger2.get("last_cash_reminder_time", 0)
+            last_amount   = ledger2.get("last_cash_reminder_amount", 0)
+            # Only notify if amount changed OR 24 hours passed
+            if abs(cash_bucket - last_amount) > 5 or _t2.time() - last_reminder > 86400:
+                send_alert(f"💵 ${cash_bucket:,.0f} profit cash ready to withdraw")
+                ledger2["last_cash_reminder_time"]   = _t2.time()
+                ledger2["last_cash_reminder_amount"] = cash_bucket
+                save_ledger(ledger2)
 
     except Exception as ex:
         msg = f"Bot error: {ex}"
