@@ -208,6 +208,136 @@ def calc_atr(candles: list, period: int = 14) -> float | None:
         return None
 
 
+def liquidity_sweep(candles: list, lookback: int = 20) -> float:
+    """
+    Detects liquidity sweeps — price spikes through equal highs/lows then reverses.
+    Returns bonus score 0-15. Higher = stronger sweep signal.
+    Dynamic: uses ATR to define what counts as a meaningful sweep.
+    """
+    if len(candles) < lookback + 2:
+        return 0
+    try:
+        highs  = [c["high"]  for c in candles]
+        lows   = [c["low"]   for c in candles]
+        closes = [c["close"] for c in candles]
+        atr    = calc_atr(candles[-lookback:]) or 0
+
+        if atr == 0:
+            return 0
+
+        # Find equal highs in lookback window (within 0.3% of each other)
+        recent_high = max(highs[-lookback:-1])
+        recent_low  = min(lows[-lookback:-1])
+        last_high   = highs[-1]
+        last_low    = lows[-1]
+        last_close  = closes[-1]
+        prev_close  = closes[-2]
+
+        bonus = 0
+
+        # Bullish sweep — price swept below equal lows then reversed up
+        if last_low < recent_low and last_close > prev_close:
+            sweep_depth = (recent_low - last_low) / atr
+            bonus += min(sweep_depth * 5, 15)  # deeper sweep = higher bonus
+
+        # Bearish sweep used as confirmation of uptrend strength
+        if last_high > recent_high and last_close > recent_high:
+            breakout_strength = (last_close - recent_high) / atr
+            bonus += min(breakout_strength * 3, 10)
+
+        return bonus
+    except Exception:
+        return 0
+
+
+def multi_timeframe_check(symbol: str) -> float:
+    """
+    Checks alignment across 5min and 30min timeframes.
+    Returns multiplier 0.5-1.2. Above 1.0 = strong alignment bonus.
+    Dynamic: uses EMA trend on each timeframe.
+    """
+    try:
+        # 5min candles (already have these)
+        candles_5m  = get_price_history(symbol, period=5,  frequency=5)
+        # 30min candles
+        candles_30m = get_price_history(symbol, period=10, frequency=30)
+
+        if len(candles_5m) < 15 or len(candles_30m) < 10:
+            return 1.0  # neutral if not enough data
+
+        closes_5m  = [c["close"] for c in candles_5m]
+        closes_30m = [c["close"] for c in candles_30m]
+
+        e9_5m,  e21_5m  = ema(closes_5m,  9),  ema(closes_5m,  21)
+        e9_30m, e21_30m = ema(closes_30m, 9),  ema(closes_30m, 21)
+
+        if not all([e9_5m, e21_5m, e9_30m, e21_30m]):
+            return 1.0
+
+        both_up = e9_5m > e21_5m and e9_30m > e21_30m
+
+        if both_up:
+            # Measure how aligned — both strongly trending up
+            strength_5m  = (e9_5m  - e21_5m)  / e21_5m
+            strength_30m = (e9_30m - e21_30m) / e21_30m
+            alignment    = (strength_5m + strength_30m) / 2
+            return min(1.0 + alignment * 10, 1.25)  # max 1.25x boost
+        else:
+            return 0.7  # misaligned timeframes — reduce conviction
+
+    except Exception:
+        return 1.0
+
+
+def candlestick_bonus(candles: list) -> float:
+    """
+    Detects 5 high-probability bullish patterns. Returns score bonus 0-12.
+    Dynamic: uses ATR to define meaningful candle body/wick sizes.
+    Patterns: Hammer, Bullish Engulfing, Doji reversal, Morning Star, Breakout candle.
+    """
+    if len(candles) < 3:
+        return 0
+    try:
+        c0 = candles[-1]   # current
+        c1 = candles[-2]   # previous
+        c2 = candles[-3]   # two back
+
+        o0, h0, l0, cl0 = c0["open"], c0["high"], c0["low"], c0["close"]
+        o1, h1, l1, cl1 = c1["open"], c1["high"], c1["low"], c1["close"]
+        o2, h2, l2, cl2 = c2["open"], c2["high"], c2["low"], c2["close"]
+
+        body0  = abs(cl0 - o0)
+        body1  = abs(cl1 - o1)
+        range0 = h0 - l0
+        range1 = h1 - l1
+        bonus  = 0
+
+        # 1. Hammer — small body at top, long lower wick, after downtrend
+        lower_wick = o0 - l0 if cl0 > o0 else cl0 - l0
+        if range0 > 0 and lower_wick > range0 * 0.6 and body0 < range0 * 0.3:
+            bonus += 8
+
+        # 2. Bullish Engulfing — current green candle body engulfs previous red
+        if cl1 < o1 and cl0 > o0 and cl0 > o1 and o0 < cl1:
+            bonus += 10
+
+        # 3. Doji reversal — very small body after red candle (indecision = reversal)
+        if cl1 < o1 and range0 > 0 and body0 < range0 * 0.1:
+            bonus += 5
+
+        # 4. Morning Star — 3 candle pattern: red, doji/small, strong green
+        if cl2 < o2 and body1 < (h1 - l1) * 0.3 and cl0 > o0 and cl0 > (o2 + cl2) / 2:
+            bonus += 12
+
+        # 5. Strong breakout candle — large body, closes near high, above average volume
+        if cl0 > o0 and body0 > range0 * 0.7 and cl0 > h1:
+            bonus += 8
+
+        return min(bonus, 12)  # cap at 12 to not overweight
+    except Exception:
+        return 0
+
+
 def volume_ok(candles: list, period: int = 20) -> bool:
     if len(candles) < period + 1:
         return True
@@ -278,7 +408,15 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     macd_bonus     = min(hist * 100, 10) if hist and hist > 0 else 0
     vol_bonus      = 5 if volume_ok(candles) else 0
 
-    total_score = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus
+    # Advanced signals — liquidity sweep, candlestick patterns
+    sweep_bonus     = liquidity_sweep(candles)
+    candle_bonus    = candlestick_bonus(candles)
+
+    base_score = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus + sweep_bonus + candle_bonus
+
+    # Multi-timeframe alignment multiplier — dynamic per market conditions
+    mtf_mult    = multi_timeframe_check(symbol)
+    total_score = base_score * mtf_mult
 
     # Hard minimum score — nothing under 6-7 passes regardless of tier
     if total_score < max(tier_cfg.get("min_score", 35), 6):
@@ -288,6 +426,9 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         "symbol": symbol, "price": price, "volume": volume,
         "rsi": rsi14, "adx": adx_val, "macd_hist": hist,
         "atr_pct": round(atr_pct, 2) if atr_val and price > 0 else None,
+        "sweep_bonus": round(sweep_bonus, 1),
+        "candle_bonus": round(candle_bonus, 1),
+        "mtf_mult": round(mtf_mult, 2),
         "score": total_score,
     }
 

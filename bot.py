@@ -233,12 +233,6 @@ def can_trade(capital: float, trades_today: int, consecutive_losses: int) -> tup
     if daily_loss >= daily_limit:
         return False, f"daily_loss_limit_${daily_limit:.0f}"
 
-    # Daily profit cap — once up 3% lock the day
-    daily_profit = ledger.get("daily_profit", 0.0)
-    daily_cap = capital * 0.03
-    if daily_profit >= daily_cap:
-        return False, f"daily_profit_cap_${daily_cap:.0f}"
-
     return True, "ok"
 
 
