@@ -248,35 +248,42 @@ def rank_strategies(results: dict) -> list:
 def get_test_symbols(bot_capital: float = 2400) -> list:
     """
     Pull live Schwab movers for backtesting — dynamic, not fixed.
+    Falls back to liquid stocks when market is closed (weekends).
     Number of symbols scales with tier.
     """
     from scanner import get_tier, get_movers
     tier_name, tier_cfg = get_tier(bot_capital)
-
-    # Symbol count scales with tier
     symbol_count = {
-        "Tier 1": 10,
-        "Tier 2": 15,
-        "Tier 3": 20,
-        "Tier 4": 30,
+        "Tier 1": 10, "Tier 2": 15, "Tier 3": 20, "Tier 4": 30
     }.get(tier_name, 15)
 
-    # Pull live movers from multiple indices
     symbols = []
     for index in ["$SPX", "$COMPX", "$DJI"]:
         symbols += get_movers(index, "up", symbol_count // 2)
         time.sleep(0.2)
 
-    # Dedupe
     seen, unique = set(), []
     for s in symbols:
         if s not in seen:
             seen.add(s)
             unique.append(s)
 
-    result = unique[:symbol_count]
-    print(f"Dynamic test universe: {len(result)} symbols ({tier_name})")
-    return result
+    # Fallback when market closed — liquid stocks with good history
+    if not unique:
+        fallback = [
+            "NVDA", "AAPL", "MSFT", "AMD", "TSLA",
+            "COIN", "PLTR", "SOFI", "BAC", "DKNG",
+            "UBER", "SNAP", "RIOT", "MARA", "AAL",
+            "META", "AMZN", "GOOGL", "JPM", "GS",
+            "PYPL", "CRM", "SHOP", "INTC", "MU",
+            "QQQ", "SPY", "SCHD", "VOO", "VTI"
+        ]
+        unique = fallback[:symbol_count]
+        print(f"Market closed — using {len(unique)} fallback symbols ({tier_name})")
+    else:
+        print(f"Dynamic universe: {len(unique)} live movers ({tier_name})")
+
+    return unique
 
 
 def run_backtest(days: int = 60, bot_capital: float = 2400):
