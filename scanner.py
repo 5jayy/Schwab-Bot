@@ -402,23 +402,76 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         if atr_pct < 0.5 or atr_pct > 6.0:
             return None  # too flat or too volatile
 
-    trend_strength = ((ema9 - ema21) / ema21) * 100
-    rsi_score      = 100 - abs(rsi14 - 55)
-    adx_bonus      = min(adx_val, 50) * 0.3 if adx_val else 0
-    macd_bonus     = min(hist * 100, 10) if hist and hist > 0 else 0
-    vol_bonus      = 5 if volume_ok(candles) else 0
+    # Confidence gate — count how many signals confirm
+    # Need at least 5 of 6 for high conviction entry (targets 60-65% win rate)
+    signals_confirmed = 0
+    signal_details    = {}
 
-    # Advanced signals — liquidity sweep, candlestick patterns
-    sweep_bonus     = liquidity_sweep(candles)
-    candle_bonus    = candlestick_bonus(candles)
+    # 1. EMA trend strength — must be meaningful not just crossed
+    trend_strength = ((ema9 - ema21) / ema21) * 100
+    if trend_strength > 0.1:  # at least 0.1% separation
+        signals_confirmed += 1
+        signal_details["ema"] = True
+    else:
+        signal_details["ema"] = False
+
+    # 2. RSI in ideal zone (50-65 sweet spot for momentum)
+    rsi_score = 100 - abs(rsi14 - 57)
+    if 45 <= rsi14 <= 68:
+        signals_confirmed += 1
+        signal_details["rsi"] = True
+    else:
+        signal_details["rsi"] = False
+
+    # 3. ADX strong trend
+    adx_bonus = min(adx_val, 50) * 0.3 if adx_val else 0
+    if adx_val and adx_val >= tier_cfg["min_adx"] + 3:  # above minimum by margin
+        signals_confirmed += 1
+        signal_details["adx"] = True
+    else:
+        signal_details["adx"] = False
+
+    # 4. MACD positive and meaningful
+    macd_bonus = min(hist * 100, 10) if hist and hist > 0 else 0
+    if hist and hist > 0.001:  # meaningfully positive not just noise
+        signals_confirmed += 1
+        signal_details["macd"] = True
+    else:
+        signal_details["macd"] = False
+
+    # 5. Volume confirmed above average
+    vol_ok    = volume_ok(candles)
+    vol_bonus = 5 if vol_ok else 0
+    if vol_ok:
+        signals_confirmed += 1
+        signal_details["volume"] = True
+    else:
+        signal_details["volume"] = False
+
+    # 6. Liquidity sweep or candlestick pattern detected
+    sweep_bonus  = liquidity_sweep(candles)
+    candle_bonus = candlestick_bonus(candles)
+    if sweep_bonus > 3 or candle_bonus > 5:
+        signals_confirmed += 1
+        signal_details["pattern"] = True
+    else:
+        signal_details["pattern"] = False
+
+    # Require at least 5 of 6 signals for high conviction
+    # Dynamic threshold — lower tiers slightly more lenient (4/6), higher tiers strict (5/6)
+    min_signals = 4 if tier_cfg.get("min_score", 35) <= 40 else 5
+    if signals_confirmed < min_signals:
+        return None  # not enough confirmation — skip
 
     base_score = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus + sweep_bonus + candle_bonus
 
-    # Multi-timeframe alignment multiplier — dynamic per market conditions
-    mtf_mult    = multi_timeframe_check(symbol)
+    # Multi-timeframe multiplier — must be above neutral (1.0) to not penalize
+    mtf_mult = multi_timeframe_check(symbol)
+    if mtf_mult < 1.0:
+        return None  # misaligned timeframes — skip entirely
     total_score = base_score * mtf_mult
 
-    # Hard minimum score — nothing under 6-7 passes regardless of tier
+    # Hard minimum score
     if total_score < max(tier_cfg.get("min_score", 35), 6):
         return None
 
