@@ -1,3 +1,8 @@
+"""
+Schwab Auto-Trading Bot
+Figure-8 Capital System | Star Rating | Room-Based Ceiling | Delta Trail | Green-Day Protect
+"""
+
 import os
 import sys
 import signal
@@ -8,8 +13,14 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 from auth import get_valid_token
-from scanner import scan_best_stocks, scan_best_etfs, get_market_pulse, get_tier, get_etf_level, ETF_DIVIDEND_RULES, get_etf_category
-from options import find_best_covered_call, place_covered_call, check_covered_call_already_open, find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
+from scanner import (
+    scan_best_stocks, scan_best_etfs, get_market_pulse,
+    get_tier, get_etf_level, ETF_DIVIDEND_RULES, get_etf_category
+)
+from options import (
+    find_best_covered_call, place_covered_call, check_covered_call_already_open,
+    find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
+)
 from dividends import get_recent_dividends
 from telegram import send_alert
 from token_manager import check_token_health
@@ -27,11 +38,21 @@ from ledger import (
 load_dotenv()
 
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
+MARKET_URL        = "https://api.schwabapi.com/marketdata/v1"
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
-ETF_PCT           = float(os.getenv("ETF_PCT", 0.60))
-CASH_PCT          = float(os.getenv("CASH_PCT", 0.30))
-BOT_PCT           = float(os.getenv("BOT_PCT", 0.10))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
+
+# ── Profit splits ─────────────────────────────────────────────────────────────
+STOCK_SPLIT  = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
+OPTIONS_SPLIT = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
+ETF_SPLITS   = {
+    "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
+    "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
+    "Level 3": {"bot": 0.30, "cash": 0.40, "etf": 0.30},
+}
+
+# ── Safety floor ──────────────────────────────────────────────────────────────
+BOT_FLOOR = 500.0  # never let bot capital drop below this
 
 
 def handle_shutdown(signum, frame):
@@ -55,13 +76,13 @@ def get_account_numbers() -> list:
 
 
 def get_account(encrypted: str) -> dict:
-    resp = requests.get(f"{BASE_URL}/accounts/{encrypted}", headers=headers(), params={"fields": "positions"})
+    resp = requests.get(f"{BASE_URL}/accounts/{encrypted}",
+                        headers=headers(), params={"fields": "positions"})
     resp.raise_for_status()
     return resp.json()
 
 
 def get_cash_balance(account: dict) -> float:
-    """Total cash — used for deposit/withdrawal tracking."""
     try:
         return max(account["securitiesAccount"]["currentBalances"].get("cashBalance", 0.0), 0.0)
     except KeyError:
@@ -69,11 +90,10 @@ def get_cash_balance(account: dict) -> float:
 
 
 def get_available_cash(account: dict) -> float:
-    """Cash available for trading — excludes put collateral."""
     try:
         b = account["securitiesAccount"]["currentBalances"]
-        avail = b.get("cashAvailableForTrading")
-        return max(avail if avail is not None else b.get("cashBalance", 0.0), 0.0)
+        a = b.get("cashAvailableForTrading")
+        return max(a if a is not None else b.get("cashBalance", 0.0), 0.0)
     except KeyError:
         return 0.0
 
@@ -106,14 +126,25 @@ def get_cash_on_hold(account: dict) -> float:
         return 0.0
 
 
-# ── Market hours (Schwab API — knows holidays/half days) ─────────────────────
+def get_live_bid(symbol: str) -> float | None:
+    """Get real-time bid price from Schwab for delta trail."""
+    try:
+        resp = requests.get(f"{MARKET_URL}/quotes", headers=headers(),
+                            params={"symbols": symbol}, timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get(symbol, {})
+        return data.get("quote", {}).get("bidPrice")
+    except Exception:
+        return None
+
+
+# ── Market hours ──────────────────────────────────────────────────────────────
 
 def is_market_open() -> bool:
     try:
         from datetime import date as _d
         resp = requests.get(
-            "https://api.schwabapi.com/marketdata/v1/markets",
-            headers=headers(),
+            f"{MARKET_URL}/markets", headers=headers(),
             params={"markets": "equity", "date": _d.today().strftime("%Y-%m-%d")},
             timeout=10
         )
@@ -146,6 +177,184 @@ def is_market_open() -> bool:
         return now.replace(hour=9, minute=30) <= now <= now.replace(hour=16, minute=0)
 
 
+# ── Star Rating (1-10) ────────────────────────────────────────────────────────
+
+def get_star_rating(stock: dict) -> int:
+    """
+    Grade signal confluence strength 1-10.
+    Sweep depth + volume ratio + ADX + MACD + RSI position.
+    """
+    stars = 0
+
+    # Sweep depth (0-3 pts)
+    sweep = stock.get("sweep_bonus", 0)
+    if sweep >= 10:   stars += 3
+    elif sweep >= 5:  stars += 2
+    elif sweep >= 1:  stars += 1
+
+    # Volume ratio (0-2 pts)
+    vol_ratio = stock.get("volume", 0) / max(stock.get("avg_volume", stock.get("volume", 1)), 1)
+    if vol_ratio >= 2.0:   stars += 2
+    elif vol_ratio >= 1.3: stars += 1
+
+    # ADX strength (0-2 pts)
+    adx = stock.get("adx") or 0
+    if adx >= 30:   stars += 2
+    elif adx >= 22: stars += 1
+
+    # MACD (0-2 pts)
+    hist = stock.get("macd_hist") or 0
+    if hist >= 0.05:   stars += 2
+    elif hist >= 0.01: stars += 1
+
+    # RSI sweet spot 50-65 (0-1 pt)
+    rsi = stock.get("rsi", 50)
+    if 50 <= rsi <= 65: stars += 1
+
+    return min(max(stars, 1), 10)
+
+
+# ── Room-based ceiling ────────────────────────────────────────────────────────
+
+def get_ceiling(bot_capital: float) -> float:
+    """
+    Position ceiling based on room (capital above safety floor).
+    Protects thin accounts, opens up as capital grows.
+    """
+    room = bot_capital - BOT_FLOOR
+    if room <= 0:      return 0
+    if room < 500:     return 50
+    if room < 1000:    return 100
+    if room < 2000:    return 200
+    if room < 5000:    return 400
+    if room < 10000:   return 600
+    return 1000
+
+
+def get_position_size(star: int, ceiling: float) -> float:
+    """Star rating scales actual size within ceiling."""
+    if star <= 3:   return ceiling * 0.25
+    if star <= 6:   return ceiling * 0.50
+    if star <= 9:   return ceiling * 0.75
+    return ceiling
+
+
+# ── Daily stats ───────────────────────────────────────────────────────────────
+
+def get_daily_stats() -> dict:
+    ledger = load_ledger()
+    today  = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    if ledger.get("daily_stats_date") != today:
+        ledger.update({
+            "daily_stats_date":   today,
+            "daily_loss_stock":   0.0,
+            "daily_loss_options": 0.0,
+            "daily_profit":       0.0,
+            "daily_peak":         0.0,
+            "trades_today":       0,
+            "consecutive_losses": 0,
+        })
+        save_ledger(ledger)
+    return {
+        "trades_today":       ledger.get("trades_today", 0),
+        "consecutive_losses": ledger.get("consecutive_losses", 0),
+        "daily_loss_stock":   ledger.get("daily_loss_stock", 0.0),
+        "daily_loss_options": ledger.get("daily_loss_options", 0.0),
+        "daily_profit":       ledger.get("daily_profit", 0.0),
+        "daily_peak":         ledger.get("daily_peak", 0.0),
+    }
+
+
+def record_trade_result(profit: float, trade_type: str = "stock"):
+    """Update daily stats after every trade."""
+    ledger = load_ledger()
+    ledger["trades_today"] = ledger.get("trades_today", 0) + 1
+    if profit > 0:
+        ledger["daily_profit"]       = ledger.get("daily_profit", 0.0) + profit
+        ledger["daily_peak"]         = max(ledger.get("daily_peak", 0.0), ledger["daily_profit"])
+        ledger["consecutive_losses"] = 0
+    else:
+        if trade_type == "options":
+            ledger["daily_loss_options"] = ledger.get("daily_loss_options", 0.0) + abs(profit)
+        else:
+            ledger["daily_loss_stock"] = ledger.get("daily_loss_stock", 0.0) + abs(profit)
+        ledger["consecutive_losses"] = ledger.get("consecutive_losses", 0) + 1
+    save_ledger(ledger)
+
+
+def update_win_rate(profit: float):
+    ledger  = load_ledger()
+    history = ledger.get("win_rate_history", [])
+    history.append(1 if profit > 0 else 0)
+    ledger["win_rate_history"]  = history[-10:]
+    ledger["current_win_rate"]  = sum(ledger["win_rate_history"]) / len(ledger["win_rate_history"])
+    save_ledger(ledger)
+
+
+def get_win_rate() -> float:
+    ledger  = load_ledger()
+    history = ledger.get("win_rate_history", [])
+    return sum(history) / len(history) if history else 1.0
+
+
+# ── Can trade gatekeeper ──────────────────────────────────────────────────────
+
+def can_trade(capital: float, stats: dict, star: int) -> tuple:
+    """
+    Dynamic gatekeeper — all checks before any buy.
+    Returns (bool, reason).
+    """
+    # Warmup — skip 9:30-9:45 ET
+    et  = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.replace(hour=9, minute=30) <= now <= now.replace(hour=9, minute=45):
+        return False, "warmup"
+
+    # Star minimum — nothing under 4
+    if star < 4:
+        return False, f"star_{star}_too_low"
+
+    # Cooldown — 2 consecutive losses
+    if stats["consecutive_losses"] >= 2:
+        return False, "cooldown_2_losses"
+
+    # Win rate gate
+    wr = get_win_rate()
+    if wr < 0.40:
+        return False, f"win_rate_{wr:.0%}"
+
+    # Stock daily loss limit — 2% of bot capital
+    stock_limit = capital * 0.02
+    if stats["daily_loss_stock"] >= stock_limit:
+        return False, f"stock_daily_cap_${stock_limit:.0f}"
+
+    # Green-day protect — if up on day, check 30% giveback rule
+    peak = stats["daily_peak"]
+    if peak > 0:
+        profit = stats["daily_profit"]
+        if profit < peak * 0.70:
+            return False, "green_day_70pct_trail"
+
+    return True, "ok"
+
+
+# ── Green-day scale-to-fit ────────────────────────────────────────────────────
+
+def green_day_scale(position_size: float, stats: dict) -> float:
+    """
+    Shrink position size once up on the day so max loss ≤ 30% of peak.
+    """
+    peak = stats["daily_peak"]
+    if peak <= 0:
+        return position_size
+    # Max we can lose = 30% of peak
+    max_loss    = peak * 0.30
+    stop_pct    = TRAILING_STOP_PCT
+    # position × stop_pct ≤ max_loss → position ≤ max_loss / stop_pct
+    max_size    = max_loss / stop_pct
+    return min(position_size, max_size)
+
+
 # ── Order helpers ─────────────────────────────────────────────────────────────
 
 def place_equity_order(encrypted: str, symbol: str, quantity: int, instruction: str):
@@ -167,119 +376,56 @@ def check_order_filled(encrypted: str, location: str) -> dict:
         resp = requests.get(location, headers=headers(), timeout=10)
         resp.raise_for_status()
         d = resp.json()
-        return {"status": d.get("status", "UNKNOWN"), "description": d.get("statusDescription", ""), "filled": d.get("status") == "FILLED"}
+        return {"status": d.get("status", "UNKNOWN"),
+                "description": d.get("statusDescription", ""),
+                "filled": d.get("status") == "FILLED"}
     except Exception as ex:
         return {"status": "UNKNOWN", "description": str(ex), "filled": False}
 
 
-# ── Win rate tracker ──────────────────────────────────────────────────────────
+# ── Delta trail (live bid/ask) ────────────────────────────────────────────────
 
-def update_win_rate(profit: float):
-    """Track rolling 10-trade win rate. Tightens filters if below 40%."""
-    ledger = load_ledger()
-    history = ledger.get("win_rate_history", [])
-    history.append(1 if profit > 0 else 0)
-    ledger["win_rate_history"] = history[-10:]  # rolling 10
-    win_rate = sum(ledger["win_rate_history"]) / len(ledger["win_rate_history"])
-    ledger["current_win_rate"] = win_rate
-    save_ledger(ledger)
-    return win_rate
-
-
-def get_win_rate() -> float:
-    ledger = load_ledger()
-    history = ledger.get("win_rate_history", [])
-    if not history:
-        return 1.0  # assume good until data exists
-    return sum(history) / len(history)
-
-
-# ── Can trade gatekeeper ──────────────────────────────────────────────────────
-
-def can_trade(capital: float, trades_today: int, consecutive_losses: int) -> tuple:
+def check_delta_trail(symbol: str, entry_px: float, high_px: float,
+                      current_px: float, atr_pct: float) -> dict:
     """
-    Dynamic gatekeeper — checks all conditions before allowing a buy.
-    Returns (bool, reason_string).
-    All thresholds dynamic based on capital and tier.
+    Once position up 5% — switch to live bid trail.
+    Trail = best bid - 1 ATR.
+    Books profits near peak before giveback.
     """
-    tier_name, tier_cfg = get_tier(capital)
+    profit_pct = (current_px - entry_px) / entry_px
+    if profit_pct < 0.05:
+        return {"active": False, "stop_price": None}
 
-    # Warmup — skip first 15 min after open (9:30-9:45 ET)
-    et  = pytz.timezone("America/New_York")
-    now = datetime.now(et)
-    open_time = now.replace(hour=9, minute=30, second=0)
-    warmup_end = now.replace(hour=9, minute=45, second=0)
-    if open_time <= now <= warmup_end:
-        return False, "warmup"
+    bid = get_live_bid(symbol)
+    if bid is None:
+        bid = current_px
 
-    # Max trades per day — dynamic per tier
-    max_trades = int(tier_cfg.get("max_trades", 5))
-    if trades_today >= max_trades:
-        return False, f"max_trades_{max_trades}"
+    atr_dollar  = current_px * (atr_pct / 100) if atr_pct else current_px * 0.02
+    trail_price = bid - atr_dollar
 
-    # Cooldown — 2 consecutive losses → pause 60 min
-    if consecutive_losses >= 2:
-        return False, "cooldown_2_losses"
-
-    # Win rate — if below 40% tighten to only best signals
-    win_rate = get_win_rate()
-    if win_rate < 0.40:
-        return False, f"win_rate_low_{win_rate:.0%}"
-
-    # Daily loss limit — dynamic: 2% of bot capital
-    ledger = load_ledger()
-    daily_loss = ledger.get("daily_loss", 0.0)
-    daily_limit = capital * 0.02
-    if daily_loss >= daily_limit:
-        return False, f"daily_loss_limit_${daily_limit:.0f}"
-
-    return True, "ok"
-
-
-def get_daily_stats() -> dict:
-    ledger = load_ledger()
-    today  = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
-    if ledger.get("daily_stats_date") != today:
-        ledger["daily_stats_date"]    = today
-        ledger["daily_loss"]          = 0.0
-        ledger["daily_profit"]        = 0.0
-        ledger["trades_today"]        = 0
-        ledger["consecutive_losses"]  = 0
-        save_ledger(ledger)
     return {
-        "trades_today":       ledger.get("trades_today", 0),
-        "consecutive_losses": ledger.get("consecutive_losses", 0),
-        "daily_loss":         ledger.get("daily_loss", 0.0),
-        "daily_profit":       ledger.get("daily_profit", 0.0),
+        "active":      True,
+        "stop_price":  trail_price,
+        "bid":         bid,
+        "atr_dollar":  round(atr_dollar, 2),
+        "profit_pct":  round(profit_pct * 100, 1),
     }
-
-
-def record_trade_result(profit: float):
-    """Update daily stats and win rate after every trade."""
-    ledger = load_ledger()
-    ledger["trades_today"] = ledger.get("trades_today", 0) + 1
-    if profit > 0:
-        ledger["daily_profit"]       = ledger.get("daily_profit", 0.0) + profit
-        ledger["consecutive_losses"] = 0
-    else:
-        ledger["daily_loss"]         = ledger.get("daily_loss", 0.0) + abs(profit)
-        ledger["consecutive_losses"] = ledger.get("consecutive_losses", 0) + 1
-    save_ledger(ledger)
-    return update_win_rate(profit)
 
 
 # ── Execute sell ──────────────────────────────────────────────────────────────
 
-def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash: float, reason: str = "signal") -> float:
+def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
+                 cash: float, reason: str = "signal", star: int = 0) -> float:
     try:
         place_equity_order(encrypted, symbol, quantity, "SELL")
         proceeds = quantity * price
-        split    = record_sell_and_split(symbol, quantity, price, proceeds, ETF_PCT, CASH_PCT, BOT_PCT)
+        split    = record_sell_and_split(symbol, quantity, price, proceeds,
+                                         STOCK_SPLIT["etf"], STOCK_SPLIT["cash"], STOCK_SPLIT["bot"])
         cash    += proceeds
         profit   = split["profit"]
-        tag      = "🛑 Stop" if "stop" in reason or "breakeven" in reason else "Signal"
 
-        record_trade_result(profit)
+        record_trade_result(profit, "stock")
+        update_win_rate(profit)
 
         if profit > 0:
             send_alert(
@@ -287,11 +433,41 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float, cash:
                 f"→ ETF ${split['etf_cut']:,.0f} | Cash ${split['cash_cut']:,.0f} | Bot ${split['bot_cut']:,.0f}"
             )
         else:
-            send_alert(f"📉 Sold {symbol} x{quantity} @ ${price:.2f} | ${profit:,.2f} | {tag}")
+            tag = "🛑" if "stop" in reason or "trail" in reason or "breakeven" in reason else "📉"
+            send_alert(f"{tag} Sold {symbol} x{quantity} @ ${price:.2f} | ${profit:,.2f}")
         print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {reason}")
     except Exception as ex:
         send_alert(f"Sell error {symbol}: {ex}")
     return cash
+
+
+# ── Daily summary ─────────────────────────────────────────────────────────────
+
+def send_daily_summary():
+    """Send 4 PM daily summary with consistency tracking."""
+    ledger = load_ledger()
+    stats  = get_daily_stats()
+    wr_history = ledger.get("win_rate_history", [])
+    win_rate   = sum(wr_history) / len(wr_history) * 100 if wr_history else 0
+
+    # Consistency % — how many of last 10 days were profitable
+    daily_history = ledger.get("daily_pnl_history", [])
+    daily_history.append(stats["daily_profit"])
+    ledger["daily_pnl_history"] = daily_history[-10:]
+    consistency = sum(1 for d in daily_history if d > 0) / len(daily_history) * 100 if daily_history else 0
+    save_ledger(ledger)
+
+    capital    = get_trading_capital()
+    stock_cap  = capital * 0.02
+    stock_used = stats["daily_loss_stock"] / stock_cap * 100 if stock_cap > 0 else 0
+
+    send_alert(
+        f"📊 Daily Summary\n"
+        f"Trades: {stats['trades_today']} | "
+        f"P&L: ${stats['daily_profit']:+,.0f} | Peak: ${stats['daily_peak']:,.0f}\n"
+        f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
+        f"Stock daily cap used: {stock_used:.0f}%"
+    )
 
 
 # ── Main strategy ─────────────────────────────────────────────────────────────
@@ -312,32 +488,32 @@ def run_strategy():
         sync_ledger_from_schwab(encrypted)
         check_token_health()
 
-        capital     = get_trading_capital()
+        capital   = get_trading_capital()
+        ceiling   = get_ceiling(capital)
+        stats     = get_daily_stats()
         tier_name, tier_cfg = get_tier(capital)
-        daily_stats = get_daily_stats()
 
-        print(f"Account: ${account_value:,.2f} | Cash: ${cash:,.2f} | Capital: ${capital:,.2f} | {tier_name}")
+        print(f"Account: ${account_value:,.2f} | Capital: ${capital:,.2f} | Ceiling: ${ceiling:,.0f} | {tier_name}")
 
-        # ── Dividends ──
         check_dividends(encrypted)
 
-        # ── Sell signals + dynamic stops ──
+        # ── Sell signals + dynamic stops + delta trail ──
         sold_this_run = set()
         for pos in positions:
             sym = pos["instrument"]["symbol"]
             if sym not in BOT_STOCKS or sym in sold_this_run:
                 continue
 
-            price    = pos.get("marketValue", 0) / max(pos.get("longQuantity", 1), 1)
-            quantity = int(pos.get("longQuantity", 0))
-            if quantity < 1 or price <= 0:
+            qty    = int(pos.get("longQuantity", 0))
+            price  = pos.get("marketValue", 0) / max(qty, 1)
+            if qty < 1 or price <= 0:
                 continue
 
             update_high_price(sym, price)
             trail_info = get_trailing_stop_info(sym)
             trigger    = None
 
-            # Get live signal
+            # Signal sell
             try:
                 from strategy import get_signal
                 sig = get_signal(sym)
@@ -348,96 +524,94 @@ def run_strategy():
                 pass
 
             if not trigger and trail_info:
-                stop_info = get_dynamic_stop(trail_info["buy_price"], trail_info["high_price"], price, TRAILING_STOP_PCT)
-                if price <= stop_info["stop_price"]:
-                    trigger = stop_info["reason"]
+                buy_px  = trail_info["buy_price"]
+                high_px = trail_info["high_price"]
+
+                # Delta trail check (live bid/ask)
+                atr_pct = 2.0  # default, ideally from scanner
+                delta   = check_delta_trail(sym, buy_px, high_px, price, atr_pct)
+                if delta["active"] and price <= delta["stop_price"]:
+                    trigger = "delta_trail"
+                    send_alert(f"🎯 Trail exit {sym} | Bid ${delta['bid']:.2f} | +{delta['profit_pct']}%")
+                else:
+                    # Dynamic stop fallback
+                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT)
+                    if price <= stop_info["stop_price"]:
+                        trigger = stop_info["reason"]
+                        if stop_info["reason"] == "breakeven":
+                            send_alert(f"🛡️ Breakeven exit {sym} | Protected")
 
             if trigger:
                 if check_covered_call_already_open(encrypted, sym):
                     print(f"  {sym}: skip sell — covered call open")
                     continue
                 sold_this_run.add(sym)
-                cash = execute_sell(encrypted, sym, quantity, price, cash, trigger)
+                cash = execute_sell(encrypted, sym, qty, price, cash, trigger)
 
         # ── Buy signals ──
         if cash >= 10:
-            ok, reason = can_trade(capital, daily_stats["trades_today"], daily_stats["consecutive_losses"])
-            if not ok:
-                print(f"  Buying paused — {reason}")
-            else:
-                base_size = cash * tier_cfg["pos_pct"]
-                top_stocks = scan_best_stocks(cash, bot_capital=capital)
-                bought_this_run = set()
+            top_stocks = scan_best_stocks(cash, bot_capital=capital)
+            bought_this_run = set()
 
-                for stock in top_stocks:
-                    symbol = stock["symbol"]
-                    price  = stock["price"]
-                    score  = stock["score"]
-                    adx_val = stock.get("adx") or 0
+            for stock in top_stocks:
+                symbol = stock["symbol"]
+                price  = stock["price"]
+                star   = get_star_rating(stock)
 
-                    if symbol in bought_this_run or get_position_for(positions, symbol):
-                        continue
-                    if score < max(tier_cfg.get("min_score", 35), 6):
-                        continue
-                    if cash < price:
-                        continue
+                if symbol in bought_this_run or get_position_for(positions, symbol):
+                    continue
+                if price > cash:
+                    continue
 
-                    # Dynamic quantity — scales with ADX strength, score quality, win rate
-                    adx_mult  = 1.0 if adx_val >= 25 else 0.75 if adx_val >= 20 else 0.5
-                    score_mult = 1.0 if score >= 60 else 0.75 if score >= 40 else 0.5
-                    wr        = get_win_rate()
-                    wr_mult   = 1.1 if wr >= 0.70 else 0.5 if wr < 0.40 else 1.0
+                ok, reason = can_trade(capital, stats, star)
+                if not ok:
+                    print(f"  {symbol}: skip — {reason}")
+                    continue
 
-                    position_size = base_size * adx_mult * score_mult * wr_mult
+                # Position sizing — star × ceiling, scaled for green-day
+                position_size = get_position_size(star, ceiling)
+                position_size = green_day_scale(position_size, stats)
+                position_size = min(position_size, cash)
 
-                    # Skip if adjusted size too small to buy even 1 share
-                    if position_size < price:
-                        print(f"  {symbol}: position too small after quality adjustment — skip")
-                        continue
+                quantity = int(position_size // price)
+                if quantity < 1:
+                    continue
 
-                    quantity = int(position_size // price)
-                    if quantity < 1:
-                        continue
+                try:
+                    resp     = place_equity_order(encrypted, symbol, quantity, "BUY")
+                    location = resp.headers.get("Location", "")
+                    cost     = quantity * price
 
-                    try:
-                        resp     = place_equity_order(encrypted, symbol, quantity, "BUY")
-                        location = resp.headers.get("Location", "")
-                        cost     = quantity * price
+                    if location:
+                        chk = check_order_filled(encrypted, location)
+                        if not chk["filled"] and chk["status"] in ("REJECTED", "CANCELED"):
+                            send_alert(f"❌ {symbol} canceled — {chk['description'][:50]}")
+                            bought_this_run.add(symbol)
+                            continue
 
-                        if location:
-                            check = check_order_filled(encrypted, location)
-                            if not check["filled"] and check["status"] in ("REJECTED", "CANCELED"):
-                                send_alert(f"❌ {symbol} canceled — {check['description'][:50]}")
-                                bought_this_run.add(symbol)
-                                continue
-
-                        cash -= cost
-                        bought_this_run.add(symbol)
-                        record_buy(symbol, quantity, price, cost)
-                        send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f}")
-                        print(f"  Bought {quantity} {symbol} @ ${price:.2f}")
-                    except Exception as ex:
-                        send_alert(f"Buy error {symbol}: {ex}")
-        else:
-            print("Not enough cash — monitoring only.")
+                    cash -= cost
+                    bought_this_run.add(symbol)
+                    record_buy(symbol, quantity, price, cost)
+                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | ⭐{star} | ${cost:,.0f}")
+                    print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
+                except Exception as ex:
+                    send_alert(f"Buy error {symbol}: {ex}")
 
         # ── Options ──
-        run_options(encrypted, positions, cash)
+        run_options(encrypted, positions, cash, stats, capital)
 
         # ── ETF sweep ──
         run_etf_sweep(encrypted)
 
-        # ── Cash ready reminder — once per day only ──
+        # ── Cash ready reminder — once per day ──
         cash_bucket = get_cash_bucket()
         if cash_bucket > 20:
-            import time as _t2
             ledger2 = load_ledger()
-            last_reminder = ledger2.get("last_cash_reminder_time", 0)
-            last_amount   = ledger2.get("last_cash_reminder_amount", 0)
-            # Only notify if amount changed OR 24 hours passed
-            if abs(cash_bucket - last_amount) > 5 or _t2.time() - last_reminder > 86400:
+            last_time = ledger2.get("last_cash_reminder_time", 0)
+            last_amt  = ledger2.get("last_cash_reminder_amount", 0)
+            if abs(cash_bucket - last_amt) > 5 or time.time() - last_time > 86400:
                 send_alert(f"💵 ${cash_bucket:,.0f} profit cash ready to withdraw")
-                ledger2["last_cash_reminder_time"]   = _t2.time()
+                ledger2["last_cash_reminder_time"]   = time.time()
                 ledger2["last_cash_reminder_amount"] = cash_bucket
                 save_ledger(ledger2)
 
@@ -447,9 +621,15 @@ def run_strategy():
         send_alert(msg)
 
 
-# ── Options (covered calls + puts) ───────────────────────────────────────────
+# ── Options ───────────────────────────────────────────────────────────────────
 
-def run_options(encrypted: str, positions: list, cash: float):
+def run_options(encrypted: str, positions: list, cash: float, stats: dict, capital: float):
+    # Options daily cap check — 1% of bot capital
+    options_limit = capital * 0.01
+    if stats["daily_loss_options"] >= options_limit:
+        print(f"  Options daily cap hit (${options_limit:.0f}) — skipping")
+        return
+
     # Covered calls
     print("\n-- Covered calls --")
     for pos in positions:
@@ -464,7 +644,8 @@ def run_options(encrypted: str, positions: list, cash: float):
         if not call:
             continue
         try:
-            resp = place_covered_call(encrypted, call["option_symbol"], call["contracts"], call["premium"])
+            resp = place_covered_call(encrypted, call["option_symbol"],
+                                      call["contracts"], call["premium"])
             loc  = resp.headers.get("Location", "")
             if loc:
                 chk = check_order_filled(encrypted, loc)
@@ -472,7 +653,7 @@ def run_options(encrypted: str, positions: list, cash: float):
                     send_alert(f"❌ {sym} call canceled — {chk['description'][:50]}")
                     continue
             total = call["total_premium"]
-            _record_options_profit(total)
+            _record_options_income(total)
             send_alert(f"📝 {sym} call ${call['strike']:.2f} {call['expiry']} | +${total:,.2f}")
         except Exception as ex:
             print(f"  Call error {sym}: {ex}")
@@ -481,11 +662,13 @@ def run_options(encrypted: str, positions: list, cash: float):
     if cash < 200:
         return
     print(f"\n-- Cash secured puts | ${cash:,.2f} --")
-    capital   = get_trading_capital()
     candidates = scan_best_stocks(cash, bot_capital=capital)
     for stock in candidates:
         sym   = stock["symbol"]
         price = stock["price"]
+        star  = get_star_rating(stock)
+        if star < 6:
+            continue  # options need strong signal
         if check_put_already_open(encrypted, sym):
             continue
         put = find_best_cash_secured_put(sym, price, cash)
@@ -500,19 +683,20 @@ def run_options(encrypted: str, positions: list, cash: float):
                     send_alert(f"❌ {sym} put canceled — {chk['description'][:50]}")
                     continue
             total = put["total_premium"]
-            _record_options_profit(total)
+            _record_options_income(total)
             send_alert(f"📝 {sym} put ${put['strike']:.2f} {put['expiry']} | +${total:,.2f}")
         except Exception as ex:
             print(f"  Put error {sym}: {ex}")
 
 
-def _record_options_profit(total: float):
+def _record_options_income(total: float):
+    """Options premium split: 60% ETF, 40% cash."""
     ledger = load_ledger()
-    ledger["profit_bucket"]   = ledger.get("profit_bucket", 0.0) + total
-    ledger["etf_bucket"]      = ledger.get("etf_bucket", 0.0) + total * ETF_PCT
-    ledger["cash_bucket"]     = ledger.get("cash_bucket", 0.0) + total * CASH_PCT
-    ledger["bot_bucket"]      = ledger.get("bot_bucket", 0.0) + total * BOT_PCT
-    ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + total * BOT_PCT
+    etf_cut  = total * OPTIONS_SPLIT["etf"]
+    cash_cut = total * OPTIONS_SPLIT["cash"]
+    ledger["profit_bucket"]  = ledger.get("profit_bucket", 0.0) + total
+    ledger["etf_bucket"]     = ledger.get("etf_bucket", 0.0) + etf_cut
+    ledger["cash_bucket"]    = ledger.get("cash_bucket", 0.0) + cash_cut
     save_ledger(ledger)
 
 
@@ -547,15 +731,35 @@ def run_etf_sweep(encrypted: str):
 def check_dividends(encrypted: str):
     dividends = get_recent_dividends(encrypted, days_back=2)
     seen_ids  = get_dividend_stats()["seen_dividend_ids"]
+
+    capital    = get_trading_capital()
+    etf_capital = load_ledger().get("etf_portfolio_value", 8000)
+    etf_level_name, etf_level = get_etf_level(etf_capital)
+    split = ETF_SPLITS.get(etf_level_name, ETF_SPLITS["Level 1"])
+
     for div in dividends:
-        if div["transaction_id"] in seen_ids:
+        txn_id = div["transaction_id"]
+        if txn_id in seen_ids:
             continue
+        # ETF dividend routing per figure-8 level
+        bot_amt = div["amount"] * split["bot"]
+        cash_amt = div["amount"] * split["cash"]
+        etf_amt = div["amount"] * split["etf"]
+
+        ledger = load_ledger()
+        ledger["trading_capital"] = ledger.get("trading_capital", 0.0) + bot_amt
+        ledger["cash_bucket"]     = ledger.get("cash_bucket", 0.0) + cash_amt
+        ledger["etf_bucket"]      = ledger.get("etf_bucket", 0.0) + etf_amt
+        save_ledger(ledger)
+
+        record_dividend(div["symbol"], div["amount"], div["reinvested"])
+        mark_dividend_seen(txn_id)
+
         cat  = get_etf_category(div["symbol"])
         rule = ETF_DIVIDEND_RULES.get(cat, {"reinvest": 0.5, "cash": 0.5})
         r_amt = div["amount"] * rule["reinvest"]
         c_amt = div["amount"] * rule["cash"]
-        record_dividend(div["symbol"], div["amount"], div["reinvested"])
-        mark_dividend_seen(div["transaction_id"])
+
         if r_amt > 0 and c_amt > 0:
             send_alert(f"💵 {div['symbol']} div ${div['amount']:,.2f} → ${r_amt:,.2f} reinvested | ${c_amt:,.2f} cash")
         elif r_amt > 0:
@@ -591,11 +795,11 @@ def check_balance_24_7():
         cash      = get_cash_balance(account)
         on_hold   = get_cash_on_hold(account)
 
-        ledger       = load_ledger()
-        seen_ids     = set(ledger.get("seen_cash_txn_ids", []))
-        transactions = get_schwab_transactions(encrypted, days_back=1)
+        ledger   = load_ledger()
+        seen_ids = set(ledger.get("seen_cash_txn_ids", []))
+        txns     = get_schwab_transactions(encrypted, days_back=1)
 
-        for txn in transactions:
+        for txn in txns:
             txn_id = str(txn.get("activityId", txn.get("transactionId", "")))
             if txn_id in seen_ids:
                 continue
@@ -607,7 +811,9 @@ def check_balance_24_7():
                 send_alert(f"💵 +${amount:,.2f} deposited")
             elif amount < -1:
                 w = abs(amount)
-                ledger.setdefault("withdrawal_history", []).append({"amount": w, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+                ledger.setdefault("withdrawal_history", []).append(
+                    {"amount": w, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                )
                 ledger["total_withdrawn"] = ledger.get("total_withdrawn", 0.0) + w
                 send_alert(f"🏦 -${w:,.2f} withdrawn")
 
@@ -617,12 +823,16 @@ def check_balance_24_7():
         # Cash on hold changes
         last_hold = ledger.get("last_cash_on_hold", on_hold)
         if abs(on_hold - last_hold) > 1:
-            send_alert(f"🔒 +${on_hold - last_hold:,.0f} on hold" if on_hold > last_hold else f"🔓 ${last_hold - on_hold:,.0f} released")
+            if on_hold > last_hold:
+                send_alert(f"🔒 +${on_hold - last_hold:,.0f} on hold")
+            else:
+                send_alert(f"🔓 ${last_hold - on_hold:,.0f} released")
         ledger["last_cash_on_hold"] = on_hold
 
         # Options P&L daily change
         positions = account["securitiesAccount"].get("positions", [])
-        opts_pl   = sum(p.get("currentDayProfitLoss", 0) for p in positions if p.get("instrument", {}).get("assetType") == "OPTION")
+        opts_pl   = sum(p.get("currentDayProfitLoss", 0) for p in positions
+                        if p.get("instrument", {}).get("assetType") == "OPTION")
         last_pl   = ledger.get("last_options_pl", opts_pl)
         last_time = ledger.get("last_options_notify_time", 0)
         if abs(opts_pl - last_pl) > 5 and time.time() - last_time > 86400:
@@ -640,6 +850,7 @@ def check_balance_24_7():
 
 _last_run = 0
 
+
 def run_strategy_safe():
     global _last_run
     if time.time() - _last_run < 60:
@@ -649,7 +860,6 @@ def run_strategy_safe():
 
 
 def main():
-    # Balance check first — catches overnight deposits/withdrawals
     check_balance_24_7()
 
     try:
@@ -662,18 +872,19 @@ def main():
         sync_ledger_from_schwab(encrypted)
 
         capital    = get_trading_capital()
+        ceiling    = get_ceiling(capital)
         cash_ready = get_cash_bucket()
-        etf_bucket = get_etf_bucket()
         on_hold    = get_cash_on_hold(account)
         tier_name, _ = get_tier(capital)
 
-        # 24h profit
         ledger  = load_ledger()
         now_ts  = time.time()
         p24h    = sum(t.get("profit", 0) for t in ledger.get("closed_trades", [])
-                      if now_ts - time.mktime(time.strptime(t.get("sold_at", "2000-01-01T00:00:00Z"), "%Y-%m-%dT%H:%M:%SZ")) < 86400)
+                      if now_ts - time.mktime(time.strptime(
+                          t.get("sold_at", t.get("closed_at", "2000-01-01T00:00:00Z")),
+                          "%Y-%m-%dT%H:%M:%SZ")) < 86400)
 
-        pulse = get_market_pulse() if is_market_open() else ""
+        pulse    = get_market_pulse() if is_market_open() else ""
         hold_str = f" | 🔒 ${on_hold:,.0f}" if on_hold > 0 else ""
         msg = f"✅ Bot online | 💵 ${cash_ready:,.0f} ready{hold_str} | 24h ${p24h:,.0f}"
         if pulse:
@@ -688,6 +899,8 @@ def main():
 
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
     schedule.every(5).minutes.do(check_balance_24_7)
+    # Daily summary at 4 PM ET
+    schedule.every().day.at("16:00").do(send_daily_summary)
 
     while True:
         schedule.run_pending()
