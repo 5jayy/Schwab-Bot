@@ -465,11 +465,9 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
 
     base_score = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus + sweep_bonus + candle_bonus
 
-    # Multi-timeframe multiplier — must be above neutral (1.0) to not penalize
-    mtf_mult = multi_timeframe_check(symbol)
-    if mtf_mult < 1.0:
-        return None  # misaligned timeframes — skip entirely
-    total_score = base_score * mtf_mult
+    # Multi-timeframe multiplier — bonus only, never blocks
+    mtf_mult    = multi_timeframe_check(symbol)
+    total_score = base_score * max(mtf_mult, 0.85)  # floor at 0.85x, never zero
 
     # Hard minimum score
     if total_score < max(tier_cfg.get("min_score", 35), 6):
@@ -543,7 +541,7 @@ def score_etf(symbol: str, max_price: float, category: str) -> dict | None:
     total = base_score + change_pct * 2
 
     return {
-        "symbol": symbol, "price": price, "rsi": rsi14,
+        "symbol": symbol, "price": price,
         "category": category, "score": total,
         "dividend_rule": ETF_DIVIDEND_RULES.get(category, ETF_DIVIDEND_RULES["growth"])
     }
