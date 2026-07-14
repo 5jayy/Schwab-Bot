@@ -250,6 +250,15 @@ def liquidity_sweep(candles: list, lookback: int = 20) -> float:
         return 0
 
 
+# Dynamic thresholds per conviction level
+MTF_THRESHOLDS = {
+    4: {"volume": 0.80, "sweep_min": 5, "candle_required": True},
+    3: {"volume": 0.75, "sweep_min": 3, "candle_required": False},
+    2: {"volume": 0.67, "sweep_min": 1, "candle_required": False},
+    0: {"volume": 1.00, "sweep_min": 99, "candle_required": True},  # no trade
+}
+
+
 def get_mtf_conviction(symbol: str) -> int:
     """
     4-frame MA conviction system.
@@ -258,7 +267,7 @@ def get_mtf_conviction(symbol: str) -> int:
     Frames: 30m, 15m, 5m, 1m
     4/4 aligned → full ceiling (return 4)
     3/4 aligned → 50% ceiling (return 3)
-    2/4 aligned → 25% ceiling (return 2)
+    2/4 aligned → 35% ceiling (return 2)
     1/4 or less → no trade (return 0)
     """
     try:
@@ -340,11 +349,12 @@ def candlestick_bonus(candles: list) -> float:
         return 0
 
 
-def volume_ok(candles: list, period: int = 20) -> bool:
+def volume_ok(candles: list, period: int = 20, threshold: float = 0.80) -> bool:
+    """Dynamic volume threshold based on MTF conviction level."""
     if len(candles) < period + 1:
         return True
     vols = [c["volume"] for c in candles]
-    return vols[-1] >= sum(vols[-period-1:-1]) / period * 0.8
+    return vols[-1] >= sum(vols[-period-1:-1]) / period * threshold
 
 
 # ── Stock scoring ─────────────────────────────────────────────────────────────
@@ -450,26 +460,32 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     else:
         signal_details["volume"] = False
 
-    # 6. Liquidity sweep or candlestick pattern detected
+    # Get MTF conviction for dynamic thresholds
+    conviction  = get_mtf_conviction(symbol)
+    if conviction == 0:
+        return None  # no trade — less than 2/4 aligned
+
+    thresholds  = MTF_THRESHOLDS.get(conviction, MTF_THRESHOLDS[2])
+
+    # Dynamic volume check based on conviction
+    vol_ok_dynamic = volume_ok(candles, threshold=thresholds["volume"])
+    vol_bonus = 5 if vol_ok_dynamic else 0
+    if not vol_ok_dynamic:
+        signals_confirmed -= 1 if signals_confirmed > 0 else 0
+
+    # Dynamic sweep and candlestick based on conviction
     sweep_bonus  = liquidity_sweep(candles)
     candle_bonus = candlestick_bonus(candles)
-    if sweep_bonus > 3 or candle_bonus > 5:
-        signals_confirmed += 1
-        signal_details["pattern"] = True
-    else:
-        signal_details["pattern"] = False
 
-    # Require at least 5 of 6 signals for high conviction
-    # Dynamic threshold — lower tiers slightly more lenient (4/6), higher tiers strict (5/6)
-    min_signals = 4 if tier_cfg.get("min_score", 35) <= 40 else 5
-    if signals_confirmed < min_signals:
-        return None  # not enough confirmation — skip
+    sweep_ok   = sweep_bonus >= thresholds["sweep_min"]
+    pattern_ok = candle_bonus > 3 or sweep_ok
 
-    base_score = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus + sweep_bonus + candle_bonus
+    # If conviction 4/4 require at least one pattern or sweep
+    if thresholds["candle_required"] and not pattern_ok:
+        return None
 
-    # Multi-timeframe multiplier — bonus only, never blocks
-    mtf_mult    = multi_timeframe_check(symbol)
-    total_score = base_score * max(mtf_mult, 0.85)  # floor at 0.85x, never zero
+    base_score  = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus + sweep_bonus + candle_bonus
+    total_score = base_score
 
     # Hard minimum score
     if total_score < max(tier_cfg.get("min_score", 35), 6):
