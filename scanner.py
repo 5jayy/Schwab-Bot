@@ -535,23 +535,12 @@ def score_etf(symbol: str, max_price: float, category: str) -> dict | None:
     if price <= 0 or price > max_price or volume < 100000:
         return None
 
-    candles = get_price_history(symbol, period=20)
-    if len(candles) < 20:
-        return None
-
-    closes = [c["close"] for c in candles]
-    ema9, ema21, rsi14 = ema(closes, 9), ema(closes, 21), rsi(closes, 14)
-    if not ema9 or not ema21 or not rsi14:
-        return None
-    if rsi14 >= 78 or rsi14 <= 25:
-        return None
-    if category != "stable" and ema9 <= ema21:
-        return None
-
-    trend_score = ((ema9 - ema21) / ema21) * 100 if ema21 > 0 else 0
-    rsi_score   = 100 - abs(rsi14 - 55)
-    weight = (20, 0.5, 5) if category in ("income", "stable") else (35, 0.35, 15)
-    total  = trend_score * weight[0] + rsi_score * weight[1] + change_pct * weight[2]
+    # ETFs are long-term holds — no strict signal filters
+    # Just check price is affordable and volume is liquid
+    # Score by category priority + day change
+    category_priority = {"growth": 40, "income": 35, "stable": 30, "international": 25}
+    base_score = category_priority.get(category, 30)
+    total = base_score + change_pct * 2
 
     return {
         "symbol": symbol, "price": price, "rsi": rsi14,
