@@ -179,6 +179,26 @@ def is_market_open() -> bool:
 
 # ── Star Rating (1-10) ────────────────────────────────────────────────────────
 
+def get_star_rating(stock: dict) -> int:
+    """Grade signal quality 1-10 for notification only. Does not affect entry or sizing."""
+    stars = 0
+    sweep = stock.get("sweep_bonus", 0)
+    if sweep >= 10:  stars += 3
+    elif sweep >= 5: stars += 2
+    elif sweep >= 1: stars += 1
+    adx = stock.get("adx") or 0
+    if adx >= 30:   stars += 2
+    elif adx >= 22: stars += 1
+    hist = stock.get("macd_hist") or 0
+    if hist >= 0.05:   stars += 2
+    elif hist >= 0.01: stars += 1
+    rsi = stock.get("rsi", 50)
+    if 50 <= rsi <= 65: stars += 1
+    vol = stock.get("volume", 0)
+    if vol > 0: stars += 1
+    return min(max(stars, 1), 10)
+
+
 def get_mtf_position_size(symbol: str, ceiling: float) -> float:
     """
     4-frame MA conviction sizing.
@@ -563,8 +583,9 @@ def run_strategy():
                     bought_this_run.add(symbol)
                     record_buy(symbol, quantity, price, cost)
                     from scanner import get_mtf_conviction
-                    conv = get_mtf_conviction(symbol)
-                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | {conv}/4 | ${cost:,.0f}")
+                    conv  = get_mtf_conviction(symbol)
+                    stars = get_star_rating(stock)
+                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | {conv}/4 | ⭐{stars} | ${cost:,.0f}")
                     print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
                 except Exception as ex:
                     send_alert(f"Buy error {symbol}: {ex}")
