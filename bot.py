@@ -779,7 +779,7 @@ def get_schwab_transactions(encrypted: str, days_back: int = 1) -> list:
             f"{BASE_URL}/accounts/{encrypted}/transactions", headers=headers(),
             params={"startDate": start.strftime("%Y-%m-%dT00:00:00.000Z"),
                     "endDate":   end.strftime("%Y-%m-%dT23:59:59.000Z"),
-                    "types":     "CASH_IN_OR_CASH_OUT"},
+                    "types":     "CASH_IN_OR_CASH_OUT,CHECKING"},
             timeout=15
         )
         return resp.json() if resp.ok and isinstance(resp.json(), list) else []
