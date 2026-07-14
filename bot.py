@@ -513,22 +513,14 @@ def run_strategy():
             trail_info = get_trailing_stop_info(sym)
             trigger    = None
 
-            # Signal sell
-            try:
-                from strategy import get_signal
-                sig = get_signal(sym)
-                if sig.get("signal") == "SELL":
-                    trigger = "signal"
-                    price   = sig.get("price", price)
-            except Exception:
-                pass
+            # Signal sell handled by dynamic stop and delta trail below
 
             if not trigger and trail_info:
                 buy_px  = trail_info["buy_price"]
                 high_px = trail_info["high_price"]
 
                 # Delta trail check (live bid/ask)
-                atr_pct = 2.0  # default, ideally from scanner
+                atr_pct = trail_info.get("atr_pct", 2.0) if trail_info else 2.0
                 delta   = check_delta_trail(sym, buy_px, high_px, price, atr_pct)
                 if delta["active"] and price <= delta["stop_price"]:
                     trigger = "delta_trail"
