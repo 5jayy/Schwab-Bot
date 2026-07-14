@@ -200,6 +200,30 @@ def find_best_cash_secured_put(symbol: str, current_price: float, cash_available
     return best
 
 
+def place_covered_call(encrypted: str, option_symbol: str, contracts: int, premium: float):
+    """Sell to open a covered call at limit (mid price)."""
+    order = {
+        "orderType":         "LIMIT",
+        "session":           "NORMAL",
+        "duration":          "DAY",
+        "price":             round(premium, 2),
+        "orderStrategyType": "SINGLE",
+        "orderLegCollection": [{
+            "instruction": "SELL_TO_OPEN",
+            "quantity":    contracts,
+            "instrument":  {"symbol": option_symbol, "assetType": "OPTION"}
+        }]
+    }
+    resp = requests.post(
+        f"{TRADER_URL}/accounts/{encrypted}/orders",
+        headers=trader_headers(),
+        json=order,
+        timeout=15
+    )
+    resp.raise_for_status()
+    return resp
+
+
 def place_cash_secured_put(encrypted: str, option_symbol: str, premium: float) -> dict:
     """
     Sell to open a cash secured put at limit price.
@@ -230,6 +254,21 @@ def place_cash_secured_put(encrypted: str, option_symbol: str, premium: float) -
     )
     resp.raise_for_status()
     return resp
+
+
+def get_open_options(encrypted: str) -> list:
+    try:
+        resp = requests.get(
+            f"{TRADER_URL}/accounts/{encrypted}?fields=positions",
+            headers=headers(),
+            timeout=15
+        )
+        resp.raise_for_status()
+        positions = resp.json()["securitiesAccount"].get("positions", [])
+        return [p for p in positions if p["instrument"].get("assetType") == "OPTION"]
+    except Exception as e:
+        print(f"Error getting options: {e}")
+        return []
 
 
 def check_put_already_open(encrypted: str, symbol: str) -> bool:
