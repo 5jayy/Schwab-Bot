@@ -562,7 +562,9 @@ def run_strategy():
                     cash -= cost
                     bought_this_run.add(symbol)
                     record_buy(symbol, quantity, price, cost)
-                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | ${cost:,.0f}")
+                    from scanner import get_mtf_conviction
+                    conv = get_mtf_conviction(symbol)
+                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | {conv}/4 | ${cost:,.0f}")
                     print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
                 except Exception as ex:
                     send_alert(f"Buy error {symbol}: {ex}")
