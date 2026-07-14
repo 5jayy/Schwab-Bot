@@ -179,39 +179,24 @@ def is_market_open() -> bool:
 
 # ── Star Rating (1-10) ────────────────────────────────────────────────────────
 
-def get_star_rating(stock: dict) -> int:
+def get_mtf_position_size(symbol: str, ceiling: float) -> float:
     """
-    Grade signal confluence strength 1-10.
-    Sweep depth + volume ratio + ADX + MACD + RSI position.
+    4-frame MA conviction sizing.
+    4/4 → full ceiling
+    3/4 → 50% ceiling
+    2/4 → 35% ceiling (~$70 at $200 ceiling)
+    1/4 or less → no trade (returns 0)
     """
-    stars = 0
-
-    # Sweep depth (0-3 pts)
-    sweep = stock.get("sweep_bonus", 0)
-    if sweep >= 10:   stars += 3
-    elif sweep >= 5:  stars += 2
-    elif sweep >= 1:  stars += 1
-
-    # Volume ratio (0-2 pts)
-    vol_ratio = stock.get("volume", 0) / max(stock.get("avg_volume", stock.get("volume", 1)), 1)
-    if vol_ratio >= 2.0:   stars += 2
-    elif vol_ratio >= 1.3: stars += 1
-
-    # ADX strength (0-2 pts)
-    adx = stock.get("adx") or 0
-    if adx >= 30:   stars += 2
-    elif adx >= 22: stars += 1
-
-    # MACD (0-2 pts)
-    hist = stock.get("macd_hist") or 0
-    if hist >= 0.05:   stars += 2
-    elif hist >= 0.01: stars += 1
-
-    # RSI sweet spot 50-65 (0-1 pt)
-    rsi = stock.get("rsi", 50)
-    if 50 <= rsi <= 65: stars += 1
-
-    return min(max(stars, 1), 10)
+    from scanner import get_mtf_conviction
+    conviction = get_mtf_conviction(symbol)
+    if conviction >= 4:
+        return ceiling          # 4/4 full
+    elif conviction == 3:
+        return ceiling * 0.50   # 3/4 half
+    elif conviction == 2:
+        return ceiling * 0.35   # 2/4 small but protected by features
+    else:
+        return 0                # 1/4 or less — no trade
 
 
 # ── Room-based ceiling ────────────────────────────────────────────────────────
@@ -231,12 +216,7 @@ def get_ceiling(bot_capital: float) -> float:
     return 1000
 
 
-def get_position_size(star: int, ceiling: float) -> float:
-    """Star rating scales actual size within ceiling."""
-    if star <= 3:   return ceiling * 0.25
-    if star <= 6:   return ceiling * 0.50
-    if star <= 9:   return ceiling * 0.75
-    return ceiling
+
 
 
 # ── Daily stats ───────────────────────────────────────────────────────────────
@@ -299,9 +279,10 @@ def get_win_rate() -> float:
 
 # ── Can trade gatekeeper ──────────────────────────────────────────────────────
 
-def can_trade(capital: float, stats: dict, star: int) -> tuple:
+def can_trade(capital: float, stats: dict, _unused: int = 0) -> tuple:
     """
     Dynamic gatekeeper — all checks before any buy.
+    MTF conviction handles sizing. This handles daily limits.
     Returns (bool, reason).
     """
     # Warmup — skip 9:30-9:45 ET
@@ -309,10 +290,6 @@ def can_trade(capital: float, stats: dict, star: int) -> tuple:
     now = datetime.now(et)
     if now.replace(hour=9, minute=30) <= now <= now.replace(hour=9, minute=45):
         return False, "warmup"
-
-    # Star minimum — nothing under 4
-    if star < 4:
-        return False, f"star_{star}_too_low"
 
     # Cooldown — 2 consecutive losses
     if stats["consecutive_losses"] >= 2:
@@ -548,20 +525,21 @@ def run_strategy():
             for stock in top_stocks:
                 symbol = stock["symbol"]
                 price  = stock["price"]
-                star   = get_star_rating(stock)
-
                 if symbol in bought_this_run or get_position_for(positions, symbol):
                     continue
                 if price > cash:
                     continue
 
-                ok, reason = can_trade(capital, stats, star)
+                ok, reason = can_trade(capital, stats, 5)
                 if not ok:
                     print(f"  {symbol}: skip — {reason}")
                     continue
 
-                # Position sizing — star × ceiling, scaled for green-day
-                position_size = get_position_size(star, ceiling)
+                # MTF conviction sizing
+                position_size = get_mtf_position_size(symbol, ceiling)
+                if position_size == 0:
+                    print(f"  {symbol}: skip — MTF conviction too low")
+                    continue
                 position_size = green_day_scale(position_size, stats)
                 position_size = min(position_size, cash)
 
@@ -584,7 +562,7 @@ def run_strategy():
                     cash -= cost
                     bought_this_run.add(symbol)
                     record_buy(symbol, quantity, price, cost)
-                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | ⭐{star} | ${cost:,.0f}")
+                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | ${cost:,.0f}")
                     print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
                 except Exception as ex:
                     send_alert(f"Buy error {symbol}: {ex}")

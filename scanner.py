@@ -250,43 +250,45 @@ def liquidity_sweep(candles: list, lookback: int = 20) -> float:
         return 0
 
 
-def multi_timeframe_check(symbol: str) -> float:
+def get_mtf_conviction(symbol: str) -> int:
     """
-    Checks alignment across 5min and 30min timeframes.
-    Returns multiplier 0.5-1.2. Above 1.0 = strong alignment bonus.
-    Dynamic: uses EMA trend on each timeframe.
+    4-frame MA conviction system.
+    Each frame: price > 20-period MA = bullish.
+
+    Frames: 30m, 15m, 5m, 1m
+    4/4 aligned → full ceiling (return 4)
+    3/4 aligned → 50% ceiling (return 3)
+    2/4 aligned → 25% ceiling (return 2)
+    1/4 or less → no trade (return 0)
     """
     try:
-        # 5min candles (already have these)
-        candles_5m  = get_price_history(symbol, period=5,  frequency=5)
-        # 30min candles
-        candles_30m = get_price_history(symbol, period=10, frequency=30)
+        frames = [
+            get_price_history(symbol, period=10, frequency=30),  # 30m
+            get_price_history(symbol, period=5,  frequency=15),  # 15m
+            get_price_history(symbol, period=5,  frequency=5),   # 5m
+            get_price_history(symbol, period=2,  frequency=1),   # 1m
+        ]
 
-        if len(candles_5m) < 15 or len(candles_30m) < 10:
-            return 1.0  # neutral if not enough data
+        aligned = 0
+        for candles in frames:
+            if len(candles) < 20:
+                continue
+            closes = [c["close"] for c in candles]
+            ma20   = sum(closes[-20:]) / 20
+            if closes[-1] > ma20:
+                aligned += 1
 
-        closes_5m  = [c["close"] for c in candles_5m]
-        closes_30m = [c["close"] for c in candles_30m]
-
-        e9_5m,  e21_5m  = ema(closes_5m,  9),  ema(closes_5m,  21)
-        e9_30m, e21_30m = ema(closes_30m, 9),  ema(closes_30m, 21)
-
-        if not all([e9_5m, e21_5m, e9_30m, e21_30m]):
-            return 1.0
-
-        both_up = e9_5m > e21_5m and e9_30m > e21_30m
-
-        if both_up:
-            # Measure how aligned — both strongly trending up
-            strength_5m  = (e9_5m  - e21_5m)  / e21_5m
-            strength_30m = (e9_30m - e21_30m) / e21_30m
-            alignment    = (strength_5m + strength_30m) / 2
-            return min(1.0 + alignment * 10, 1.25)  # max 1.25x boost
+        if aligned >= 4:
+            return 4
+        elif aligned == 3:
+            return 3
+        elif aligned == 2:
+            return 2
         else:
-            return 0.7  # misaligned timeframes — reduce conviction
+            return 0
 
     except Exception:
-        return 1.0
+        return 0
 
 
 def candlestick_bonus(candles: list) -> float:
