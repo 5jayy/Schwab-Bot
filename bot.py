@@ -265,6 +265,14 @@ def get_daily_stats() -> dict:
     }
 
 
+def record_conviction_count(conviction: int):
+    """Track how many times each conviction level fired today."""
+    ledger = load_ledger()
+    key = f"conviction_{conviction}_count"
+    ledger[key] = ledger.get(key, 0) + 1
+    save_ledger(ledger)
+
+
 def record_trade_result(profit: float, trade_type: str = "stock"):
     """Update daily stats after every trade."""
     ledger = load_ledger()
@@ -458,13 +466,26 @@ def send_daily_summary():
     stock_cap  = capital * 0.02
     stock_used = stats["daily_loss_stock"] / stock_cap * 100 if stock_cap > 0 else 0
 
-    send_alert(
-        f"📊 Daily Summary\n"
-        f"Trades: {stats['trades_today']} | "
-        f"P&L: ${stats['daily_profit']:+,.0f} | Peak: ${stats['daily_peak']:,.0f}\n"
-        f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
-        f"Stock daily cap used: {stock_used:.0f}%"
-    )
+    # Conviction breakdown
+    c4 = ledger.get("conviction_4_count", 0)
+    c3 = ledger.get("conviction_3_count", 0)
+    c2 = ledger.get("conviction_2_count", 0)
+    c1 = ledger.get("conviction_1_count", 0)
+
+    # Reset conviction counts for tomorrow
+    for k in ["conviction_4_count", "conviction_3_count", "conviction_2_count", "conviction_1_count"]:
+        ledger[k] = 0
+    save_ledger(ledger)
+
+    trades_today = stats['trades_today']
+    daily_profit = stats['daily_profit']
+    daily_peak   = stats['daily_peak']
+    msg = "Daily Summary\n"
+    msg += f"Trades: {trades_today} | P&L: ${daily_profit:+,.0f} | Peak: ${daily_peak:,.0f}\n"
+    msg += f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
+    msg += f"Stock cap used: {stock_used:.0f}%\n"
+    msg += f"Signals: 4/4={c4} | 3/4={c3} | 2/4={c2} | 1/4={c1}"
+    send_alert("📊 " + msg)
 
 
 # ── Main strategy ─────────────────────────────────────────────────────────────
@@ -591,6 +612,7 @@ def run_strategy():
                     from scanner import get_mtf_conviction
                     conv  = get_mtf_conviction(symbol)
                     stars = get_star_rating(stock)
+                    record_conviction_count(conv)
                     send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | {conv}/4 | ⭐{stars} | ${cost:,.0f}")
                     print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
                 except Exception as ex:
