@@ -524,7 +524,13 @@ def run_strategy():
                     send_alert(f"🎯 Trail exit {sym} | Bid ${delta['bid']:.2f} | +{delta['profit_pct']}%")
                 else:
                     # Dynamic stop fallback
-                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT)
+                    # Pull recent candles for candle-strength based stop
+                    try:
+                        from scanner import get_price_history as _gph
+                        _candles = _gph(sym)
+                    except Exception:
+                        _candles = None
+                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles)
                     if price <= stop_info["stop_price"]:
                         trigger = stop_info["reason"]
                         if stop_info["reason"] == "breakeven":

@@ -359,9 +359,71 @@ def volume_ok(candles: list, period: int = 20, threshold: float = 0.80) -> bool:
 
 # ── Stock scoring ─────────────────────────────────────────────────────────────
 
+def candle_strength(candles: list) -> float:
+    """
+    Measures raw candle strength 0-100.
+    Uses body size, close position, and wick rejection.
+    No lagging indicators — pure price action.
+    """
+    if len(candles) < 3:
+        return 0
+    try:
+        c  = candles[-1]
+        o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+        rng  = h - l
+        if rng == 0:
+            return 0
+        body      = abs(cl - o)
+        body_pct  = body / rng                          # big body = strong
+        close_pct = (cl - l) / rng                     # closes near high = bullish
+        wick_low  = (min(o, cl) - l) / rng             # lower wick rejection
+        direction = 1 if cl > o else -1                 # green or red
+
+        if direction < 0:
+            return 0  # only bullish candles
+
+        score = (body_pct * 40) + (close_pct * 40) + (wick_low * 20)
+        return round(score * 100, 1)
+    except Exception:
+        return 0
+
+
+def order_flow(symbol: str, candles: list) -> float:
+    """
+    Measures order flow pressure 0-100.
+    Uses bid/ask imbalance from live Schwab quotes + volume delta.
+    Replaces MACD — forward-looking not lagging.
+    """
+    try:
+        # Live bid/ask imbalance
+        quote = get_quote(symbol)
+        bid_size = quote.get("quote", {}).get("bidSize", 0)
+        ask_size = quote.get("quote", {}).get("askSize", 0)
+        total    = bid_size + ask_size
+        if total > 0:
+            imbalance = (bid_size - ask_size) / total  # -1 to +1
+        else:
+            imbalance = 0
+
+        # Volume delta — up candles vs down candles last 10
+        up_vol   = sum(c["volume"] for c in candles[-10:] if c["close"] > c["open"])
+        down_vol = sum(c["volume"] for c in candles[-10:] if c["close"] <= c["open"])
+        total_vol = up_vol + down_vol
+        vol_delta = (up_vol - down_vol) / total_vol if total_vol > 0 else 0
+
+        # Combine — both must agree for strong signal
+        flow_score = (imbalance * 50) + (vol_delta * 50)
+        return max(0, round(flow_score * 100, 1))
+    except Exception:
+        return 0
+
+
 def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
-    """Score a stock using live Schwab data. All filters dynamic via tier_cfg."""
-    # Skip known restricted securities
+    """
+    Score a stock using candle strength + order flow.
+    No MA, no RSI, no MACD — pure price action and order flow.
+    MTF conviction (1m/5m/15m/30m) controls position size.
+    """
     if symbol in RESTRICTED_SECURITIES:
         return None
 
@@ -381,123 +443,65 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         return None
     if volume < tier_cfg["min_volume"]:
         return None
-    # Hard minimums regardless of tier — avoid restricted/halted securities
     if price < 1.50 or volume < 200_000:
         return None
 
-    candles = get_price_history(symbol)
-    if len(candles) < 30:
-        return None
-
-    closes = [c["close"] for c in candles]
-    ema9, ema21 = ema(closes, 9), ema(closes, 21)
-    rsi14 = rsi(closes, 14)
-    if not ema9 or not ema21 or not rsi14:
-        return None
-    if ema9 <= ema21:
-        return None
-    if rsi14 >= tier_cfg["rsi_high"] or rsi14 <= tier_cfg["rsi_low"]:
-        return None
-
-    adx_val = calc_adx(candles)
-    if adx_val is not None and adx_val < tier_cfg["min_adx"]:
-        return None
-
-    hist = macd_hist(closes)
-    if hist is not None and hist < 0:
-        return None
-
-    # ATR filter — dynamic: stock must have ATR between 0.5% and 6% of price
-    atr_val = calc_atr(candles)
-    if atr_val and price > 0:
-        atr_pct = atr_val / price * 100
-        if atr_pct < 0.5 or atr_pct > 6.0:
-            return None  # too flat or too volatile
-
-    # Confidence gate — count how many signals confirm
-    # Need at least 5 of 6 for high conviction entry (targets 60-65% win rate)
-    signals_confirmed = 0
-    signal_details    = {}
-
-    # 1. EMA trend strength — must be meaningful not just crossed
-    trend_strength = ((ema9 - ema21) / ema21) * 100
-    if trend_strength > 0.1:  # at least 0.1% separation
-        signals_confirmed += 1
-        signal_details["ema"] = True
-    else:
-        signal_details["ema"] = False
-
-    # 2. RSI in ideal zone (50-65 sweet spot for momentum)
-    rsi_score = 100 - abs(rsi14 - 57)
-    if 45 <= rsi14 <= 68:
-        signals_confirmed += 1
-        signal_details["rsi"] = True
-    else:
-        signal_details["rsi"] = False
-
-    # 3. ADX strong trend
-    adx_bonus = min(adx_val, 50) * 0.3 if adx_val else 0
-    if adx_val and adx_val >= tier_cfg["min_adx"] + 3:  # above minimum by margin
-        signals_confirmed += 1
-        signal_details["adx"] = True
-    else:
-        signal_details["adx"] = False
-
-    # 4. MACD positive and meaningful
-    macd_bonus = min(hist * 100, 10) if hist and hist > 0 else 0
-    if hist and hist > 0.001:  # meaningfully positive not just noise
-        signals_confirmed += 1
-        signal_details["macd"] = True
-    else:
-        signal_details["macd"] = False
-
-    # 5. Volume confirmed above average
-    vol_ok    = volume_ok(candles)
-    vol_bonus = 5 if vol_ok else 0
-    if vol_ok:
-        signals_confirmed += 1
-        signal_details["volume"] = True
-    else:
-        signal_details["volume"] = False
-
-    # Get MTF conviction for dynamic thresholds
-    conviction  = get_mtf_conviction(symbol)
+    # Get MTF conviction first — no trade if less than 2/4
+    conviction = get_mtf_conviction(symbol)
     if conviction == 0:
-        return None  # no trade — less than 2/4 aligned
+        return None
 
-    thresholds  = MTF_THRESHOLDS.get(conviction, MTF_THRESHOLDS[2])
+    thresholds = MTF_THRESHOLDS.get(conviction, MTF_THRESHOLDS[2])
 
-    # Dynamic volume check based on conviction
+    # Pull candles for strength and flow analysis
+    candles = get_price_history(symbol)
+    if len(candles) < 20:
+        return None
+
+    # ATR for volatility filter
+    atr_val = calc_atr(candles)
+    atr_pct = atr_val / price * 100 if atr_val and price > 0 else 2.0
+    if atr_pct < 0.5 or atr_pct > 6.0:
+        return None
+
+    # Candle strength — pure price action
+    strength = candle_strength(candles)
+    if strength < 20:  # very weak candle — skip
+        return None
+
+    # Order flow — bid/ask + volume delta
+    flow = order_flow(symbol, candles)
+
+    # Dynamic volume threshold per conviction
     vol_ok_dynamic = volume_ok(candles, threshold=thresholds["volume"])
-    vol_bonus = 5 if vol_ok_dynamic else 0
     if not vol_ok_dynamic:
-        signals_confirmed -= 1 if signals_confirmed > 0 else 0
+        return None
 
-    # Dynamic sweep and candlestick based on conviction
+    # Liquidity sweep bonus — still valuable signal
     sweep_bonus  = liquidity_sweep(candles)
     candle_bonus = candlestick_bonus(candles)
 
-    sweep_ok   = sweep_bonus >= thresholds["sweep_min"]
-    pattern_ok = candle_bonus > 3 or sweep_ok
-
-    # If conviction 4/4 require at least one pattern or sweep
-    if thresholds["candle_required"] and not pattern_ok:
+    # 4/4 conviction requires candle pattern or sweep
+    if thresholds["candle_required"] and sweep_bonus < thresholds["sweep_min"] and candle_bonus < 3:
         return None
 
-    base_score  = (trend_strength * 35) + (rsi_score * 0.35) + (change_pct * 15) + adx_bonus + macd_bonus + vol_bonus + sweep_bonus + candle_bonus
-    total_score = base_score
+    # Total score — candle strength + order flow + sweep + candle patterns
+    total_score = (strength * 0.4) + (flow * 0.4) + sweep_bonus + candle_bonus + (change_pct * 2)
 
-    # Hard minimum score
-    if total_score < max(tier_cfg.get("min_score", 35), 6):
+    if total_score < 10:
         return None
 
     return {
-        "symbol": symbol, "price": price, "volume": volume,
-        "rsi": rsi14, "adx": adx_val, "macd_hist": hist,
-        "atr_pct": round(atr_pct, 2) if atr_val and price > 0 else None,
-        "sweep_bonus": round(sweep_bonus, 1),
+        "symbol":       symbol,
+        "price":        price,
+        "volume":       volume,
+        "strength":     round(strength, 1),
+        "flow":         round(flow, 1),
+        "atr_pct":      round(atr_pct, 2),
+        "sweep_bonus":  round(sweep_bonus, 1),
         "candle_bonus": round(candle_bonus, 1),
-        "mtf_mult": round(mtf_mult, 2),
+        "conviction":   conviction,
+        "score":        round(total_score, 1),
         "score": total_score,
     }
 

@@ -221,42 +221,84 @@ def get_trailing_stop_info(symbol: str) -> dict | None:
     }
 
 
-def get_dynamic_stop(buy_price: float, high_price: float, current_price: float, base_trail: float = 0.07) -> dict:
+def get_dynamic_stop(buy_price: float, high_price: float, current_price: float,
+                      base_trail: float = 0.07, candles: list = None) -> dict:
     """
-    Dynamic stop — tightens as profit grows, activates breakeven at 2% gain.
-    
-    Profit tiers:
-    - 0-2%   → 7% trail (base)
-    - 2-5%   → breakeven (stop = buy price)
-    - 5-10%  → 5% trail
-    - 10-20% → 4% trail
-    - 20%+   → 3% trail (lock big gains)
+    Dynamic trailing stop — tightens based on candle strength not fixed % tiers.
+
+    Breakeven always locks at +2% (never lose on a winner).
+    After breakeven, trail tightens based on how strong recent candles are:
+    - Strong candles (buyers in control) → give room (wider trail)
+    - Weak candles (momentum fading)    → tighten immediately
+    - Very strong breakout candles      → trail tight to lock gains
     """
     if buy_price <= 0:
         return {"stop_price": 0, "trail_pct": base_trail, "reason": "invalid", "profit_pct": 0}
 
     profit_pct = (current_price - buy_price) / buy_price
 
-    if profit_pct >= 0.20:
-        trail_pct  = 0.03
-        reason     = "trail_tight_3pct"
-        stop_price = high_price * (1 - trail_pct)
-    elif profit_pct >= 0.10:
-        trail_pct  = 0.04
-        reason     = "trail_tight_4pct"
-        stop_price = high_price * (1 - trail_pct)
-    elif profit_pct >= 0.05:
-        trail_pct  = 0.05
-        reason     = "trail_tight_5pct"
-        stop_price = high_price * (1 - trail_pct)
-    elif profit_pct >= 0.02:
-        trail_pct  = base_trail
-        stop_price = buy_price  # breakeven — never lose on a winner
-        reason     = "breakeven"
+    # Breakeven — always at 2%, non-negotiable
+    if 0.02 <= profit_pct < 0.05:
+        return {
+            "stop_price": buy_price,
+            "trail_pct":  base_trail,
+            "reason":     "breakeven",
+            "profit_pct": profit_pct
+        }
+
+    # Below breakeven — base trail
+    if profit_pct < 0.02:
+        return {
+            "stop_price": high_price * (1 - base_trail),
+            "trail_pct":  base_trail,
+            "reason":     "trail_base",
+            "profit_pct": profit_pct
+        }
+
+    # Above breakeven — candle strength determines trail tightness
+    trail_pct = base_trail  # default
+
+    if candles and len(candles) >= 3:
+        # Measure recent candle strength
+        recent = candles[-3:]
+        strengths = []
+        for c in recent:
+            rng  = c["high"] - c["low"]
+            if rng == 0:
+                continue
+            body     = abs(c["close"] - c["open"])
+            close_up = (c["close"] - c["low"]) / rng
+            strength = (body / rng * 0.6) + (close_up * 0.4)
+            strengths.append(strength)
+
+        avg_strength = sum(strengths) / len(strengths) if strengths else 0.5
+
+        # Dynamic trail based on candle strength
+        if avg_strength >= 0.75:
+            trail_pct = 0.03  # very strong candles — tight trail locks gains
+            reason    = "trail_candle_strong"
+        elif avg_strength >= 0.55:
+            trail_pct = 0.04  # solid candles — moderate trail
+            reason    = "trail_candle_moderate"
+        elif avg_strength >= 0.35:
+            trail_pct = 0.05  # average candles — give some room
+            reason    = "trail_candle_weak"
+        else:
+            trail_pct = 0.06  # very weak candles — momentum fading, widen slightly
+            reason    = "trail_candle_fading"
     else:
-        trail_pct  = base_trail
-        stop_price = high_price * (1 - trail_pct)
-        reason     = "trail_base"
+        # No candle data — use profit-based fallback
+        if profit_pct >= 0.20:
+            trail_pct = 0.03
+            reason    = "trail_profit_20pct"
+        elif profit_pct >= 0.10:
+            trail_pct = 0.04
+            reason    = "trail_profit_10pct"
+        else:
+            trail_pct = 0.05
+            reason    = "trail_profit_5pct"
+
+    stop_price = high_price * (1 - trail_pct)
 
     return {
         "stop_price": stop_price,
