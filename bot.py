@@ -417,6 +417,98 @@ def check_delta_trail(symbol: str, entry_px: float, high_px: float,
     }
 
 
+# ── Spike protection ─────────────────────────────────────────────────────────
+
+def detect_spike(candles: list, spike_mult: float = 2.5) -> dict:
+    """
+    Detects abnormal price bars using ATR(14) x SpikeMult.
+    Dynamic — adjusts to current market pace automatically.
+    Quiet day: small bar triggers it. Busy day: takes a big bar.
+
+    Returns:
+        is_spike: bool
+        direction: "up" | "down" | None
+        bar_range: current bar range
+        atr: current ATR(14)
+        threshold: bar_range needed to be a spike
+    """
+    if len(candles) < 15:
+        return {"is_spike": False, "direction": None}
+
+    try:
+        # ATR(14) — true range average
+        true_ranges = []
+        for i in range(1, min(15, len(candles))):
+            c     = candles[-i]
+            prev  = candles[-i-1]
+            tr    = max(
+                c["high"] - c["low"],
+                abs(c["high"] - prev["close"]),
+                abs(c["low"]  - prev["close"])
+            )
+            true_ranges.append(tr)
+        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0
+
+        if atr == 0:
+            return {"is_spike": False, "direction": None}
+
+        # Current bar range
+        c         = candles[-1]
+        bar_range = c["high"] - c["low"]
+        threshold = atr * spike_mult
+        is_spike  = bar_range > threshold
+
+        # Spike direction
+        direction = None
+        if is_spike:
+            if c["close"] > c["open"]:
+                direction = "up"
+            else:
+                direction = "down"
+
+        return {
+            "is_spike":  is_spike,
+            "direction": direction,
+            "bar_range": round(bar_range, 4),
+            "atr":       round(atr, 4),
+            "threshold": round(threshold, 4),
+        }
+    except Exception:
+        return {"is_spike": False, "direction": None}
+
+
+def check_spike_on_position(symbol: str, pos_price: float, buy_price: float,
+                             candles: list) -> dict:
+    """
+    Check spike protection on an open position.
+    1. PROFIT GRAB — spike in your favor while in profit → book immediately
+    2. LOSS EXIT  — spike against you → emergency exit before full stop
+    Returns action: "profit_grab" | "loss_exit" | None
+    """
+    spike = detect_spike(candles)
+    if not spike["is_spike"]:
+        return {"action": None}
+
+    in_profit = pos_price > buy_price
+
+    if spike["direction"] == "up" and in_profit:
+        return {
+            "action":  "profit_grab",
+            "reason":  "SPIKE PROFIT GRAB",
+            "bar_range": spike["bar_range"],
+            "atr":     spike["atr"],
+        }
+    elif spike["direction"] == "down":
+        return {
+            "action":  "loss_exit",
+            "reason":  "SPIKE LOSS EXIT",
+            "bar_range": spike["bar_range"],
+            "atr":     spike["atr"],
+        }
+
+    return {"action": None}
+
+
 # ── Execute sell ──────────────────────────────────────────────────────────────
 
 def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
@@ -545,13 +637,35 @@ def run_strategy():
                     send_alert(f"🎯 Trail exit {sym} | Bid ${delta['bid']:.2f} | +{delta['profit_pct']}%")
                 else:
                     # Dynamic stop fallback
-                    # Pull recent candles for candle-strength based stop
+                    # Pull recent candles for spike + candle-strength stop
                     try:
                         from scanner import get_price_history as _gph
                         _candles = _gph(sym)
                     except Exception:
                         _candles = None
-                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles)
+
+                    # Spike protection check
+                    if _candles:
+                        spike_check = check_spike_on_position(sym, price, buy_px, _candles)
+                        if spike_check["action"] == "profit_grab":
+                            trigger = "profit_grab"
+                            send_alert(
+                                f"⚡ SPIKE PROFIT GRAB {sym} | "
+                                f"Bar {spike_check['bar_range']:.2f} vs ATR {spike_check['atr']:.2f} | "
+                                f"Booking windfall now"
+                            )
+                        elif spike_check["action"] == "loss_exit":
+                            trigger = "loss_exit"
+                            send_alert(
+                                f"🚨 SPIKE LOSS EXIT {sym} | "
+                                f"Bar {spike_check['bar_range']:.2f} vs ATR {spike_check['atr']:.2f} | "
+                                f"Emergency exit"
+                            )
+
+                    if not trigger:
+                        stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles)
+                    else:
+                        stop_info = None
                     if price <= stop_info["stop_price"]:
                         trigger = stop_info["reason"]
                         if stop_info["reason"] == "breakeven":
@@ -581,6 +695,17 @@ def run_strategy():
                 if not ok:
                     print(f"  {symbol}: skip — {reason}")
                     continue
+
+                # Volatility guard — skip entry if current bar is a spike
+                try:
+                    from scanner import get_price_history as _gph2
+                    _entry_candles = _gph2(symbol)
+                    _spike = detect_spike(_entry_candles)
+                    if _spike["is_spike"]:
+                        print(f"  {symbol}: skip — VOLATILITY GUARD spike detected")
+                        continue
+                except Exception:
+                    pass
 
                 # MTF conviction sizing
                 position_size = get_mtf_position_size(symbol, ceiling)
