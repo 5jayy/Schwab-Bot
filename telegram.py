@@ -17,7 +17,7 @@ def send_alert(message: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text":    message,
-        "parse_mode": "Markdown",
+        
     }
     try:
         resp = requests.post(url, json=payload, timeout=10)
