@@ -192,8 +192,8 @@ def get_star_rating(stock: dict) -> int:
     hist = stock.get("macd_hist") or 0
     if hist >= 0.05:   stars += 2
     elif hist >= 0.01: stars += 1
-    rsi = stock.get("rsi", 50)
-    if 50 <= rsi <= 65: stars += 1
+    flow = stock.get("flow", 0)
+    if flow >= 60: stars += 1
     vol = stock.get("volume", 0)
     if vol > 0: stars += 1
     return min(max(stars, 1), 10)

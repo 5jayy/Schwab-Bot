@@ -534,7 +534,7 @@ def scan_best_stocks(cash: float, bot_capital: float = 2400) -> list:
     top = unique[:top_n]
 
     for r in top:
-        print(f"  {r['symbol']}: score={r['score']:.1f} RSI={r['rsi']:.1f} ADX={r['adx'] or 0:.1f} ATR={r['atr_pct'] or 0:.1f}% price=${r['price']:.2f}")
+        print(f"  {r['symbol']}: score={r['score']:.1f} ADX={r.get('adx') or 0:.1f} ATR={r.get('atr_pct') or 0:.1f}% price=${r['price']:.2f}")
 
     return top
 
