@@ -259,34 +259,77 @@ MTF_THRESHOLDS = {
 }
 
 
+def get_4h_candles(symbol: str) -> list:
+    """
+    Build 4H candles by aggregating 8x30min candles.
+    Schwab doesn't have native 4H so we build it.
+    """
+    try:
+        import requests as _req
+        from auth import get_valid_token as _gvt
+        _h = {"Authorization": f"Bearer {_gvt()}"}
+        _r = _req.get(
+            "https://api.schwabapi.com/marketdata/v1/pricehistory",
+            headers=_h,
+            params={"symbol": symbol, "periodType": "day", "period": 10,
+                    "frequencyType": "minute", "frequency": 30,
+                    "needExtendedHoursData": False},
+            timeout=10
+        )
+        candles_30m = _r.json().get("candles", []) if _r.ok else []
+        if len(candles_30m) < 8:
+            return []
+
+        # Aggregate every 8 bars into one 4H candle
+        candles_4h = []
+        for i in range(0, len(candles_30m) - 7, 8):
+            chunk = candles_30m[i:i+8]
+            candles_4h.append({
+                "open":     chunk[0]["open"],
+                "high":     max(c["high"]   for c in chunk),
+                "low":      min(c["low"]    for c in chunk),
+                "close":    chunk[-1]["close"],
+                "volume":   sum(c["volume"] for c in chunk),
+                "datetime": chunk[0]["datetime"]
+            })
+        return candles_4h
+    except Exception:
+        return []
+
+
 def get_day_conviction(symbol: str) -> int:
     """
-    DAY TRADING bucket (25%) — 4-frame short term system.
-    Frames: 30m, 15m, 5m, 1m
-    Only longs. Need 3/4 minimum.
+    DAY TRADING bucket (25%) — 4-frame system.
+    Frames: 4H, 15m, 5m, 1m
+    4H  = direction/bias for the day
+    15m = alignment
+    5m  = trigger
+    1m  = entry timing + order flow
+
+    Stars 7+ required (checked in bot.py)
     4/4 → full day ceiling
-    3/4 → 50% day ceiling
-    2/4 or less → no trade
+    3/4 → 50% day ceiling (or 70% with FVG)
+    2/4 → no trade
     """
     try:
         frames = [
-            get_price_history(symbol, period=10, frequency=30),  # 30m
-            get_price_history(symbol, period=5,  frequency=15),  # 15m
-            get_price_history(symbol, period=5,  frequency=5),   # 5m
-            get_price_history(symbol, period=2,  frequency=1),   # 1m
+            get_4h_candles(symbol),                              # 4H — bias
+            get_price_history(symbol, period=5,  frequency=15), # 15m — align
+            get_price_history(symbol, period=5,  frequency=5),  # 5m  — trigger
+            get_price_history(symbol, period=2,  frequency=1),  # 1m  — entry
         ]
         aligned = 0
         for candles in frames:
-            if len(candles) < 20:
+            if len(candles) < 10:
                 continue
             closes = [c["close"] for c in candles]
-            ma20   = sum(closes[-20:]) / 20
+            ma20   = sum(closes[-min(20,len(closes)):]) / min(20,len(closes))
             if closes[-1] > ma20:
                 aligned += 1
 
         if aligned >= 4:   return 4
         elif aligned == 3: return 3
-        else:              return 0  # 2/4 or less = no trade
+        else:              return 0
     except Exception:
         return 0
 

@@ -543,6 +543,54 @@ def detect_spike(candles: list, spike_mult: float = 2.5) -> dict:
         return {"is_spike": False, "direction": None}
 
 
+def check_wick_exit(symbol: str, pos_price: float, buy_price: float,
+                    candles: list, bucket: str = "swing") -> dict:
+    """
+    Wick exit — pressure flip signal.
+    Day:   fires in profit OR loss (cheap insurance, fast exits)
+    Swing: only fires when in profit (let stop handle losses)
+
+    Armed after entry — checks for upper wick rejection (sellers taking control).
+    """
+    if len(candles) < 3:
+        return {"action": None}
+    try:
+        c   = candles[-1]
+        rng = c["high"] - c["low"]
+        if rng == 0:
+            return {"action": None}
+
+        upper_wick = c["high"] - max(c["open"], c["close"])
+        in_profit  = pos_price > buy_price
+
+        # Upper wick > 45% of range = sellers rejecting highs = pressure flip
+        wick_pct = upper_wick / rng
+        if wick_pct < 0.45:
+            return {"action": None}
+
+        # Day: fires in profit OR loss
+        if bucket == "day":
+            return {
+                "action": "wick_exit",
+                "reason": "WICK EXIT (day)",
+                "wick_pct": round(wick_pct * 100, 1),
+                "in_profit": in_profit
+            }
+
+        # Swing: only fires when in profit
+        if bucket == "swing" and in_profit:
+            return {
+                "action": "wick_exit",
+                "reason": "WICK EXIT (swing)",
+                "wick_pct": round(wick_pct * 100, 1),
+                "in_profit": in_profit
+            }
+
+        return {"action": None}
+    except Exception:
+        return {"action": None}
+
+
 def check_spike_on_position(symbol: str, pos_price: float, buy_price: float,
                              candles: list) -> dict:
     """
@@ -625,44 +673,78 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
 
 # ── Daily summary ─────────────────────────────────────────────────────────────
 
-def send_daily_summary():
-    """Send 4 PM daily summary with consistency tracking."""
+def send_premarket_summary():
+    """9:00 AM ET — morning brief before market opens."""
+    ledger  = load_ledger()
+    capital = get_trading_capital()
+    cash_b  = get_cash_bucket()
+    etf_b   = get_etf_bucket()
+    day_cap = capital * DAY_PCT
+    swg_cap = capital * SWING_PCT
+
+    msg  = "Good morning — Pre-Market Brief\n"
+    msg += f"Capital: ${capital:,.0f} | Day: ${day_cap:,.0f} | Swing: ${swg_cap:,.0f}\n"
+    msg += f"ETF bucket: ${etf_b:,.0f} | Cash ready: ${cash_b:,.0f}\n"
+    msg += f"PDT trades used: {ledger.get('day_trades_this_week', 0)}/3 this week"
+    send_alert(msg)
+
+
+def send_session_summary():
+    """4:05 PM ET — end of session summary after market close."""
     ledger = load_ledger()
     stats  = get_daily_stats()
     wr_history = ledger.get("win_rate_history", [])
     win_rate   = sum(wr_history) / len(wr_history) * 100 if wr_history else 0
 
-    # Consistency % — how many of last 10 days were profitable
     daily_history = ledger.get("daily_pnl_history", [])
     daily_history.append(stats["daily_profit"])
     ledger["daily_pnl_history"] = daily_history[-10:]
     consistency = sum(1 for d in daily_history if d > 0) / len(daily_history) * 100 if daily_history else 0
+
+    c4 = ledger.get("conviction_4_count", 0)
+    c3 = ledger.get("conviction_3_count", 0)
+    c2 = ledger.get("conviction_2_count", 0)
+    c1 = ledger.get("conviction_1_count", 0)
+
+    for k in ["conviction_4_count", "conviction_3_count", "conviction_2_count", "conviction_1_count"]:
+        ledger[k] = 0
     save_ledger(ledger)
 
     capital    = get_trading_capital()
     stock_cap  = capital * 0.02
     stock_used = stats["daily_loss_stock"] / stock_cap * 100 if stock_cap > 0 else 0
 
-    # Conviction breakdown
-    c4 = ledger.get("conviction_4_count", 0)
-    c3 = ledger.get("conviction_3_count", 0)
-    c2 = ledger.get("conviction_2_count", 0)
-    c1 = ledger.get("conviction_1_count", 0)
+    trades_today = stats["trades_today"]
+    daily_profit = stats["daily_profit"]
+    daily_peak   = stats["daily_peak"]
 
-    # Reset conviction counts for tomorrow
-    for k in ["conviction_4_count", "conviction_3_count", "conviction_2_count", "conviction_1_count"]:
-        ledger[k] = 0
-    save_ledger(ledger)
-
-    trades_today = stats['trades_today']
-    daily_profit = stats['daily_profit']
-    daily_peak   = stats['daily_peak']
-    msg = "Daily Summary\n"
+    msg  = "Session Summary\n"
     msg += f"Trades: {trades_today} | P&L: ${daily_profit:+,.0f} | Peak: ${daily_peak:,.0f}\n"
     msg += f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
-    msg += f"Stock cap used: {stock_used:.0f}%\n"
+    msg += f"Cap used: {stock_used:.0f}%\n"
     msg += f"Signals: 4/4={c4} | 3/4={c3} | 2/4={c2} | 1/4={c1}"
     send_alert("📊 " + msg)
+
+
+def send_eod_summary():
+    """5:00 PM ET — end of day full summary with tax YTD."""
+    ledger  = load_ledger()
+    capital = get_trading_capital()
+    cash_b  = get_cash_bucket()
+    etf_b   = get_etf_bucket()
+    ytd_tax = ledger.get("ytd_tax_owed", 0.0)
+
+    msg  = "End of Day Summary\n"
+    msg += f"Capital: ${capital:,.0f}\n"
+    msg += f"ETF bucket: ${etf_b:,.0f} | Cash: ${cash_b:,.0f}\n"
+    msg += f"YTD tax owed: ${ytd_tax:,.2f} (MD rates)\n"
+    msg += f"Day bucket: ${capital*DAY_PCT:,.0f} | Swing: ${capital*SWING_PCT:,.0f}"
+    send_alert(msg)
+
+
+def send_daily_summary():
+    """Legacy — calls session summary."""
+    send_session_summary()
 
 
 # ── Main strategy ─────────────────────────────────────────────────────────────
@@ -717,6 +799,12 @@ def run_strategy():
             trigger    = None
 
             # Signal sell handled by dynamic stop and delta trail below
+            # Check cooldown (30 min after loss or spike exit)
+            ledger_cd = load_ledger()
+            last_exit = ledger_cd.get("last_loss_exit_time", 0)
+            if time.time() - last_exit < 1800:  # 30 min cooldown
+                print(f"  {sym}: COOLDOWN active — {int((1800-(time.time()-last_exit))/60)}min remaining")
+                continue
 
             if not trigger and trail_info:
                 buy_px  = trail_info["buy_price"]
@@ -737,8 +825,26 @@ def run_strategy():
                     except Exception:
                         _candles = None
 
-                    # Spike protection check
+                    # Get bucket type for this position
+                    _bucket = trail_info.get("bucket", "swing") if trail_info else "swing"
+
+                    # Wick exit check
                     if _candles:
+                        wick_check = check_wick_exit(sym, price, buy_px, _candles, _bucket)
+                        if wick_check["action"] == "wick_exit":
+                            trigger = "wick_exit"
+                            send_alert(
+                                f"{'🕯️'} WICK EXIT {sym} ({_bucket}) | "
+                                f"Wick {wick_check['wick_pct']}% | "
+                                f"{'Profit' if wick_check['in_profit'] else 'Loss'}"
+                            )
+                            # Record cooldown
+                            _l = load_ledger()
+                            _l["last_loss_exit_time"] = time.time()
+                            save_ledger(_l)
+
+                    # Spike protection check
+                    if not trigger and _candles:
                         spike_check = check_spike_on_position(sym, price, buy_px, _candles)
                         if spike_check["action"] == "profit_grab":
                             trigger = "profit_grab"
@@ -754,6 +860,42 @@ def run_strategy():
                                 f"Bar {spike_check['bar_range']:.2f} vs ATR {spike_check['atr']:.2f} | "
                                 f"Emergency exit"
                             )
+
+                    # Scale-out TP check (1:3 R/R)
+                    if not trigger and trail_info:
+                        tp1_pct = trail_info.get("tp1_pct", 0.105)
+                        tp2_pct = trail_info.get("tp2_pct", 0.175)
+                        tp1_hit = trail_info.get("tp1_hit", False)
+                        tp2_hit = trail_info.get("tp2_hit", False)
+                        profit_pct = (price - buy_px) / buy_px if buy_px > 0 else 0
+
+                        if not tp1_hit and profit_pct >= tp1_pct:
+                            # Sell ⅓ at TP1
+                            tp1_qty = max(1, qty // 3)
+                            try:
+                                place_equity_order(encrypted, sym, tp1_qty, "SELL")
+                                ledger_tp = load_ledger()
+                                if sym in ledger_tp["open_trades"]:
+                                    ledger_tp["open_trades"][sym]["tp1_hit"]  = True
+                                    ledger_tp["open_trades"][sym]["quantity"] -= tp1_qty
+                                save_ledger(ledger_tp)
+                                send_alert(f"TP1 {sym} x{tp1_qty} @ ${price:.2f} | +{profit_pct*100:.1f}% | 1/3 out")
+                            except Exception as _e:
+                                print(f"  TP1 error {sym}: {_e}")
+
+                        elif tp1_hit and not tp2_hit and profit_pct >= tp2_pct:
+                            # Sell ⅓ at TP2
+                            tp2_qty = max(1, qty // 3)
+                            try:
+                                place_equity_order(encrypted, sym, tp2_qty, "SELL")
+                                ledger_tp = load_ledger()
+                                if sym in ledger_tp["open_trades"]:
+                                    ledger_tp["open_trades"][sym]["tp2_hit"]  = True
+                                    ledger_tp["open_trades"][sym]["quantity"] -= tp2_qty
+                                save_ledger(ledger_tp)
+                                send_alert(f"TP2 {sym} x{tp2_qty} @ ${price:.2f} | +{profit_pct*100:.1f}% | 2/3 out")
+                            except Exception as _e:
+                                print(f"  TP2 error {sym}: {_e}")
 
                     if not trigger:
                         # Use pressure trail for exits — more aggressive
@@ -827,7 +969,7 @@ def run_strategy():
 
                     cash -= cost
                     bought_this_run.add(symbol)
-                    record_buy(symbol, quantity, price, cost)
+                    record_buy(symbol, quantity, price, cost, bucket=bucket)
                     from scanner import get_mtf_conviction
                     conv  = get_mtf_conviction(symbol)
                     stars = get_star_rating(stock)
@@ -1152,10 +1294,29 @@ def main():
 
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
     schedule.every(5).minutes.do(check_balance_24_7)
-    # Daily summary at 4 PM ET
-    schedule.every().day.at("16:00").do(send_daily_summary)
+    # Pre-market brief at 9:00 AM ET
+    schedule.every().day.at("09:00").do(send_premarket_summary)
 
-    # April tax alert — fires April 1-15 daily
+    # Session summary at 4:05 PM ET (after market close)
+    schedule.every().day.at("16:05").do(send_session_summary)
+
+    # End of day full summary at 5:00 PM ET
+    schedule.every().day.at("17:00").do(send_eod_summary)
+
+    # Backtest after session at 4:30 PM ET on weekdays
+    def run_post_session_backtest():
+        et  = pytz.timezone("America/New_York")
+        now = datetime.now(et)
+        if now.weekday() < 5:  # Mon-Fri only
+            try:
+                from backtest import run_backtest
+                run_backtest(days=14, bot_capital=get_trading_capital())
+            except Exception as ex:
+                print(f"Backtest error: {ex}")
+
+    schedule.every().day.at("16:30").do(run_post_session_backtest)
+
+    # April tax alert daily at 9:05 AM
     def maybe_send_tax_alert():
         from datetime import datetime as _dt
         import pytz as _pytz
@@ -1163,12 +1324,12 @@ def main():
         if now.month == 4 and 1 <= now.day <= 15:
             try:
                 accts     = get_account_numbers()
-                encrypted = accts[0]["hashValue"]
-                send_tax_alert(encrypted)
+                enc       = accts[0]["hashValue"]
+                send_tax_alert(enc)
             except Exception as ex:
                 print(f"Tax alert error: {ex}")
 
-    schedule.every().day.at("09:00").do(maybe_send_tax_alert)
+    schedule.every().day.at("09:05").do(maybe_send_tax_alert)
 
     while True:
         schedule.run_pending()

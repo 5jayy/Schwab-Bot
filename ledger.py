@@ -186,13 +186,29 @@ def mark_dividend_seen(transaction_id: str):
         save_ledger(ledger)
 
 
-def record_buy(symbol: str, quantity: int, price: float, cost: float):
+def record_buy(symbol: str, quantity: int, price: float, cost: float,
+               bucket: str = "swing", stop_pct: float = 0.07):
+    """Record buy with scale-out TP levels and R/R targets."""
     ledger = load_ledger()
+    # 1:3 R/R — day tighter, swing wider
+    if bucket == "day":
+        tp1_pct = stop_pct * 1.5   # ⅓ out at 1.5R
+        tp2_pct = stop_pct * 2.5   # ⅓ out at 2.5R
+    else:
+        tp1_pct = stop_pct * 2.0   # ⅓ out at 2R
+        tp2_pct = stop_pct * 3.0   # ⅓ out at 3R
+
     ledger["open_trades"][symbol] = {
         "quantity":    quantity,
         "buy_price":   price,
         "cost":        cost,
-        "high_price":  price,  # track peak price for trailing stop
+        "high_price":  price,
+        "bucket":      bucket,
+        "stop_pct":    stop_pct,
+        "tp1_pct":     tp1_pct,
+        "tp2_pct":     tp2_pct,
+        "tp1_hit":     False,
+        "tp2_hit":     False,
         "bought_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
     save_ledger(ledger)
