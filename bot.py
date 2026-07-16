@@ -658,13 +658,21 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
             pass
 
         if profit > 0:
-            send_alert(
-                f"💰 Sold {symbol} x{quantity} @ ${price:.2f} | +${profit:,.2f}\n"
-                f"→ ETF ${split['etf_cut']:,.0f} | Cash ${split['cash_cut']:,.0f} | Bot ${split['bot_cut']:,.0f}"
-            )
+            msg  = f"[ OUT ] {symbol} +{profit:,.2f}\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"PRICE  {price:.2f}\n"
+            msg += f"QTY    {quantity}\n"
+            msg += f"ETF    +{split['etf_cut']:,.2f}\n"
+            msg += f"CASH   +{split['cash_cut']:,.2f}\n"
+            msg += f"BOT    +{split['bot_cut']:,.2f}"
+            send_alert(msg)
         else:
-            tag = "🛑" if "stop" in reason or "trail" in reason or "breakeven" in reason else "📉"
-            send_alert(f"{tag} Sold {symbol} x{quantity} @ ${price:.2f} | ${profit:,.2f}")
+            msg  = f"[ CUT ] {symbol} {profit:,.2f}\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"PRICE  {price:.2f}\n"
+            msg += f"QTY    {quantity}\n"
+            msg += f"EXIT   {reason.upper()}"
+            send_alert(msg)
         print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {reason}")
     except Exception as ex:
         send_alert(f"Sell error {symbol}: {ex}")
@@ -718,12 +726,17 @@ def send_session_summary():
     daily_profit = stats["daily_profit"]
     daily_peak   = stats["daily_peak"]
 
-    msg  = "Session Summary\n"
-    msg += f"Trades: {trades_today} | P&L: ${daily_profit:+,.0f} | Peak: ${daily_peak:,.0f}\n"
-    msg += f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
-    msg += f"Cap used: {stock_used:.0f}%\n"
-    msg += f"Signals: 4/4={c4} | 3/4={c3} | 2/4={c2} | 1/4={c1}"
-    send_alert("📊 " + msg)
+    msg  = "[ CIRCUIT ] CLOSE 16:05\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += f"TRADES {trades_today}\n"
+    msg += f"P&L    {daily_profit:+,.2f}\n"
+    msg += f"PEAK   {daily_peak:,.2f}\n"
+    msg += f"WIN    {win_rate:.0f}%\n"
+    msg += f"CONS   {consistency:.0f}%\n"
+    msg += f"CAP    {stock_used:.0f}% used\n"
+    msg += f"━━━━━━━━━━━━━━━━━━\n"
+    msg += f"4/4 x{c4}  3/4 x{c3}  2/4 x{c2}"
+    send_alert(msg)
 
 
 def send_eod_summary():
@@ -734,11 +747,14 @@ def send_eod_summary():
     etf_b   = get_etf_bucket()
     ytd_tax = ledger.get("ytd_tax_owed", 0.0)
 
-    msg  = "End of Day Summary\n"
-    msg += f"Capital: ${capital:,.0f}\n"
-    msg += f"ETF bucket: ${etf_b:,.0f} | Cash: ${cash_b:,.0f}\n"
-    msg += f"YTD tax owed: ${ytd_tax:,.2f} (MD rates)\n"
-    msg += f"Day bucket: ${capital*DAY_PCT:,.0f} | Swing: ${capital*SWING_PCT:,.0f}"
+    msg  = "[ CIRCUIT ] EOD 17:00\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += f"CAP    {capital:,.2f}\n"
+    msg += f"DAY    {capital*DAY_PCT:,.2f}\n"
+    msg += f"SWING  {capital*SWING_PCT:,.2f}\n"
+    msg += f"ETF    {etf_b:,.2f}\n"
+    msg += f"CASH   {cash_b:,.2f}\n"
+    msg += f"TAX YTD {ytd_tax:,.2f}"
     send_alert(msg)
 
 
@@ -833,11 +849,10 @@ def run_strategy():
                         wick_check = check_wick_exit(sym, price, buy_px, _candles, _bucket)
                         if wick_check["action"] == "wick_exit":
                             trigger = "wick_exit"
-                            send_alert(
-                                f"{'🕯️'} WICK EXIT {sym} ({_bucket}) | "
-                                f"Wick {wick_check['wick_pct']}% | "
-                                f"{'Profit' if wick_check['in_profit'] else 'Loss'}"
-                            )
+                            _side = "PROFIT" if wick_check["in_profit"] else "LOSS"
+                            msg  = f"[ WICK ] {sym} — {_bucket.upper()}\n"
+                            msg += f"WICK {wick_check['wick_pct']}% — {_side}"
+                            send_alert(msg)
                             # Record cooldown
                             _l = load_ledger()
                             _l["last_loss_exit_time"] = time.time()
@@ -879,7 +894,11 @@ def run_strategy():
                                     ledger_tp["open_trades"][sym]["tp1_hit"]  = True
                                     ledger_tp["open_trades"][sym]["quantity"] -= tp1_qty
                                 save_ledger(ledger_tp)
-                                send_alert(f"TP1 {sym} x{tp1_qty} @ ${price:.2f} | +{profit_pct*100:.1f}% | 1/3 out")
+                                msg  = f"[ TP1 ] {sym} 1/3\n"
+                                msg += "━━━━━━━━━━━━━━━━━━\n"
+                                msg += f"PRICE  {price:.2f}\n"
+                                msg += f"+{profit_pct*100:.1f}%"
+                                send_alert(msg)
                             except Exception as _e:
                                 print(f"  TP1 error {sym}: {_e}")
 
@@ -893,7 +912,11 @@ def run_strategy():
                                     ledger_tp["open_trades"][sym]["tp2_hit"]  = True
                                     ledger_tp["open_trades"][sym]["quantity"] -= tp2_qty
                                 save_ledger(ledger_tp)
-                                send_alert(f"TP2 {sym} x{tp2_qty} @ ${price:.2f} | +{profit_pct*100:.1f}% | 2/3 out")
+                                msg  = f"[ TP2 ] {sym} 2/3\n"
+                                msg += "━━━━━━━━━━━━━━━━━━\n"
+                                msg += f"PRICE  {price:.2f}\n"
+                                msg += f"+{profit_pct*100:.1f}%"
+                                send_alert(msg)
                             except Exception as _e:
                                 print(f"  TP2 error {sym}: {_e}")
 
@@ -905,7 +928,7 @@ def run_strategy():
                     if price <= stop_info["stop_price"]:
                         trigger = stop_info["reason"]
                         if stop_info["reason"] == "breakeven":
-                            send_alert(f"🛡️ Breakeven exit {sym} | Protected")
+                            send_alert(f"[ LOCK ] {sym} — BREAKEVEN")
 
             if trigger:
                 if check_covered_call_already_open(encrypted, sym):
@@ -1280,10 +1303,16 @@ def main():
                           "%Y-%m-%dT%H:%M:%SZ")) < 86400)
 
         pulse    = get_market_pulse() if is_market_open() else ""
-        hold_str = f" | 🔒 ${on_hold:,.0f}" if on_hold > 0 else ""
-        msg = f"✅ Bot online | 💵 ${cash_ready:,.0f} ready{hold_str} | 24h ${p24h:,.0f}"
+        hold_str = f"\nHOLD   {on_hold:,.0f}" if on_hold > 0 else ""
+        msg  = "[ CIRCUIT ] LIVE\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+        msg += f"CAP    {capital:,.2f}\n"
+        msg += f"DAY    {capital*DAY_PCT:,.2f}\n"
+        msg += f"SWING  {capital*SWING_PCT:,.2f}\n"
+        msg += f"CASH   {cash_ready:,.2f}"
+        msg += hold_str
         if pulse:
-            msg += f"\n{pulse}"
+            msg += f"\n━━━━━━━━━━━━━━━━━━\n{pulse}"
         send_alert(msg)
 
     except Exception as ex:
@@ -1295,7 +1324,7 @@ def main():
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
     schedule.every(5).minutes.do(check_balance_24_7)
     # Pre-market brief at 9:00 AM ET
-    schedule.every().day.at("09:00").do(send_premarket_summary)
+    schedule.every().day.at("07:30").do(send_premarket_summary)
 
     # Session summary at 4:05 PM ET (after market close)
     schedule.every().day.at("16:05").do(send_session_summary)
