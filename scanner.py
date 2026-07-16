@@ -259,16 +259,14 @@ MTF_THRESHOLDS = {
 }
 
 
-def get_mtf_conviction(symbol: str) -> int:
+def get_day_conviction(symbol: str) -> int:
     """
-    4-frame MA conviction system.
-    Each frame: price > 20-period MA = bullish.
-
+    DAY TRADING bucket (25%) — 4-frame short term system.
     Frames: 30m, 15m, 5m, 1m
-    4/4 aligned → full ceiling (return 4)
-    3/4 aligned → 50% ceiling (return 3)
-    2/4 aligned → 35% ceiling (return 2)
-    1/4 or less → no trade (return 0)
+    Only longs. Need 3/4 minimum.
+    4/4 → full day ceiling
+    3/4 → 50% day ceiling
+    2/4 or less → no trade
     """
     try:
         frames = [
@@ -277,7 +275,6 @@ def get_mtf_conviction(symbol: str) -> int:
             get_price_history(symbol, period=5,  frequency=5),   # 5m
             get_price_history(symbol, period=2,  frequency=1),   # 1m
         ]
-
         aligned = 0
         for candles in frames:
             if len(candles) < 20:
@@ -287,17 +284,111 @@ def get_mtf_conviction(symbol: str) -> int:
             if closes[-1] > ma20:
                 aligned += 1
 
-        if aligned >= 4:
-            return 4
-        elif aligned == 3:
-            return 3
-        elif aligned == 2:
-            return 2
-        else:
-            return 0
-
+        if aligned >= 4:   return 4
+        elif aligned == 3: return 3
+        else:              return 0  # 2/4 or less = no trade
     except Exception:
         return 0
+
+
+def get_swing_conviction(symbol: str) -> dict:
+    """
+    SWING bucket (75%) — 3-frame system with direction awareness.
+    Frames: Daily, 30m, 5m
+
+    Returns:
+        conviction: 4 (all aligned) | 3 (2/3) | 0 (no trade)
+        direction: "up" | "down" | "flat"
+        bias: daily direction for options routing
+
+    Up bias   → look for long stock entries
+    Down bias → look for put selling opportunities
+    Flat bias → covered calls on existing positions only
+    """
+    try:
+        # Daily candles — bias/direction
+        daily   = get_price_history(symbol, period=10, frequency="day" if False else 1440)
+        # Use monthly period with daily frequency instead
+        import requests as _req
+        from auth import get_valid_token as _gvt
+        _h = {"Authorization": f"Bearer {_gvt()}"}
+        _r = _req.get(
+            "https://api.schwabapi.com/marketdata/v1/pricehistory",
+            headers=_h,
+            params={"symbol": symbol, "periodType": "month", "period": 1,
+                    "frequencyType": "daily", "frequency": 1,
+                    "needExtendedHoursData": False},
+            timeout=10
+        )
+        daily = _r.json().get("candles", []) if _r.ok else []
+
+        # 30m candles — alignment
+        candles_30m = get_price_history(symbol, period=5, frequency=30)
+        # 5m candles — trigger + order flow
+        candles_5m  = get_price_history(symbol, period=2, frequency=5)
+
+        # Daily direction
+        daily_bias = "flat"
+        daily_aligned = False
+        if len(daily) >= 10:
+            closes_d = [c["close"] for c in daily]
+            ma10_d   = sum(closes_d[-10:]) / 10
+            ma20_d   = sum(closes_d[-20:]) / 20 if len(closes_d) >= 20 else ma10_d
+            if closes_d[-1] > ma10_d and ma10_d > ma20_d:
+                daily_bias    = "up"
+                daily_aligned = True
+            elif closes_d[-1] < ma10_d and ma10_d < ma20_d:
+                daily_bias    = "down"
+                daily_aligned = True
+            else:
+                daily_bias    = "flat"
+                daily_aligned = False
+
+        # 30m alignment
+        aligned_30m = False
+        if len(candles_30m) >= 20:
+            closes_30 = [c["close"] for c in candles_30m]
+            ma20_30   = sum(closes_30[-20:]) / 20
+            if daily_bias == "up":
+                aligned_30m = closes_30[-1] > ma20_30
+            elif daily_bias == "down":
+                aligned_30m = closes_30[-1] < ma20_30
+            else:
+                aligned_30m = False
+
+        # 5m trigger
+        aligned_5m = False
+        if len(candles_5m) >= 20:
+            closes_5 = [c["close"] for c in candles_5m]
+            ma20_5   = sum(closes_5[-20:]) / 20
+            if daily_bias == "up":
+                aligned_5m = closes_5[-1] > ma20_5
+            elif daily_bias == "down":
+                aligned_5m = closes_5[-1] < ma20_5
+            else:
+                aligned_5m = False
+
+        frames_aligned = sum([daily_aligned, aligned_30m, aligned_5m])
+
+        if frames_aligned >= 3:   conviction = 4
+        elif frames_aligned == 2: conviction = 3
+        else:                     conviction = 0
+
+        return {
+            "conviction": conviction,
+            "direction":  daily_bias,
+            "daily_ok":   daily_aligned,
+            "30m_ok":     aligned_30m,
+            "5m_ok":      aligned_5m,
+        }
+    except Exception:
+        return {"conviction": 0, "direction": "flat", "daily_ok": False,
+                "30m_ok": False, "5m_ok": False}
+
+
+def get_mtf_conviction(symbol: str) -> int:
+    """Legacy wrapper — uses day conviction for backward compatibility."""
+    return get_day_conviction(symbol)
 
 
 def candlestick_bonus(candles: list) -> float:

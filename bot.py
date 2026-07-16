@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 from auth import get_valid_token
 from scanner import (
     scan_best_stocks, scan_best_etfs, get_market_pulse,
-    get_tier, get_etf_level, ETF_DIVIDEND_RULES, get_etf_category
+    get_tier, get_etf_level, ETF_DIVIDEND_RULES, get_etf_category,
+    get_day_conviction, get_swing_conviction
 )
 from options import (
     find_best_covered_call, place_covered_call, check_covered_call_already_open,
@@ -45,13 +46,20 @@ TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 # ── Profit splits ─────────────────────────────────────────────────────────────
-STOCK_SPLIT  = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
+STOCK_SPLIT   = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
 OPTIONS_SPLIT = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
-ETF_SPLITS   = {
+ETF_SPLITS    = {
     "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
     "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
     "Level 3": {"bot": 0.30, "cash": 0.40, "etf": 0.30},
 }
+
+# ── Capital bucket split ───────────────────────────────────────────────────────
+DAY_PCT   = 0.25   # 25% for day trading (30/15/5/1m)
+SWING_PCT = 0.75   # 75% for swing + options (Daily/30m/5m)
+
+# PDT rule — max 3 day trades in 5 days under $25k
+MAX_DAY_TRADES_PER_WEEK = 3
 
 # ── Safety floor ──────────────────────────────────────────────────────────────
 BOT_FLOOR = 500.0  # never let bot capital drop below this
@@ -201,22 +209,76 @@ def get_star_rating(stock: dict) -> int:
     return min(max(stars, 1), 10)
 
 
-def get_mtf_position_size(symbol: str, ceiling: float) -> float:
+def get_day_position_size(symbol: str, capital: float, fvg_confirmed: bool = False, stars: int = 0) -> float:
     """
-    4-frame MA conviction sizing.
-    4/4 → full ceiling
-    3/4 → 50% ceiling
-    2/4 → NO TRADE (too weak, kills account)
-    1/4 → NO TRADE
+    Day trading bucket (25% of capital).
+    Conviction only for sizing. Stars 7+ required to qualify.
+    Frames: 30m/15m/5m/1m
+
+    4/4        → full ceiling
+    3/4 + FVG  → 2.5 fires at 70% ceiling
+    3/4 no FVG → 50% ceiling (still trades)
+    2/4        → no trade always
+    Stars 7+   → required to qualify
     """
-    from scanner import get_mtf_conviction
-    conviction = get_mtf_conviction(symbol)
+    if stars < 7:
+        return 0  # stars 7+ required for day trades
+
+    day_capital = capital * DAY_PCT
+    room        = day_capital - 200
+    if room <= 0:
+        return 0
+    ceiling = min(room * 0.40, 200)
+
+    conviction = get_day_conviction(symbol)
+
     if conviction >= 4:
-        return ceiling          # 4/4 full
+        return ceiling              # 4/4 full
+    elif conviction == 3 and fvg_confirmed:
+        return ceiling * 0.70       # 2.5 with FVG → 70% ceiling
     elif conviction == 3:
-        return ceiling * 0.50   # 3/4 half
+        return ceiling * 0.50       # 3/4 no FVG → 50% ceiling (still trades)
     else:
-        return 0                # 2/4 or less — no trade
+        return 0                    # 2/4 or less → no trade
+
+
+def get_swing_position_size(symbol: str, capital: float, stock: dict = None) -> tuple:
+    """
+    Swing bucket (75% of capital).
+    Frames: Daily/30m/5m
+    Minimum to fire: 3.0/4 conviction
+    Stars LOCK IN the size (7+ required):
+    Stars 7  → 50% ceiling
+    Stars 8  → 75% ceiling
+    Stars 9  → 90% ceiling
+    Stars 10 → full ceiling
+    Stars <7 → no trade
+    Returns (size, direction, conviction_info)
+    """
+    swing_capital = capital * SWING_PCT
+    room          = swing_capital - 300
+    if room <= 0:
+        return 0, "flat", {}
+    ceiling = get_ceiling(swing_capital)
+
+    info = get_swing_conviction(symbol)
+    conv = info["conviction"]
+
+    # Minimum 3.0/4 to fire — no FVG shortcut for swing
+    if conv < 3:
+        return 0, info.get("direction", "flat"), info
+
+    # Stars lock in size — 7+ required
+    stars = get_star_rating(stock) if stock else 0
+    if stars < 7:
+        return 0, info.get("direction", "flat"), info
+
+    if stars >= 10:    size = ceiling
+    elif stars >= 9:   size = ceiling * 0.90
+    elif stars >= 8:   size = ceiling * 0.75
+    else:              size = ceiling * 0.50  # stars 7
+
+    return size, info["direction"], info
 
 
 # ── Room-based ceiling ────────────────────────────────────────────────────────
@@ -245,6 +307,10 @@ def get_daily_stats() -> dict:
     ledger = load_ledger()
     today  = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
     if ledger.get("daily_stats_date") != today:
+        # Reset weekly PDT counter on Monday
+        now = datetime.now(pytz.timezone("America/New_York"))
+        if now.weekday() == 0:  # Monday
+            ledger["day_trades_this_week"] = 0
         ledger.update({
             "daily_stats_date":   today,
             "daily_loss_stock":   0.0,
@@ -832,7 +898,7 @@ def run_options(encrypted: str, positions: list, cash: float, stats: dict, capit
         except Exception as ex:
             print(f"  Call error {sym}: {ex}")
 
-    # Cash secured puts
+    # Cash secured puts — use swing direction (down bias = better put opportunities)
     if cash < 200:
         return
     print(f"\n-- Cash secured puts | ${cash:,.2f} --")
@@ -841,8 +907,21 @@ def run_options(encrypted: str, positions: list, cash: float, stats: dict, capit
         sym   = stock["symbol"]
         price = stock["price"]
         star  = get_star_rating(stock)
-        if star < 6:
-            continue  # options need strong signal
+
+        # Check swing direction for puts
+        try:
+            swing_info = get_swing_conviction(sym)
+            swing_dir  = swing_info.get("direction", "flat")
+            swing_conv = swing_info.get("conviction", 0)
+            # Puts work in any direction but prefer flat/down bias
+            # Skip puts when strong uptrend (better to buy stock instead)
+            if swing_dir == "up" and swing_conv >= 4:
+                continue  # strong uptrend — buy stock not put
+        except Exception:
+            swing_dir = "flat"
+
+        if star < 7:  # 7+ stars required for puts
+            continue
         if check_put_already_open(encrypted, sym):
             continue
         put = find_best_cash_secured_put(sym, price, cash)
