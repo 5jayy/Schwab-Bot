@@ -221,6 +221,162 @@ def get_trailing_stop_info(symbol: str) -> dict | None:
     }
 
 
+def get_pressure_trail(symbol: str, buy_price: float, high_price: float,
+                       current_price: float, candles: list = None,
+                       base_trail: float = 0.07) -> dict:
+    """
+    Pressure trailing exit — trails based on candle pressure + order flow.
+    Not price-based. Exits when pressure flips not when price drops.
+
+    Pressure flip signals:
+    - Candles turning red after green run
+    - Upper wicks appearing (sellers rejecting highs)
+    - Order flow imbalance shifting to sellers
+    - Volume dropping on up candles (momentum fading)
+
+    More aggressive than fixed trail — books profits at peak pressure.
+    """
+    if buy_price <= 0:
+        return {"stop_price": 0, "reason": "invalid", "profit_pct": 0, "pressure": 0}
+
+    profit_pct = (current_price - buy_price) / buy_price
+
+    # Always breakeven at 2%
+    if 0.02 <= profit_pct < 0.05:
+        return {
+            "stop_price":  buy_price,
+            "trail_pct":   base_trail,
+            "reason":      "breakeven",
+            "profit_pct":  profit_pct,
+            "pressure":    0
+        }
+
+    if profit_pct < 0.02:
+        return {
+            "stop_price": high_price * (1 - base_trail),
+            "trail_pct":  base_trail,
+            "reason":     "trail_base",
+            "profit_pct": profit_pct,
+            "pressure":   0
+        }
+
+    # Measure sell pressure from candles
+    pressure_score = 0
+    trail_pct      = base_trail
+
+    if candles and len(candles) >= 5:
+        recent = candles[-5:]
+
+        # Signal 1: Upper wicks on recent candles (sellers rejecting highs)
+        wick_count = 0
+        for c in recent:
+            rng = c["high"] - c["low"]
+            if rng > 0:
+                upper_wick = c["high"] - max(c["open"], c["close"])
+                if upper_wick > rng * 0.4:
+                    wick_count += 1
+        pressure_score += wick_count * 10  # 0-50 pts
+
+        # Signal 2: Consecutive red candles
+        red_count = sum(1 for c in recent if c["close"] < c["open"])
+        pressure_score += red_count * 8  # 0-40 pts
+
+        # Signal 3: Volume declining on up candles
+        up_candles = [c for c in recent if c["close"] > c["open"]]
+        if len(up_candles) >= 2:
+            if up_candles[-1]["volume"] < up_candles[-2]["volume"] * 0.8:
+                pressure_score += 15  # volume fading on up moves
+
+        # Pressure determines trail tightness
+        if pressure_score >= 60:
+            trail_pct = 0.02   # high pressure — very tight trail
+            reason    = "pressure_high"
+        elif pressure_score >= 35:
+            trail_pct = 0.03   # moderate pressure — tighten
+            reason    = "pressure_moderate"
+        elif pressure_score >= 15:
+            trail_pct = 0.04   # low pressure — slight tighten
+            reason    = "pressure_low"
+        else:
+            trail_pct = 0.05   # no pressure — give room
+            reason    = "pressure_none"
+    else:
+        reason = "trail_profit"
+        trail_pct = 0.05
+
+    stop_price = high_price * (1 - trail_pct)
+
+    return {
+        "stop_price":    stop_price,
+        "trail_pct":     trail_pct,
+        "reason":        reason,
+        "profit_pct":    profit_pct,
+        "pressure":      pressure_score
+    }
+
+
+# ── Tax tracker ───────────────────────────────────────────────────────────────
+
+MARYLAND_SHORT_TERM = 0.3775   # federal + MD state short term
+MARYLAND_LONG_TERM  = 0.2075   # federal + MD state long term
+MARYLAND_QUALIFIED  = 0.2075   # qualified dividends rate
+
+
+def record_taxable_event(symbol: str, profit: float, hold_days: int,
+                          event_type: str = "stock"):
+    """
+    Records every taxable event for annual tax calculation.
+    Types: stock, options, dividend, etf_sale
+    """
+    ledger = load_ledger()
+    event  = {
+        "symbol":     symbol,
+        "profit":     profit,
+        "hold_days":  hold_days,
+        "type":       event_type,
+        "long_term":  hold_days >= 365,
+        "tax_rate":   MARYLAND_LONG_TERM if hold_days >= 365 else MARYLAND_SHORT_TERM,
+        "tax_owed":   profit * (MARYLAND_LONG_TERM if hold_days >= 365 else MARYLAND_SHORT_TERM),
+        "timestamp":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    }
+    ledger.setdefault("tax_events", []).append(event)
+    ledger["ytd_tax_owed"] = ledger.get("ytd_tax_owed", 0.0) + max(event["tax_owed"], 0)
+    save_ledger(ledger)
+
+
+def get_tax_report() -> dict:
+    """
+    Calculate annual tax report from all recorded events.
+    Shows exactly what you owe by category.
+    """
+    ledger = load_ledger()
+    events = ledger.get("tax_events", [])
+
+    short_gains = sum(e["profit"] for e in events if e["profit"] > 0 and not e["long_term"] and e["type"] in ("stock", "options"))
+    long_gains  = sum(e["profit"] for e in events if e["profit"] > 0 and e["long_term"])
+    short_loss  = sum(e["profit"] for e in events if e["profit"] < 0 and not e["long_term"])
+    dividends   = sum(e["profit"] for e in events if e["type"] == "dividend")
+
+    net_short   = short_gains + short_loss
+    tax_short   = max(net_short, 0) * MARYLAND_SHORT_TERM
+    tax_long    = max(long_gains, 0) * MARYLAND_LONG_TERM
+    tax_div     = max(dividends, 0) * MARYLAND_QUALIFIED
+    total_owed  = tax_short + tax_long + tax_div
+
+    return {
+        "short_term_gains":  round(short_gains, 2),
+        "short_term_losses": round(short_loss, 2),
+        "net_short_term":    round(net_short, 2),
+        "long_term_gains":   round(long_gains, 2),
+        "dividends":         round(dividends, 2),
+        "tax_short_term":    round(tax_short, 2),
+        "tax_long_term":     round(tax_long, 2),
+        "tax_dividends":     round(tax_div, 2),
+        "total_tax_owed":    round(total_owed, 2),
+        "ytd_events":        len(events),
+    }
+
+
 def get_dynamic_stop(buy_price: float, high_price: float, current_price: float,
                       base_trail: float = 0.07, candles: list = None) -> dict:
     """

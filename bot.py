@@ -32,8 +32,10 @@ from ledger import (
     deduct_etf_bucket,
     record_dividend, get_dividend_stats, mark_dividend_seen,
     update_high_price, get_trailing_stop_info, get_dynamic_stop,
+    get_pressure_trail,
     BOT_STOCKS, ETF_MIN_SWEEP
 )
+from tax import record_taxable_event, send_tax_alert, sync_schwab_tax_history
 
 load_dotenv()
 
@@ -204,8 +206,8 @@ def get_mtf_position_size(symbol: str, ceiling: float) -> float:
     4-frame MA conviction sizing.
     4/4 → full ceiling
     3/4 → 50% ceiling
-    2/4 → 35% ceiling (~$70 at $200 ceiling)
-    1/4 or less → no trade (returns 0)
+    2/4 → NO TRADE (too weak, kills account)
+    1/4 → NO TRADE
     """
     from scanner import get_mtf_conviction
     conviction = get_mtf_conviction(symbol)
@@ -213,10 +215,8 @@ def get_mtf_position_size(symbol: str, ceiling: float) -> float:
         return ceiling          # 4/4 full
     elif conviction == 3:
         return ceiling * 0.50   # 3/4 half
-    elif conviction == 2:
-        return ceiling * 0.35   # 2/4 small but protected by features
     else:
-        return 0                # 1/4 or less — no trade
+        return 0                # 2/4 or less — no trade
 
 
 # ── Room-based ceiling ────────────────────────────────────────────────────────
@@ -524,6 +524,25 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
         record_trade_result(profit, "stock")
         update_win_rate(profit)
 
+        # Record for tax tracking
+        try:
+            ledger_t = load_ledger()
+            trade_t  = ledger_t.get("closed_trades", [])
+            hold_days = 180  # default
+            for ct in trade_t:
+                if ct.get("symbol") == symbol:
+                    try:
+                        from datetime import datetime as _dt
+                        b = _dt.strptime(ct.get("bought_at","2000-01-01")[:10], "%Y-%m-%d")
+                        s = _dt.strptime(ct.get("closed_at","2000-01-01")[:10], "%Y-%m-%d")
+                        hold_days = (s - b).days
+                    except Exception:
+                        pass
+                    break
+            record_taxable_event(symbol, profit, hold_days, "stock")
+        except Exception:
+            pass
+
         if profit > 0:
             send_alert(
                 f"💰 Sold {symbol} x{quantity} @ ${price:.2f} | +${profit:,.2f}\n"
@@ -598,6 +617,14 @@ def run_strategy():
         sync_ledger_from_schwab(encrypted)
         check_token_health()
 
+        # Sync Schwab tax history in January
+        from datetime import datetime as _dt2
+        if _dt2.now().month == 1:
+            try:
+                sync_schwab_tax_history(encrypted)
+            except Exception:
+                pass
+
         capital   = get_trading_capital()
         ceiling   = get_ceiling(capital)
         stats     = get_daily_stats()
@@ -663,7 +690,8 @@ def run_strategy():
                             )
 
                     if not trigger:
-                        stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles)
+                        # Use pressure trail for exits — more aggressive
+                        stop_info = get_pressure_trail(sym, buy_px, high_px, price, _candles, TRAILING_STOP_PCT)
                     else:
                         stop_info = None
                     if price <= stop_info["stop_price"]:
@@ -1047,6 +1075,21 @@ def main():
     schedule.every(5).minutes.do(check_balance_24_7)
     # Daily summary at 4 PM ET
     schedule.every().day.at("16:00").do(send_daily_summary)
+
+    # April tax alert — fires April 1-15 daily
+    def maybe_send_tax_alert():
+        from datetime import datetime as _dt
+        import pytz as _pytz
+        now = _dt.now(_pytz.timezone("America/New_York"))
+        if now.month == 4 and 1 <= now.day <= 15:
+            try:
+                accts     = get_account_numbers()
+                encrypted = accts[0]["hashValue"]
+                send_tax_alert(encrypted)
+            except Exception as ex:
+                print(f"Tax alert error: {ex}")
+
+    schedule.every().day.at("09:00").do(maybe_send_tax_alert)
 
     while True:
         schedule.run_pending()

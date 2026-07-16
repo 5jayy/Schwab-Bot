@@ -418,6 +418,101 @@ def order_flow(symbol: str, candles: list) -> float:
         return 0
 
 
+def wick_rejection(candles: list) -> float:
+    """
+    Detects wick rejection — price pushed to an extreme then violently rejected.
+    Strong lower wick = buyers rejecting lower prices (bullish).
+    Boosts entry score 0-15. Also used for exit pressure flip signal.
+    Dynamic — uses candle range so it scales with volatility.
+    """
+    if len(candles) < 3:
+        return 0
+    try:
+        c   = candles[-1]
+        o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+        rng = h - l
+        if rng == 0:
+            return 0
+
+        lower_wick = min(o, cl) - l  # wick below body
+        upper_wick = h - max(o, cl)  # wick above body
+        body       = abs(cl - o)
+
+        # Bullish wick rejection — big lower wick, small upper wick, closes green
+        if cl > o and lower_wick > rng * 0.45 and upper_wick < rng * 0.2:
+            strength = lower_wick / rng
+            return min(strength * 20, 15)
+
+        # Pressure flip signal — previous bar had big upper wick (sellers rejected)
+        # current bar closes green = buyers took control
+        if len(candles) >= 2:
+            prev = candles[-2]
+            prev_rng  = prev["high"] - prev["low"]
+            prev_wick = prev["high"] - max(prev["open"], prev["close"])
+            if prev_rng > 0 and prev_wick > prev_rng * 0.5 and cl > prev["close"]:
+                return 10  # pressure flip bonus
+
+        return 0
+    except Exception:
+        return 0
+
+
+def detect_fvg(candles: list) -> dict:
+    """
+    Fair Value Gap (FVG) detection.
+    A FVG is a 3-candle pattern where candle 1 high and candle 3 low don't overlap.
+    Gap = inefficiency that price tends to return to.
+
+    Entry use: price returning to fresh FVG = boost score (strong institutional level)
+    Safety use: price still INSIDE FVG = skip entry (unstable, gap still filling)
+
+    Returns:
+        has_fvg: bool
+        in_gap: bool (price currently inside the gap = unsafe)
+        returning: bool (price just returned to gap edge = entry boost)
+        gap_top: float
+        gap_bottom: float
+        boost: float (score bonus 0-12)
+    """
+    if len(candles) < 4:
+        return {"has_fvg": False, "in_gap": False, "returning": False, "boost": 0}
+    try:
+        current_price = candles[-1]["close"]
+        result = {"has_fvg": False, "in_gap": False, "returning": False, "boost": 0}
+
+        # Check last 10 candles for FVG patterns
+        for i in range(2, min(10, len(candles))):
+            c1 = candles[-i-1]  # oldest
+            c2 = candles[-i]    # middle
+            c3 = candles[-i+1] if i > 1 else candles[-1]  # newest
+
+            # Bullish FVG — gap between c1 high and c3 low
+            gap_bottom = c1["high"]
+            gap_top    = c3["low"]
+
+            if gap_top > gap_bottom:  # valid gap
+                result["has_fvg"]   = True
+                result["gap_top"]   = gap_top
+                result["gap_bottom"] = gap_bottom
+
+                # Price inside gap — unstable, skip entry
+                if gap_bottom <= current_price <= gap_top:
+                    result["in_gap"] = True
+                    result["boost"]  = 0
+                    return result
+
+                # Price returning to gap from above — strong entry signal
+                gap_size = gap_top - gap_bottom
+                if gap_top < current_price <= gap_top + gap_size * 0.5:
+                    result["returning"] = True
+                    result["boost"]     = 12
+                    return result
+
+        return result
+    except Exception:
+        return {"has_fvg": False, "in_gap": False, "returning": False, "boost": 0}
+
+
 def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     """
     Score a stock using candle strength + order flow.
@@ -485,8 +580,17 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     if thresholds["candle_required"] and sweep_bonus < thresholds["sweep_min"] and candle_bonus < 3:
         return None
 
-    # Total score — candle strength + order flow + sweep + candle patterns
-    total_score = (strength * 0.4) + (flow * 0.4) + sweep_bonus + candle_bonus + (change_pct * 2)
+    # Wick rejection bonus
+    wick_bonus = wick_rejection(candles)
+
+    # FVG detection — boost or block
+    fvg = detect_fvg(candles)
+    if fvg["in_gap"]:
+        return None  # price inside FVG — unstable, skip entry
+    fvg_bonus = fvg["boost"]
+
+    # Total score — candle strength + order flow + sweep + wick + fvg + candle patterns
+    total_score = (strength * 0.4) + (flow * 0.4) + sweep_bonus + candle_bonus + wick_bonus + fvg_bonus + (change_pct * 2)
 
     if total_score < 10:
         return None
@@ -500,6 +604,9 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         "atr_pct":      round(atr_pct, 2),
         "sweep_bonus":  round(sweep_bonus, 1),
         "candle_bonus": round(candle_bonus, 1),
+        "wick_bonus":   round(wick_bonus, 1),
+        "fvg_bonus":    round(fvg_bonus, 1),
+        "fvg_returning": fvg["returning"],
         "conviction":   conviction,
         "score":        round(total_score, 1),
         "score": total_score,
