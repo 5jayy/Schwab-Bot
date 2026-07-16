@@ -863,18 +863,20 @@ def run_strategy():
                         spike_check = check_spike_on_position(sym, price, buy_px, _candles)
                         if spike_check["action"] == "profit_grab":
                             trigger = "profit_grab"
-                            send_alert(
-                                f"⚡ SPIKE PROFIT GRAB {sym} | "
-                                f"Bar {spike_check['bar_range']:.2f} vs ATR {spike_check['atr']:.2f} | "
-                                f"Booking windfall now"
-                            )
+                            msg  = "[ GRAB ] " + sym + "\n"
+                            msg += "BAR " + str(round(spike_check['bar_range'],2)) + " ATR " + str(round(spike_check['atr'],2))
+                            send_alert(msg)
+                            _l = load_ledger()
+                            _l["last_loss_exit_time"] = time.time()
+                            save_ledger(_l)
                         elif spike_check["action"] == "loss_exit":
                             trigger = "loss_exit"
-                            send_alert(
-                                f"🚨 SPIKE LOSS EXIT {sym} | "
-                                f"Bar {spike_check['bar_range']:.2f} vs ATR {spike_check['atr']:.2f} | "
-                                f"Emergency exit"
-                            )
+                            msg  = "[ SPIKE CUT ] " + sym + "\n"
+                            msg += "BAR " + str(round(spike_check['bar_range'],2)) + " ATR " + str(round(spike_check['atr'],2))
+                            send_alert(msg)
+                            _l = load_ledger()
+                            _l["last_loss_exit_time"] = time.time()
+                            save_ledger(_l)
 
                     # Scale-out TP check (1:3 R/R)
                     if not trigger and trail_info:
