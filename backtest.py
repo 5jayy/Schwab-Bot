@@ -91,11 +91,12 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
     if len(candles) < 50:
         return {}
 
-    trades   = []
-    in_trade = False
-    entry_px = 0
-    high_px  = 0
-    bars_held = 0
+    trades          = []
+    in_trade        = False
+    entry_px        = 0
+    high_px         = 0
+    bars_held       = 0
+    missed_signals  = 0  # signals that qualified but were skipped
 
     for i in range(30, len(candles) - 1):
         window  = candles[:i+1]
@@ -171,6 +172,13 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
         entry_px  = candles[i+1]["open"]  # next bar open (realistic)
         high_px   = entry_px
         bars_held = 0
+        continue
+
+    # Count missed — signal qualified but we were already in a trade
+    if in_trade:
+        missed_signals += 0  # already handled above
+    elif score >= min_score:
+        missed_signals += 1  # signal fired but filtered by something
 
     if not trades:
         return {}
@@ -183,6 +191,7 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
     profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else 999
     total_return  = sum(t["pnl"] for t in trades)
     avg_bars      = sum(t["bars"] for t in trades) / len(trades)
+    peak_return   = max(t["pnl"] for t in trades) if trades else 0
 
     # Sharpe approximation
     returns = [t["pnl"] for t in trades]
@@ -192,6 +201,7 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
 
     return {
         "trades":        len(trades),
+        "missed":        missed_signals,
         "win_rate":      round(win_rate * 100, 1),
         "avg_win_pct":   round(avg_win, 2),
         "avg_loss_pct":  round(avg_loss, 2),
@@ -199,6 +209,7 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
         "total_return":  round(total_return, 2),
         "sharpe":        round(sharpe, 2),
         "avg_bars_held": round(avg_bars, 1),
+        "peak_return":   round(peak_return, 2),
     }
 
 
@@ -317,6 +328,7 @@ def run_backtest(days: int = 60, bot_capital: float = 2400):
 
         aggregated[name] = {
             "trades":        sum(m["trades"]        for m in metrics_list),
+            "missed":        sum(m.get("missed", 0) for m in metrics_list),
             "win_rate":      round(sum(m["win_rate"]      for m in metrics_list) / len(metrics_list), 1),
             "avg_win_pct":   round(sum(m["avg_win_pct"]   for m in metrics_list) / len(metrics_list), 2),
             "avg_loss_pct":  round(sum(m["avg_loss_pct"]  for m in metrics_list) / len(metrics_list), 2),
@@ -324,6 +336,7 @@ def run_backtest(days: int = 60, bot_capital: float = 2400):
             "total_return":  round(sum(m["total_return"]  for m in metrics_list) / len(metrics_list), 2),
             "sharpe":        round(sum(m["sharpe"]        for m in metrics_list) / len(metrics_list), 2),
             "avg_bars_held": round(sum(m["avg_bars_held"] for m in metrics_list) / len(metrics_list), 1),
+            "peak_return":   round(max(m.get("peak_return", 0) for m in metrics_list), 2),
             "symbols_tested": len(metrics_list),
         }
 

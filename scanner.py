@@ -336,22 +336,24 @@ def get_day_conviction(symbol: str) -> int:
 
 def get_swing_conviction(symbol: str) -> dict:
     """
-    SWING bucket (75%) — 3-frame system with direction awareness.
-    Frames: Daily, 30m, 5m
+    SWING bucket (75%) — 4-frame system with direction awareness.
+    Frames: Daily, 30m, 15m, 5m
 
-    Returns:
-        conviction: 4 (all aligned) | 3 (2/3) | 0 (no trade)
-        direction: "up" | "down" | "flat"
-        bias: daily direction for options routing
+    Daily = direction/bias (mandatory)
+    30m   = alignment
+    15m   = confirmation
+    5m    = trigger + order flow
 
-    Up bias   → look for long stock entries
-    Down bias → look for put selling opportunities
-    Flat bias → covered calls on existing positions only
+    4/4 → full ceiling x stars
+    3/4 → 50% ceiling x stars
+    2/4 → no trade
+
+    Up bias   → long stock entries
+    Down bias → put selling opportunities
+    Flat bias → covered calls only
     """
     try:
         # Daily candles — bias/direction
-        daily   = get_price_history(symbol, period=10, frequency="day" if False else 1440)
-        # Use monthly period with daily frequency instead
         import requests as _req
         from auth import get_valid_token as _gvt
         _h = {"Authorization": f"Bearer {_gvt()}"}
@@ -366,12 +368,14 @@ def get_swing_conviction(symbol: str) -> dict:
         daily = _r.json().get("candles", []) if _r.ok else []
 
         # 30m candles — alignment
-        candles_30m = get_price_history(symbol, period=5, frequency=30)
-        # 5m candles — trigger + order flow
-        candles_5m  = get_price_history(symbol, period=2, frequency=5)
+        candles_30m = get_price_history(symbol, period=5,  frequency=30)
+        # 15m candles — confirmation
+        candles_15m = get_price_history(symbol, period=5,  frequency=15)
+        # 5m candles — trigger
+        candles_5m  = get_price_history(symbol, period=2,  frequency=5)
 
         # Daily direction
-        daily_bias = "flat"
+        daily_bias    = "flat"
         daily_aligned = False
         if len(daily) >= 10:
             closes_d = [c["close"] for c in daily]
@@ -383,38 +387,24 @@ def get_swing_conviction(symbol: str) -> dict:
             elif closes_d[-1] < ma10_d and ma10_d < ma20_d:
                 daily_bias    = "down"
                 daily_aligned = True
-            else:
-                daily_bias    = "flat"
-                daily_aligned = False
 
-        # 30m alignment
-        aligned_30m = False
-        if len(candles_30m) >= 20:
-            closes_30 = [c["close"] for c in candles_30m]
-            ma20_30   = sum(closes_30[-20:]) / 20
-            if daily_bias == "up":
-                aligned_30m = closes_30[-1] > ma20_30
-            elif daily_bias == "down":
-                aligned_30m = closes_30[-1] < ma20_30
-            else:
-                aligned_30m = False
+        def frame_aligned(candles, direction):
+            if len(candles) < 20:
+                return False
+            closes = [c["close"] for c in candles]
+            ma20   = sum(closes[-20:]) / 20
+            if direction == "up":   return closes[-1] > ma20
+            if direction == "down": return closes[-1] < ma20
+            return False
 
-        # 5m trigger
-        aligned_5m = False
-        if len(candles_5m) >= 20:
-            closes_5 = [c["close"] for c in candles_5m]
-            ma20_5   = sum(closes_5[-20:]) / 20
-            if daily_bias == "up":
-                aligned_5m = closes_5[-1] > ma20_5
-            elif daily_bias == "down":
-                aligned_5m = closes_5[-1] < ma20_5
-            else:
-                aligned_5m = False
+        aligned_30m = frame_aligned(candles_30m, daily_bias)
+        aligned_15m = frame_aligned(candles_15m, daily_bias)
+        aligned_5m  = frame_aligned(candles_5m,  daily_bias)
 
-        frames_aligned = sum([daily_aligned, aligned_30m, aligned_5m])
+        frames_aligned = sum([daily_aligned, aligned_30m, aligned_15m, aligned_5m])
 
-        if frames_aligned >= 3:   conviction = 4
-        elif frames_aligned == 2: conviction = 3
+        if frames_aligned >= 4:   conviction = 4
+        elif frames_aligned >= 3: conviction = 3
         else:                     conviction = 0
 
         return {
@@ -422,11 +412,12 @@ def get_swing_conviction(symbol: str) -> dict:
             "direction":  daily_bias,
             "daily_ok":   daily_aligned,
             "30m_ok":     aligned_30m,
+            "15m_ok":     aligned_15m,
             "5m_ok":      aligned_5m,
         }
     except Exception:
         return {"conviction": 0, "direction": "flat", "daily_ok": False,
-                "30m_ok": False, "5m_ok": False}
+                "30m_ok": False, "15m_ok": False, "5m_ok": False}
 
 
 def get_mtf_conviction(symbol: str) -> int:
