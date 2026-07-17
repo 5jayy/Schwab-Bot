@@ -1264,11 +1264,45 @@ def run_strategy():
                 except Exception:
                     pass
 
-                # MTF conviction sizing
-                position_size = get_mtf_position_size(symbol, ceiling)
-                if position_size == 0:
-                    print(f"  {symbol}: skip — MTF conviction too low")
+                # Two bucket sizing - day or swing
+                fvg_ok = stock.get("fvg_returning", False)
+                in_gap = False
+                try:
+                    from scanner import detect_fvg, get_price_history as _gph3
+                    _fvg_c = _entry_candles or _gph3(symbol)
+                    _fvg   = detect_fvg(_fvg_c)
+                    fvg_ok = _fvg.get("returning", False)
+                    in_gap = _fvg.get("in_gap", False)
+                except Exception:
+                    pass
+
+                if in_gap:
+                    print(f"  {symbol}: skip — price inside FVG zone")
                     continue
+
+                position_size = 0
+                bucket = "swing"
+
+                ledger_pdt    = load_ledger()
+                day_trades_wk = ledger_pdt.get("day_trades_this_week", 0)
+
+                if day_trades_wk < MAX_DAY_TRADES_PER_WEEK:
+                    day_stars = get_star_rating(stock)
+                    day_size  = get_day_position_size(symbol, capital, fvg_confirmed=fvg_ok, stars=day_stars)
+                    if day_size > 0:
+                        position_size = day_size
+                        bucket = "day"
+
+                if position_size == 0:
+                    swing_size, direction, swing_info = get_swing_position_size(symbol, capital, stock)
+                    if swing_size > 0 and direction == "up":
+                        position_size = swing_size
+                        bucket = "swing"
+
+                if position_size == 0:
+                    print(f"  {symbol}: skip — no conviction in either bucket")
+                    continue
+
                 position_size = green_day_scale(position_size, stats)
                 position_size = min(position_size, cash)
 
