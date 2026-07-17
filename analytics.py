@@ -169,13 +169,15 @@ def check_day_signal(candles: list, i: int) -> tuple:
     body  = abs(c["close"] - c["open"])
     strength = body / rng if rng > 0 else 0
 
-    # Simple conviction proxy
-    if closes[-1] > ma20 and closes[-1] > ma10 and strength > 0.5:
+    # Tighter conviction — require volume spike too
+    vols    = [c["volume"] for c in candles[:i+1]][-20:]
+    avg_vol = sum(vols[:-1]) / len(vols[:-1]) if len(vols) > 1 else 0
+    vol_spike = candles[i]["volume"] > avg_vol * 1.3 if avg_vol > 0 else False
+
+    if closes[-1] > ma20 and closes[-1] > ma10 and strength > 0.6 and vol_spike:
         return 4, strength * 10
-    elif closes[-1] > ma20 and strength > 0.4:
+    elif closes[-1] > ma20 and strength > 0.5 and vol_spike:
         return 3, strength * 8
-    elif closes[-1] > ma10:
-        return 2, strength * 6
     return 0, 0
 
 
@@ -217,10 +219,10 @@ def run_analytics(symbols: list = None, days: int = 10):
             taken_cnt += 1
             result = simulate_trade(
                 candles, i,
-                stop_pct   = STOP_PCT_DAY,
-                target_pct = 0.10,
-                tp1_pct    = STOP_PCT_DAY * 1.5,
-                tp2_pct    = STOP_PCT_DAY * 2.5,
+                stop_pct   = STOP_PCT_DAY * 0.6,   # tighter stop 4.2%
+                target_pct = STOP_PCT_DAY * 4.0,   # wider target
+                tp1_pct    = STOP_PCT_DAY * 2.0,   # 2R
+                tp2_pct    = STOP_PCT_DAY * 4.0,   # 4R
             )
             if not result:
                 continue
