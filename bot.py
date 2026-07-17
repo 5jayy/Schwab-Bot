@@ -41,6 +41,297 @@ from tax import record_taxable_event, send_tax_alert, sync_schwab_tax_history
 load_dotenv()
 
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
+
+# ── Telegram command polling ──────────────────────────────────────────────────
+
+_last_update_id = 0
+
+def poll_telegram_commands():
+    global _last_update_id
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat  = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": _last_update_id + 1, "timeout": 5},
+            timeout=10
+        )
+        if not resp.ok:
+            return
+        updates = resp.json().get("result", [])
+        for update in updates:
+            _last_update_id = update["update_id"]
+            msg  = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            uid  = str(msg.get("chat", {}).get("id", ""))
+            if uid != str(chat):
+                continue
+
+            if text == "/pause":
+                ledger = load_ledger()
+                ledger["bot_paused"] = True
+                save_ledger(ledger)
+                send_alert("[ CIRCUIT ] PAUSED\nTrading stopped\nPositions held + tracked\nSend /resume to restart")
+
+            elif text == "/resume":
+                ledger = load_ledger()
+                ledger["bot_paused"] = False
+                save_ledger(ledger)
+                send_alert("[ CIRCUIT ] RESUMED\nTrading active")
+
+            elif text == "/status":
+                ledger  = load_ledger()
+                capital = get_trading_capital()
+                paused  = ledger.get("bot_paused", False)
+                cash_b  = get_cash_bucket()
+                etf_b   = get_etf_bucket()
+                pdt     = ledger.get("day_trades_this_week", 0)
+                open_t  = list(ledger.get("open_trades", {}).keys())
+                state   = "PAUSED" if paused else "LIVE"
+                parts   = [
+                    "[ CIRCUIT ] STATUS",
+                    "STATE  " + state,
+                    "CAP    " + f"{capital:,.2f}",
+                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
+                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
+                    "ETF    " + f"{etf_b:,.2f}",
+                    "CASH   " + f"{cash_b:,.2f}",
+                    "PDT    " + str(pdt) + "/3",
+                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
+                ]
+                send_alert("\n".join(parts))
+
+            elif text == "/backtest":
+                send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
+                try:
+                    import threading
+                    def _run():
+                        from backtest import run_backtest
+                        run_backtest(days=14, bot_capital=get_trading_capital())
+                    threading.Thread(target=_run, daemon=True).start()
+                except Exception as ex:
+                    send_alert("Backtest error: " + str(ex))
+
+            elif text == "/tax":
+                try:
+                    from tax import get_tax_report, get_etf_tax_exit_plan
+                    report = get_tax_report()
+                    plan   = get_etf_tax_exit_plan(
+                        get_account_numbers()[0]["hashValue"],
+                        report["total_tax_owed"]
+                    )
+                    parts = [
+                        "[ CIRCUIT ] TAX " + str(report["year"]),
+                        "ST GAINS  " + f"{report['short_term_gains']:,.2f}",
+                        "ST LOSS   " + f"{report['short_term_losses']:,.2f}",
+                        "LT GAINS  " + f"{report['long_term_gains']:,.2f}",
+                        "OPTIONS   " + f"{report['options_income']:,.2f}",
+                        "DIVIDENDS " + f"{report['dividends']:,.2f}",
+                        "TAX OWED  " + f"{report['total_tax_owed']:,.2f}",
+                        "MD RATES  ST " + report["md_rate_short"] + " LT " + report["md_rate_long"],
+                    ]
+                    if plan:
+                        parts.append("EXIT PLAN:")
+                        for p in plan:
+                            parts.append("  SELL " + str(p["shares_to_sell"]) + " " + p["symbol"] + " = " + f"{p['proceeds']:,.2f}")
+                    send_alert("\n".join(parts))
+                except Exception as ex:
+                    send_alert("Tax error: " + str(ex))
+
+    except Exception as ex:
+        print(f"Command poll error: {ex}")
+
+_last_update_id = 0
+
+def poll_telegram_commands():
+    """
+    Poll Telegram for slash commands every 60 seconds.
+    /pause  — pause trading, keep positions, keep tracking
+    /resume — resume trading
+    /status — bot status report
+    /backtest — run backtest now
+    """
+    global _last_update_id
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat  = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": _last_update_id + 1, "timeout": 5},
+            timeout=10
+        )
+        if not resp.ok:
+            return
+        updates = resp.json().get("result", [])
+
+        for update in updates:
+            _last_update_id = update["update_id"]
+            msg  = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            uid  = str(msg.get("chat", {}).get("id", ""))
+
+            if uid != str(chat):
+                continue  # ignore other chats
+
+            if text == "/pause":
+                ledger = load_ledger()
+                ledger["bot_paused"] = True
+                save_ledger(ledger)
+                send_alert("[ CIRCUIT ] PAUSED\n━━━━━━━━━━━━━━━━━━\nTrading stopped\nPositions held + tracked\nSend /resume to restart")
+
+            elif text == "/resume":
+                ledger = load_ledger()
+                ledger["bot_paused"] = False
+                save_ledger(ledger)
+                send_alert("[ CIRCUIT ] RESUMED\n━━━━━━━━━━━━━━━━━━\nTrading active")
+
+            elif text == "/status":
+                ledger  = load_ledger()
+                capital = get_trading_capital()
+                paused  = ledger.get("bot_paused", False)
+                cash_b  = get_cash_bucket()
+                etf_b   = get_etf_bucket()
+                pdt     = ledger.get("day_trades_this_week", 0)
+                open_t  = list(ledger.get("open_trades", {}).keys())
+                status  = "PAUSED" if paused else "LIVE"
+                parts = [
+                    "[ CIRCUIT ] STATUS",
+                    "STATE  " + status,
+                    "CAP    " + f"{capital:,.2f}",
+                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
+                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
+                    "ETF    " + f"{etf_b:,.2f}",
+                    "CASH   " + f"{cash_b:,.2f}",
+                    "PDT    " + str(pdt) + "/3",
+                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
+                ]
+                send_alert("\n".join(parts))
+
+            elif text == "/backtest":
+                send_alert("[ CIRCUIT ] BACKTEST\n━━━━━━━━━━━━━━━━━━\nRunning 14d backtest...\nResults in ~5 min")
+                try:
+                    import threading
+                    def _run():
+                        from backtest import run_backtest
+                        run_backtest(days=14, bot_capital=get_trading_capital())
+                    threading.Thread(target=_run, daemon=True).start()
+                except Exception as ex:
+                    send_alert("Backtest error: " + str(ex))
+
+    except Exception as ex:
+        print(f"Command poll error: {ex}")
+
+# ── Telegram command state ────────────────────────────────────────────────────
+_BOT_PAUSED = False  # global pause flag
+
+
+def check_telegram_commands():
+    """
+    Poll Telegram for slash commands every 60 seconds.
+    /pause  - stop new trades, keep tracking positions
+    /resume - restart trading
+    /status - show bot status
+    /backtest - run 14-day backtest
+    """
+    global _BOT_PAUSED
+    try:
+        url    = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_TOKEN')}/getUpdates"
+        ledger = load_ledger()
+        offset = ledger.get("tg_offset", 0)
+        resp   = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10)
+        if not resp.ok:
+            return
+        updates = resp.json().get("result", [])
+        for update in updates:
+            update_id = update["update_id"]
+            ledger["tg_offset"] = update_id + 1
+            msg = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+
+            if text == "/pause":
+                _BOT_PAUSED = True
+                ledger["bot_paused"] = True
+                save_ledger(ledger)
+                send_alert("[ CIRCUIT ] PAUSED\nTrading halted\nPositions still tracked\n/resume to restart")
+
+            elif text == "/resume":
+                _BOT_PAUSED = False
+                ledger["bot_paused"] = False
+                save_ledger(ledger)
+                send_alert("[ CIRCUIT ] RESUMED\nTrading active")
+
+            elif text == "/status":
+                ledger  = load_ledger()
+                capital = get_trading_capital()
+                paused  = ledger.get("bot_paused", False)
+                cash_b  = get_cash_bucket()
+                etf_b   = get_etf_bucket()
+                pdt     = ledger.get("day_trades_this_week", 0)
+                open_t  = list(ledger.get("open_trades", {}).keys())
+                state   = "PAUSED" if paused else "LIVE"
+                parts   = [
+                    "[ CIRCUIT ] STATUS",
+                    "STATE  " + state,
+                    "CAP    " + f"{capital:,.2f}",
+                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
+                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
+                    "ETF    " + f"{etf_b:,.2f}",
+                    "CASH   " + f"{cash_b:,.2f}",
+                    "PDT    " + str(pdt) + "/3",
+                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
+                ]
+                send_alert("\n".join(parts))
+
+            elif text == "/backtest":
+                send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
+                try:
+                    import threading
+                    def _run():
+                        from backtest import run_backtest
+                        run_backtest(days=14, bot_capital=get_trading_capital())
+                    threading.Thread(target=_run, daemon=True).start()
+                except Exception as ex:
+                    send_alert("Backtest error: " + str(ex))
+
+            elif text == "/tax":
+                try:
+                    from tax import get_tax_report, get_etf_tax_exit_plan
+                    report = get_tax_report()
+                    plan   = get_etf_tax_exit_plan(
+                        get_account_numbers()[0]["hashValue"],
+                        report["total_tax_owed"]
+                    )
+                    parts = [
+                        "[ CIRCUIT ] TAX " + str(report["year"]),
+                        "ST GAINS  " + f"{report['short_term_gains']:,.2f}",
+                        "ST LOSS   " + f"{report['short_term_losses']:,.2f}",
+                        "LT GAINS  " + f"{report['long_term_gains']:,.2f}",
+                        "OPTIONS   " + f"{report['options_income']:,.2f}",
+                        "DIVIDENDS " + f"{report['dividends']:,.2f}",
+                        "TAX OWED  " + f"{report['total_tax_owed']:,.2f}",
+                        "MD RATES  ST " + report["md_rate_short"] + " LT " + report["md_rate_long"],
+                    ]
+                    if plan:
+                        parts.append("EXIT PLAN:")
+                        for p in plan:
+                            parts.append("  SELL " + str(p["shares_to_sell"]) + " " + p["symbol"] + " = " + f"{p['proceeds']:,.2f}")
+                    send_alert("\n".join(parts))
+                except Exception as ex:
+                    send_alert("Tax error: " + str(ex))
+                try:
+                    from backtest import run_backtest
+                    run_backtest(days=14, bot_capital=get_trading_capital())
+                except Exception as ex:
+                    send_alert("Backtest error: " + str(ex))
+
+        save_ledger(ledger)
+    except Exception as ex:
+        print(f"Command check error: {ex}")
 MARKET_URL        = "https://api.schwabapi.com/marketdata/v1"
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
@@ -379,6 +670,11 @@ def can_trade(capital: float, stats: dict, _unused: int = 0) -> tuple:
     MTF conviction handles sizing. This handles daily limits.
     Returns (bool, reason).
     """
+    global _BOT_PAUSED
+    # Check pause state from ledger (survives restarts)
+    if _BOT_PAUSED or load_ledger().get("bot_paused", False):
+        return False, "bot_paused"
+
     # Warmup — skip 9:30-9:45 ET
     et  = pytz.timezone("America/New_York")
     now = datetime.now(et)
@@ -659,7 +955,7 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
 
         if profit > 0:
             msg  = f"[ OUT ] {symbol} +{profit:,.2f}\n"
-            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n\n"
             msg += f"PRICE  {price:.2f}\n"
             msg += f"QTY    {quantity}\n"
             msg += f"ETF    +{split['etf_cut']:,.2f}\n"
@@ -668,7 +964,7 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
             send_alert(msg)
         else:
             msg  = f"[ CUT ] {symbol} {profit:,.2f}\n"
-            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n\n"
             msg += f"PRICE  {price:.2f}\n"
             msg += f"QTY    {quantity}\n"
             msg += f"EXIT   {reason.upper()}"
@@ -727,14 +1023,14 @@ def send_session_summary():
     daily_peak   = stats["daily_peak"]
 
     msg  = "[ CIRCUIT ] CLOSE 16:05\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"TRADES {trades_today}\n"
     msg += f"P&L    {daily_profit:+,.2f}\n"
     msg += f"PEAK   {daily_peak:,.2f}\n"
     msg += f"WIN    {win_rate:.0f}%\n"
     msg += f"CONS   {consistency:.0f}%\n"
     msg += f"CAP    {stock_used:.0f}% used\n"
-    msg += f"━━━━━━━━━━━━━━━━━━\n"
+    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"4/4 x{c4}  3/4 x{c3}  2/4 x{c2}"
     send_alert(msg)
 
@@ -748,7 +1044,7 @@ def send_eod_summary():
     ytd_tax = ledger.get("ytd_tax_owed", 0.0)
 
     msg  = "[ CIRCUIT ] EOD 17:00\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"CAP    {capital:,.2f}\n"
     msg += f"DAY    {capital*DAY_PCT:,.2f}\n"
     msg += f"SWING  {capital*SWING_PCT:,.2f}\n"
@@ -897,7 +1193,7 @@ def run_strategy():
                                     ledger_tp["open_trades"][sym]["quantity"] -= tp1_qty
                                 save_ledger(ledger_tp)
                                 msg  = f"[ TP1 ] {sym} 1/3\n"
-                                msg += "━━━━━━━━━━━━━━━━━━\n"
+                                msg += "━━━━━━━━━━━━━━━━━━\n\n"
                                 msg += f"PRICE  {price:.2f}\n"
                                 msg += f"+{profit_pct*100:.1f}%"
                                 send_alert(msg)
@@ -915,7 +1211,7 @@ def run_strategy():
                                     ledger_tp["open_trades"][sym]["quantity"] -= tp2_qty
                                 save_ledger(ledger_tp)
                                 msg  = f"[ TP2 ] {sym} 2/3\n"
-                                msg += "━━━━━━━━━━━━━━━━━━\n"
+                                msg += "━━━━━━━━━━━━━━━━━━\n\n"
                                 msg += f"PRICE  {price:.2f}\n"
                                 msg += f"+{profit_pct*100:.1f}%"
                                 send_alert(msg)
@@ -1307,14 +1603,14 @@ def main():
         pulse    = get_market_pulse() if is_market_open() else ""
         hold_str = f"\nHOLD   {on_hold:,.0f}" if on_hold > 0 else ""
         msg  = "[ CIRCUIT ] LIVE\n"
-        msg += "━━━━━━━━━━━━━━━━━━\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n\n"
         msg += f"CAP    {capital:,.2f}\n"
         msg += f"DAY    {capital*DAY_PCT:,.2f}\n"
         msg += f"SWING  {capital*SWING_PCT:,.2f}\n"
         msg += f"CASH   {cash_ready:,.2f}"
         msg += hold_str
         if pulse:
-            msg += f"\n━━━━━━━━━━━━━━━━━━\n{pulse}"
+            msg += f"\n━━━━━━━━━━━━━━━━━━\n{pulse}\n"
         send_alert(msg)
 
     except Exception as ex:
@@ -1325,6 +1621,8 @@ def main():
 
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
     schedule.every(5).minutes.do(check_balance_24_7)
+    schedule.every(1).minutes.do(poll_telegram_commands)
+    schedule.every(1).minutes.do(check_telegram_commands)
     # Pre-market brief at 9:00 AM ET
     schedule.every().day.at("07:30").do(send_premarket_summary)
 
