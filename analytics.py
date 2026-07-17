@@ -66,14 +66,17 @@ def get_account_hash() -> str:
 def parse_trades_from_schwab(txns: list) -> list:
     """
     Parse buy/sell pairs from Schwab transactions.
-    Match buys to sells by symbol to calculate P&L.
+    Schwab netAmount: negative = money out (buy), positive = money in (sell).
+    Uses netAmount for accurate P&L not price calculation.
     """
     buys  = {}
     sells = []
 
-    for txn in txns:
+    # Sort by date so buys come before sells
+    txns_sorted = sorted(txns, key=lambda x: x.get("tradeDate", x.get("activityDate", "")))
+
+    for txn in txns_sorted:
         items = txn.get("transferItems", [])
-        desc  = txn.get("description", "").upper()
         date  = txn.get("tradeDate", txn.get("activityDate", ""))[:10]
         net   = txn.get("netAmount", 0)
 
@@ -85,48 +88,56 @@ def parse_trades_from_schwab(txns: list) -> list:
             inst = item.get("instrument", {})
             if inst.get("assetType") == "EQUITY":
                 symbol = inst.get("symbol", "")
-                qty    = abs(item.get("amount", 0))
+                qty    = abs(item.get("amount", item.get("quantity", 0)))
                 price  = abs(item.get("price", 0))
                 break
 
         if not symbol or not qty:
             continue
 
-        if "BOUGHT" in desc or net < 0:
+        # net < 0 = money went out = BUY
+        # net > 0 = money came in = SELL
+        if net < 0:
+            cost_per_share = abs(net) / qty if qty > 0 else price
             buys[symbol] = {
-                "symbol": symbol,
-                "qty":    qty,
-                "price":  price,
-                "date":   date,
-                "cost":   abs(net)
+                "symbol":    symbol,
+                "qty":       qty,
+                "price":     cost_per_share,
+                "date":      date,
+                "total_cost": abs(net)
             }
-        elif "SOLD" in desc or net > 0:
+        elif net > 0:
             buy = buys.get(symbol)
-            if buy:
-                hold_days  = 0
-                try:
-                    b = datetime.strptime(buy["date"], "%Y-%m-%d")
-                    s = datetime.strptime(date, "%Y-%m-%d")
-                    hold_days = (s - b).days
-                except Exception:
-                    pass
+            if not buy:
+                continue
 
-                profit    = net - buy["cost"]
-                move_pct  = (price - buy["price"]) / buy["price"] * 100 if buy["price"] > 0 else 0
+            # Accurate P&L from actual net amounts
+            profit       = net - buy["total_cost"]
+            sell_per_sh  = net / qty if qty > 0 else price
+            buy_per_sh   = buy["price"]
+            move_pct     = (sell_per_sh - buy_per_sh) / buy_per_sh * 100 if buy_per_sh > 0 else 0
 
-                sells.append({
-                    "symbol":    symbol,
-                    "buy_price": buy["price"],
-                    "sell_price": price,
-                    "qty":       qty,
-                    "profit":    round(profit, 2),
-                    "move_pct":  round(move_pct, 2),
-                    "hold_days": hold_days,
-                    "buy_date":  buy["date"],
-                    "sell_date": date,
-                    "cost":      buy["cost"],
-                })
-                del buys[symbol]
+            hold_days = 0
+            try:
+                b = datetime.strptime(buy["date"], "%Y-%m-%d")
+                s = datetime.strptime(date, "%Y-%m-%d")
+                hold_days = (s - b).days
+            except Exception:
+                pass
+
+            sells.append({
+                "symbol":     symbol,
+                "buy_price":  round(buy_per_sh, 4),
+                "sell_price": round(sell_per_sh, 4),
+                "qty":        qty,
+                "profit":     round(profit, 2),
+                "move_pct":   round(move_pct, 2),
+                "hold_days":  hold_days,
+                "buy_date":   buy["date"],
+                "sell_date":  date,
+                "cost":       buy["total_cost"],
+            })
+            del buys[symbol]
 
     return sells
 
