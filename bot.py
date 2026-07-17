@@ -1328,39 +1328,40 @@ def main():
     # Pre-market brief at 9:00 AM ET
     schedule.every().day.at("07:30").do(send_premarket_summary)
 
-    # Session summary at 4:05 PM ET (after market close)
-    schedule.every().day.at("16:05").do(send_session_summary)
+    # All times in UTC (Fly.io server is UTC)
+    # 4:05 PM ET = 20:05 UTC
+    schedule.every().day.at("20:05").do(send_session_summary)
 
-    # End of day full summary at 5:00 PM ET
-    schedule.every().day.at("17:00").do(send_eod_summary)
+    # 5:00 PM ET = 21:00 UTC
+    schedule.every().day.at("21:00").do(send_eod_summary)
 
-    # Backtest after session at 4:30 PM ET on weekdays
+    # 4:30 PM ET = 20:30 UTC — backtest
     def run_post_session_backtest():
         et  = pytz.timezone("America/New_York")
         now = datetime.now(et)
-        if now.weekday() < 5:  # Mon-Fri only
+        if now.weekday() < 5:
             try:
                 from backtest import run_backtest
                 run_backtest(days=14, bot_capital=get_trading_capital())
             except Exception as ex:
                 print(f"Backtest error: {ex}")
 
-    schedule.every().day.at("16:30").do(run_post_session_backtest)
+    schedule.every().day.at("20:30").do(run_post_session_backtest)
 
-    # April tax alert daily at 9:05 AM
+    # April tax alert — 9:05 AM ET = 13:05 UTC
     def maybe_send_tax_alert():
         from datetime import datetime as _dt
         import pytz as _pytz
         now = _dt.now(_pytz.timezone("America/New_York"))
         if now.month == 4 and 1 <= now.day <= 15:
             try:
-                accts     = get_account_numbers()
-                enc       = accts[0]["hashValue"]
+                accts = get_account_numbers()
+                enc   = accts[0]["hashValue"]
                 send_tax_alert(enc)
             except Exception as ex:
                 print(f"Tax alert error: {ex}")
 
-    schedule.every().day.at("09:05").do(maybe_send_tax_alert)
+    schedule.every().day.at("13:05").do(maybe_send_tax_alert)
 
     while True:
         schedule.run_pending()
