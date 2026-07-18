@@ -519,6 +519,15 @@ def send_roadmap_alert(encrypted: str):
         msg += "ALL CALLS UNLOCKED"
 
     send_alert(msg)
+
+    # Check upgrades and alert if any
+    try:
+        upgrades = check_etf_upgrades(encrypted)
+        if upgrades:
+            send_upgrade_alert(upgrades)
+    except Exception:
+        pass
+
     return roadmap
 
 
@@ -537,6 +546,123 @@ def get_etf_sweep_priority() -> list:
     # Return priority order
     order = sorted(ETF_ROADMAP.items(), key=lambda x: x[1]["priority"])
     return [sym for sym, _ in order]
+
+
+def check_etf_upgrades(encrypted: str) -> list:
+    """
+    Check if any ETFs are worth upgrading after 1+ year hold.
+    Only upgrades when:
+    1. Held 1+ year (long term tax rate)
+    2. New ETF premium > old ETF premium x 1.5
+    3. After-tax proceeds cover 50+ shares of new ETF
+    4. New ETF closer to 100 shares than current
+    Returns list of recommended upgrades.
+    """
+    ledger    = load_ledger()
+    positions = get_etf_positions(encrypted)
+    tax_events = ledger.get("tax_events", [])
+    upgrades  = []
+
+    # Target ETFs ranked by premium potential
+    upgrade_targets = [
+        {"symbol": "QQQ",  "price": 565, "monthly_premium": 500, "shares_needed": 100},
+        {"symbol": "VOO",  "price": 640, "monthly_premium": 450, "shares_needed": 100},
+        {"symbol": "JEPI", "price": 60,  "monthly_premium": 95,  "shares_needed": 100},
+        {"symbol": "IWM",  "price": 215, "monthly_premium": 180, "shares_needed": 100},
+        {"symbol": "QYLD", "price": 16,  "monthly_premium": 20,  "shares_needed": 100},
+        {"symbol": "RYLD", "price": 18,  "monthly_premium": 22,  "shares_needed": 100},
+    ]
+
+    for sym, pos in positions.items():
+        shares    = pos.get("shares", 0)
+        avg_price = pos.get("avg_price", 0)
+        mkt_value = pos.get("mkt_value", 0)
+
+        if shares < 10:
+            continue
+
+        # Check hold time
+        hold_days = 0
+        for ev in tax_events:
+            if ev.get("symbol") == sym:
+                try:
+                    buy_date  = datetime.strptime(ev["timestamp"][:10], "%Y-%m-%d")
+                    hold_days = (datetime.now() - buy_date).days
+                except Exception:
+                    pass
+
+        if hold_days < 365:
+            continue  # not long term yet
+
+        # Current ETF premium potential
+        cfg          = ETF_ROADMAP.get(sym, {})
+        current_prem = cfg.get("est_call_premium", 0.10) * 100
+
+        # Calculate after-tax proceeds
+        cost_basis   = shares * avg_price
+        gain         = mkt_value - cost_basis
+        tax_owed     = max(gain, 0) * LT_RATE
+        net_proceeds = mkt_value - tax_owed
+
+        # Check each upgrade target
+        for target in upgrade_targets:
+            tsym  = target["symbol"]
+            tprem = target["monthly_premium"]
+
+            # Skip if same ETF or already own 100 shares
+            if tsym == sym:
+                continue
+            target_pos = positions.get(tsym, {})
+            if target_pos.get("shares", 0) >= 100:
+                continue
+
+            # Worth it checks
+            premium_improvement = tprem / max(current_prem, 1)
+            if premium_improvement < 1.5:
+                continue  # not 50% better
+
+            # Can afford — need proceeds to cover 50+ shares
+            shares_can_buy = int(net_proceeds // target["price"])
+            if shares_can_buy < 50:
+                continue  # can't afford meaningful position
+
+            # ROI check — new premium per dollar > old premium per dollar
+            new_roi = tprem / (shares_can_buy * target["price"])
+            old_roi = current_prem / max(mkt_value, 1)
+            if new_roi <= old_roi:
+                continue  # no improvement
+
+            upgrades.append({
+                "sell_symbol":    sym,
+                "sell_shares":    int(shares),
+                "sell_proceeds":  round(net_proceeds, 2),
+                "tax_owed":       round(tax_owed, 2),
+                "hold_days":      hold_days,
+                "buy_symbol":     tsym,
+                "shares_can_buy": shares_can_buy,
+                "cost":           round(shares_can_buy * target["price"], 2),
+                "old_premium":    round(current_prem, 2),
+                "new_premium":    round(tprem * (shares_can_buy / 100), 2),
+                "improvement":    round((premium_improvement - 1) * 100, 1),
+                "worthy":         True,
+            })
+            break  # only recommend one upgrade per ETF
+
+    return upgrades
+
+
+def send_upgrade_alert(upgrades: list):
+    """Send ETF upgrade recommendations to Telegram."""
+    if not upgrades:
+        return
+    parts = ["[ CIRCUIT ] ETF UPGRADES"]
+    for u in upgrades:
+        parts.append("SELL  " + u["sell_symbol"] + " x" + str(u["sell_shares"]))
+        parts.append("TAX   $" + f"{u['tax_owed']:,.2f}" + " (" + str(u["hold_days"]) + "d LT)")
+        parts.append("NET   $" + f"{u['sell_proceeds']:,.2f}")
+        parts.append("BUY   " + u["buy_symbol"] + " x" + str(u["shares_can_buy"]))
+        parts.append("PREM  $" + f"{u['old_premium']:.0f}" + " to $" + f"{u['new_premium']:.0f}" + "/mo (+" + f"{u['improvement']:.0f}" + "%)")
+    send_alert("\n".join(parts))
 
 
 if __name__ == "__main__":
