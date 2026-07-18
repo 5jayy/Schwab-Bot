@@ -108,6 +108,255 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
     return best
 
 
+# ── ETF options scanning ──────────────────────────────────────────────────────
+
+ETF_OPTIONS_SYMBOLS = ["SCHD", "SOXS", "JEPI", "JEPQ", "ARKK", "XLF", "XLE", "GDX"]
+
+def find_best_etf_covered_call(symbol: str, shares_owned: int) -> dict | None:
+    """Find best covered call on ETF positions we own."""
+    if shares_owned < 100:
+        return None
+    return find_best_covered_call(symbol, shares_owned)
+
+
+def find_best_etf_cash_secured_put(symbol: str, current_price: float,
+                                    cash_available: float) -> dict | None:
+    """
+    Find best cash secured put on liquid ETFs.
+    Same structure as stock puts but ETF-specific symbols.
+    Only on ETFs we want to own more of at a discount.
+    """
+    if symbol not in ETF_OPTIONS_SYMBOLS:
+        return None
+    return find_best_cash_secured_put(symbol, current_price, cash_available)
+
+
+def scan_etf_options(cash_available: float, positions: list) -> list:
+    """
+    Scan all ETF options opportunities.
+    Returns list of best covered calls and puts on ETFs.
+    """
+    opportunities = []
+
+    # Check covered calls on ETF positions we own
+    for pos in positions:
+        sym = pos["instrument"]["symbol"]
+        if sym in ETF_OPTIONS_SYMBOLS:
+            qty = pos.get("longQuantity", 0)
+            if qty >= 100:
+                call = find_best_etf_covered_call(sym, qty)
+                if call:
+                    call["etf_option"] = True
+                    call["strategy"]   = "covered_call"
+                    opportunities.append(call)
+
+    # Check cash secured puts on ETF universe
+    for sym in ETF_OPTIONS_SYMBOLS:
+        try:
+            quote = requests.get(
+                f"https://api.schwabapi.com/marketdata/v1/quotes/{sym}",
+                headers=headers(), timeout=10
+            )
+            if not quote.ok:
+                continue
+            price = quote.json().get(sym, {}).get("quote", {}).get("lastPrice", 0)
+            if price <= 0:
+                continue
+
+            cash_needed = price * 100 * 0.95  # 5% OTM put
+            if cash_needed > cash_available:
+                continue
+
+            put = find_best_etf_cash_secured_put(sym, price, cash_available)
+            if put:
+                put["etf_option"] = True
+                put["strategy"]   = "cash_secured_put"
+                opportunities.append(put)
+        except Exception:
+            continue
+
+    return opportunities
+
+
+# ── ETF options scanning ──────────────────────────────────────────────────────
+
+ETF_OPTIONS_UNIVERSE = {
+    "SCHD":  {"min_shares": 100, "max_strike_pct": 0.97, "min_premium": 0.10},
+    "JEPI":  {"min_shares": 100, "max_strike_pct": 0.97, "min_premium": 0.10},
+    "SOXS":  {"min_shares": 100, "max_strike_pct": 0.95, "min_premium": 0.08},
+    "ARKK":  {"min_shares": 100, "max_strike_pct": 0.95, "min_premium": 0.10},
+    "TQQQ":  {"min_shares": 100, "max_strike_pct": 0.95, "min_premium": 0.15},
+    "VOO":   {"min_shares": 100, "max_strike_pct": 0.97, "min_premium": 0.20},
+    "QQQ":   {"min_shares": 100, "max_strike_pct": 0.97, "min_premium": 0.25},
+}
+
+
+def find_best_etf_covered_call(symbol: str, shares_owned: int) -> dict | None:
+    """Find best covered call on an ETF position."""
+    if symbol not in ETF_OPTIONS_UNIVERSE:
+        return None
+    cfg = ETF_OPTIONS_UNIVERSE[symbol]
+    if shares_owned < cfg["min_shares"]:
+        return None
+
+    chain = get_option_chain(symbol, option_type="CALL")
+    if not chain:
+        return None
+
+    underlying = chain.get("underlyingPrice", 0)
+    if underlying <= 0:
+        return None
+
+    call_map  = chain.get("callExpDateMap", {})
+    contracts = shares_owned // 100
+    best      = None
+
+    for expiry, strikes in call_map.items():
+        try:
+            dte = int(expiry.split(":")[1])
+        except Exception:
+            continue
+        if not (14 <= dte <= 45):
+            continue
+
+        for strike_str, options in strikes.items():
+            strike = float(strike_str)
+            if not (underlying * 1.01 <= strike <= underlying * 1.06):
+                continue
+
+            opt     = options[0] if options else None
+            if not opt:
+                continue
+
+            bid     = opt.get("bid", 0)
+            ask     = opt.get("ask", 0)
+            premium = (bid + ask) / 2
+
+            if premium < cfg["min_premium"] or bid <= 0:
+                continue
+
+            total   = premium * 100 * contracts
+            score   = (premium / underlying) * 100
+
+            if best is None or score > best["score"]:
+                best = {
+                    "type":           "etf_covered_call",
+                    "symbol":         symbol,
+                    "option_symbol":  opt.get("symbol", ""),
+                    "strike":         strike,
+                    "expiry":         expiry.split(":")[0],
+                    "dte":            dte,
+                    "premium":        premium,
+                    "total_premium":  total,
+                    "contracts":      contracts,
+                    "underlying":     underlying,
+                    "score":          score,
+                }
+    return best
+
+
+def find_best_etf_put(symbol: str, current_price: float, cash_available: float) -> dict | None:
+    """Find best cash secured put on an ETF — sell at strike you want to own more."""
+    if symbol not in ETF_OPTIONS_UNIVERSE:
+        return None
+    cfg = ETF_OPTIONS_UNIVERSE[symbol]
+
+    chain = get_option_chain(symbol, option_type="PUT")
+    if not chain:
+        return None
+
+    underlying = chain.get("underlyingPrice", current_price)
+    put_map    = chain.get("putExpDateMap", {})
+    best       = None
+
+    for expiry, strikes in put_map.items():
+        try:
+            dte = int(expiry.split(":")[1])
+        except Exception:
+            continue
+        if not (14 <= dte <= 45):
+            continue
+
+        for strike_str, options in strikes.items():
+            strike = float(strike_str)
+            if not (underlying * cfg["max_strike_pct"] <= strike <= underlying * 0.99):
+                continue
+
+            cash_needed = strike * 100
+            if cash_needed > cash_available:
+                continue
+
+            opt     = options[0] if options else None
+            if not opt:
+                continue
+
+            bid     = opt.get("bid", 0)
+            ask     = opt.get("ask", 0)
+            premium = (bid + ask) / 2
+
+            if premium < cfg["min_premium"] or bid <= 0:
+                continue
+
+            score = (premium / underlying) * 100
+
+            if best is None or score > best["score"]:
+                best = {
+                    "type":          "etf_put",
+                    "symbol":        symbol,
+                    "option_symbol": opt.get("symbol", ""),
+                    "strike":        strike,
+                    "expiry":        expiry.split(":")[0],
+                    "dte":           dte,
+                    "premium":       premium,
+                    "total_premium": premium * 100,
+                    "cash_needed":   cash_needed,
+                    "underlying":    underlying,
+                    "score":         score,
+                }
+    return best
+
+
+def scan_etf_options(positions: list, cash_available: float) -> list:
+    """
+    Scan all ETF positions for covered call opportunities.
+    Also scan ETF universe for put selling opportunities.
+    Returns list of best opportunities sorted by score.
+    """
+    opportunities = []
+
+    # Covered calls on existing ETF positions
+    etf_symbols = {p["instrument"]["symbol"] for p in positions
+                   if p["instrument"]["symbol"] in ETF_OPTIONS_UNIVERSE}
+
+    for sym in etf_symbols:
+        for p in positions:
+            if p["instrument"]["symbol"] == sym:
+                shares = int(p.get("longQuantity", 0))
+                result = find_best_etf_covered_call(sym, shares)
+                if result:
+                    opportunities.append(result)
+                break
+
+    # Cash secured puts on ETF universe
+    for sym, cfg in ETF_OPTIONS_UNIVERSE.items():
+        if cash_available >= cfg["min_shares"] * 20:  # rough min
+            try:
+                resp = requests.get(
+                    f"{BASE_URL}/quotes/{sym}",
+                    headers=headers(), timeout=10
+                )
+                if resp.ok:
+                    price = resp.json().get(sym, {}).get("quote", {}).get("lastPrice", 0)
+                    if price > 0:
+                        result = find_best_etf_put(sym, price, cash_available)
+                        if result:
+                            opportunities.append(result)
+            except Exception:
+                pass
+
+    return sorted(opportunities, key=lambda x: x["score"], reverse=True)
+
+
 # ── Cash secured puts ─────────────────────────────────────────────────────────
 
 def find_best_cash_secured_put(symbol: str, current_price: float, cash_available: float) -> dict | None:

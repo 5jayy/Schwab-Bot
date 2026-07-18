@@ -15,8 +15,7 @@ from dotenv import load_dotenv
 from auth import get_valid_token
 from scanner import (
     scan_best_stocks, scan_best_etfs, get_market_pulse,
-    get_tier, get_etf_level, ETF_DIVIDEND_RULES, get_etf_category,
-    get_day_conviction, get_swing_conviction
+    get_tier, get_etf_level, ETF_DIVIDEND_RULES, get_etf_category
 )
 from options import (
     find_best_covered_call, place_covered_call, check_covered_call_already_open,
@@ -33,324 +32,25 @@ from ledger import (
     deduct_etf_bucket,
     record_dividend, get_dividend_stats, mark_dividend_seen,
     update_high_price, get_trailing_stop_info, get_dynamic_stop,
-    get_pressure_trail,
     BOT_STOCKS, ETF_MIN_SWEEP
 )
-from tax import record_taxable_event, send_tax_alert, sync_schwab_tax_history
 
 load_dotenv()
 
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
-
-# ── Telegram command polling ──────────────────────────────────────────────────
-
-_last_update_id = 0
-
-def poll_telegram_commands():
-    global _last_update_id
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat  = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        return
-    try:
-        resp = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            params={"offset": _last_update_id + 1, "timeout": 5},
-            timeout=10
-        )
-        if not resp.ok:
-            return
-        updates = resp.json().get("result", [])
-        for update in updates:
-            _last_update_id = update["update_id"]
-            msg  = update.get("message", {})
-            text = msg.get("text", "").strip().lower()
-            uid  = str(msg.get("chat", {}).get("id", ""))
-            if uid != str(chat):
-                continue
-
-            if text == "/pause":
-                ledger = load_ledger()
-                ledger["bot_paused"] = True
-                save_ledger(ledger)
-                send_alert("[ CIRCUIT ] PAUSED\nTrading stopped\nPositions held + tracked\nSend /resume to restart")
-
-            elif text == "/resume":
-                ledger = load_ledger()
-                ledger["bot_paused"] = False
-                save_ledger(ledger)
-                send_alert("[ CIRCUIT ] RESUMED\nTrading active")
-
-            elif text == "/status":
-                ledger  = load_ledger()
-                capital = get_trading_capital()
-                paused  = ledger.get("bot_paused", False)
-                cash_b  = get_cash_bucket()
-                etf_b   = get_etf_bucket()
-                pdt     = ledger.get("day_trades_this_week", 0)
-                open_t  = list(ledger.get("open_trades", {}).keys())
-                state   = "PAUSED" if paused else "LIVE"
-                parts   = [
-                    "[ CIRCUIT ] STATUS",
-                    "STATE  " + state,
-                    "CAP    " + f"{capital:,.2f}",
-                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
-                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
-                    "ETF    " + f"{etf_b:,.2f}",
-                    "CASH   " + f"{cash_b:,.2f}",
-                    "PDT    " + str(pdt) + "/3",
-                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
-                ]
-                send_alert("\n".join(parts))
-
-            elif text == "/backtest":
-                send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
-                try:
-                    import threading
-                    def _run():
-                        from backtest import run_backtest
-                        run_backtest(days=14, bot_capital=get_trading_capital())
-                    threading.Thread(target=_run, daemon=True).start()
-                except Exception as ex:
-                    send_alert("Backtest error: " + str(ex))
-
-            elif text == "/tax":
-                try:
-                    from tax import get_tax_report, get_etf_tax_exit_plan
-                    report = get_tax_report()
-                    plan   = get_etf_tax_exit_plan(
-                        get_account_numbers()[0]["hashValue"],
-                        report["total_tax_owed"]
-                    )
-                    parts = [
-                        "[ CIRCUIT ] TAX " + str(report["year"]),
-                        "ST GAINS  " + f"{report['short_term_gains']:,.2f}",
-                        "ST LOSS   " + f"{report['short_term_losses']:,.2f}",
-                        "LT GAINS  " + f"{report['long_term_gains']:,.2f}",
-                        "OPTIONS   " + f"{report['options_income']:,.2f}",
-                        "DIVIDENDS " + f"{report['dividends']:,.2f}",
-                        "TAX OWED  " + f"{report['total_tax_owed']:,.2f}",
-                        "MD RATES  ST " + report["md_rate_short"] + " LT " + report["md_rate_long"],
-                    ]
-                    if plan:
-                        parts.append("EXIT PLAN:")
-                        for p in plan:
-                            parts.append("  SELL " + str(p["shares_to_sell"]) + " " + p["symbol"] + " = " + f"{p['proceeds']:,.2f}")
-                    send_alert("\n".join(parts))
-                except Exception as ex:
-                    send_alert("Tax error: " + str(ex))
-
-    except Exception as ex:
-        print(f"Command poll error: {ex}")
-
-_last_update_id = 0
-
-def poll_telegram_commands():
-    """
-    Poll Telegram for slash commands every 60 seconds.
-    /pause  — pause trading, keep positions, keep tracking
-    /resume — resume trading
-    /status — bot status report
-    /backtest — run backtest now
-    """
-    global _last_update_id
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat  = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        return
-
-    try:
-        resp = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            params={"offset": _last_update_id + 1, "timeout": 5},
-            timeout=10
-        )
-        if not resp.ok:
-            return
-        updates = resp.json().get("result", [])
-
-        for update in updates:
-            _last_update_id = update["update_id"]
-            msg  = update.get("message", {})
-            text = msg.get("text", "").strip().lower()
-            uid  = str(msg.get("chat", {}).get("id", ""))
-
-            if uid != str(chat):
-                continue  # ignore other chats
-
-            if text == "/pause":
-                ledger = load_ledger()
-                ledger["bot_paused"] = True
-                save_ledger(ledger)
-                send_alert("[ CIRCUIT ] PAUSED\n━━━━━━━━━━━━━━━━━━\nTrading stopped\nPositions held + tracked\nSend /resume to restart")
-
-            elif text == "/resume":
-                ledger = load_ledger()
-                ledger["bot_paused"] = False
-                save_ledger(ledger)
-                send_alert("[ CIRCUIT ] RESUMED\n━━━━━━━━━━━━━━━━━━\nTrading active")
-
-            elif text == "/status":
-                ledger  = load_ledger()
-                capital = get_trading_capital()
-                paused  = ledger.get("bot_paused", False)
-                cash_b  = get_cash_bucket()
-                etf_b   = get_etf_bucket()
-                pdt     = ledger.get("day_trades_this_week", 0)
-                open_t  = list(ledger.get("open_trades", {}).keys())
-                status  = "PAUSED" if paused else "LIVE"
-                parts = [
-                    "[ CIRCUIT ] STATUS",
-                    "STATE  " + status,
-                    "CAP    " + f"{capital:,.2f}",
-                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
-                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
-                    "ETF    " + f"{etf_b:,.2f}",
-                    "CASH   " + f"{cash_b:,.2f}",
-                    "PDT    " + str(pdt) + "/3",
-                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
-                ]
-                send_alert("\n".join(parts))
-
-            elif text == "/backtest":
-                send_alert("[ CIRCUIT ] BACKTEST\n━━━━━━━━━━━━━━━━━━\nRunning 14d backtest...\nResults in ~5 min")
-                try:
-                    import threading
-                    def _run():
-                        from backtest import run_backtest
-                        run_backtest(days=14, bot_capital=get_trading_capital())
-                    threading.Thread(target=_run, daemon=True).start()
-                except Exception as ex:
-                    send_alert("Backtest error: " + str(ex))
-
-    except Exception as ex:
-        print(f"Command poll error: {ex}")
-
-# ── Telegram command state ────────────────────────────────────────────────────
-_BOT_PAUSED = False  # global pause flag
-
-
-def check_telegram_commands():
-    """
-    Poll Telegram for slash commands every 60 seconds.
-    /pause  - stop new trades, keep tracking positions
-    /resume - restart trading
-    /status - show bot status
-    /backtest - run 14-day backtest
-    """
-    global _BOT_PAUSED
-    try:
-        url    = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_TOKEN')}/getUpdates"
-        ledger = load_ledger()
-        offset = ledger.get("tg_offset", 0)
-        resp   = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10)
-        if not resp.ok:
-            return
-        updates = resp.json().get("result", [])
-        for update in updates:
-            update_id = update["update_id"]
-            ledger["tg_offset"] = update_id + 1
-            msg = update.get("message", {})
-            text = msg.get("text", "").strip().lower()
-
-            if text == "/pause":
-                _BOT_PAUSED = True
-                ledger["bot_paused"] = True
-                save_ledger(ledger)
-                send_alert("[ CIRCUIT ] PAUSED\nTrading halted\nPositions still tracked\n/resume to restart")
-
-            elif text == "/resume":
-                _BOT_PAUSED = False
-                ledger["bot_paused"] = False
-                save_ledger(ledger)
-                send_alert("[ CIRCUIT ] RESUMED\nTrading active")
-
-            elif text == "/status":
-                ledger  = load_ledger()
-                capital = get_trading_capital()
-                paused  = ledger.get("bot_paused", False)
-                cash_b  = get_cash_bucket()
-                etf_b   = get_etf_bucket()
-                pdt     = ledger.get("day_trades_this_week", 0)
-                open_t  = list(ledger.get("open_trades", {}).keys())
-                state   = "PAUSED" if paused else "LIVE"
-                parts   = [
-                    "[ CIRCUIT ] STATUS",
-                    "STATE  " + state,
-                    "CAP    " + f"{capital:,.2f}",
-                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
-                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
-                    "ETF    " + f"{etf_b:,.2f}",
-                    "CASH   " + f"{cash_b:,.2f}",
-                    "PDT    " + str(pdt) + "/3",
-                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
-                ]
-                send_alert("\n".join(parts))
-
-            elif text == "/backtest":
-                send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
-                try:
-                    import threading
-                    def _run():
-                        from backtest import run_backtest
-                        run_backtest(days=14, bot_capital=get_trading_capital())
-                    threading.Thread(target=_run, daemon=True).start()
-                except Exception as ex:
-                    send_alert("Backtest error: " + str(ex))
-
-            elif text == "/tax":
-                try:
-                    from tax import get_tax_report, get_etf_tax_exit_plan
-                    report = get_tax_report()
-                    plan   = get_etf_tax_exit_plan(
-                        get_account_numbers()[0]["hashValue"],
-                        report["total_tax_owed"]
-                    )
-                    parts = [
-                        "[ CIRCUIT ] TAX " + str(report["year"]),
-                        "ST GAINS  " + f"{report['short_term_gains']:,.2f}",
-                        "ST LOSS   " + f"{report['short_term_losses']:,.2f}",
-                        "LT GAINS  " + f"{report['long_term_gains']:,.2f}",
-                        "OPTIONS   " + f"{report['options_income']:,.2f}",
-                        "DIVIDENDS " + f"{report['dividends']:,.2f}",
-                        "TAX OWED  " + f"{report['total_tax_owed']:,.2f}",
-                        "MD RATES  ST " + report["md_rate_short"] + " LT " + report["md_rate_long"],
-                    ]
-                    if plan:
-                        parts.append("EXIT PLAN:")
-                        for p in plan:
-                            parts.append("  SELL " + str(p["shares_to_sell"]) + " " + p["symbol"] + " = " + f"{p['proceeds']:,.2f}")
-                    send_alert("\n".join(parts))
-                except Exception as ex:
-                    send_alert("Tax error: " + str(ex))
-                try:
-                    from backtest import run_backtest
-                    run_backtest(days=14, bot_capital=get_trading_capital())
-                except Exception as ex:
-                    send_alert("Backtest error: " + str(ex))
-
-        save_ledger(ledger)
-    except Exception as ex:
-        print(f"Command check error: {ex}")
 MARKET_URL        = "https://api.schwabapi.com/marketdata/v1"
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 # ── Profit splits ─────────────────────────────────────────────────────────────
-STOCK_SPLIT   = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
-OPTIONS_SPLIT = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
-ETF_SPLITS    = {
+STOCK_SPLIT  = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
+OPTIONS_SPLIT     = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
+ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.50, "bot": 0.30}
+ETF_SPLITS   = {
     "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
     "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
     "Level 3": {"bot": 0.30, "cash": 0.40, "etf": 0.30},
 }
-
-# ── Capital bucket split ───────────────────────────────────────────────────────
-DAY_PCT   = 0.25   # 25% for day trading (30/15/5/1m)
-SWING_PCT = 0.75   # 75% for swing + options (Daily/30m/5m)
-
-# PDT rule — max 3 day trades in 5 days under $25k
-MAX_DAY_TRADES_PER_WEEK = 3
 
 # ── Safety floor ──────────────────────────────────────────────────────────────
 BOT_FLOOR = 500.0  # never let bot capital drop below this
@@ -493,83 +193,31 @@ def get_star_rating(stock: dict) -> int:
     hist = stock.get("macd_hist") or 0
     if hist >= 0.05:   stars += 2
     elif hist >= 0.01: stars += 1
-    flow = stock.get("flow", 0)
-    if flow >= 60: stars += 1
+    rsi = stock.get("rsi", 50)
+    if 50 <= rsi <= 65: stars += 1
     vol = stock.get("volume", 0)
     if vol > 0: stars += 1
     return min(max(stars, 1), 10)
 
 
-def get_day_position_size(symbol: str, capital: float, fvg_confirmed: bool = False, stars: int = 0) -> float:
+def get_mtf_position_size(symbol: str, ceiling: float) -> float:
     """
-    Day trading bucket (25% of capital).
-    Conviction only for sizing. Stars 7+ required to qualify.
-    Frames: 30m/15m/5m/1m
-
-    4/4        → full ceiling
-    3/4 + FVG  → 2.5 fires at 70% ceiling
-    3/4 no FVG → 50% ceiling (still trades)
-    2/4        → no trade always
-    Stars 7+   → required to qualify
+    4-frame MA conviction sizing.
+    4/4 → full ceiling
+    3/4 → 50% ceiling
+    2/4 → 35% ceiling (~$70 at $200 ceiling)
+    1/4 or less → no trade (returns 0)
     """
-    if stars < 7:
-        return 0  # stars 7+ required for day trades
-
-    day_capital = capital * DAY_PCT
-    room        = day_capital - 200
-    if room <= 0:
-        return 0
-    ceiling = min(room * 0.40, 200)
-
-    conviction = get_day_conviction(symbol)
-
+    from scanner import get_mtf_conviction
+    conviction = get_mtf_conviction(symbol)
     if conviction >= 4:
-        return ceiling              # 4/4 full
-    elif conviction == 3 and fvg_confirmed:
-        return ceiling * 0.70       # 2.5 with FVG → 70% ceiling
+        return ceiling          # 4/4 full
     elif conviction == 3:
-        return ceiling * 0.50       # 3/4 no FVG → 50% ceiling (still trades)
+        return ceiling * 0.50   # 3/4 half
+    elif conviction == 2:
+        return ceiling * 0.35   # 2/4 small but protected by features
     else:
-        return 0                    # 2/4 or less → no trade
-
-
-def get_swing_position_size(symbol: str, capital: float, stock: dict = None) -> tuple:
-    """
-    Swing bucket (75% of capital).
-    Frames: Daily/30m/5m
-    Minimum to fire: 3.0/4 conviction
-    Stars LOCK IN the size (7+ required):
-    Stars 7  → 50% ceiling
-    Stars 8  → 75% ceiling
-    Stars 9  → 90% ceiling
-    Stars 10 → full ceiling
-    Stars <7 → no trade
-    Returns (size, direction, conviction_info)
-    """
-    swing_capital = capital * SWING_PCT
-    room          = swing_capital - 300
-    if room <= 0:
-        return 0, "flat", {}
-    ceiling = get_ceiling(swing_capital)
-
-    info = get_swing_conviction(symbol)
-    conv = info["conviction"]
-
-    # Minimum 3.0/4 to fire — no FVG shortcut for swing
-    if conv < 3:
-        return 0, info.get("direction", "flat"), info
-
-    # Stars lock in size — 7+ required
-    stars = get_star_rating(stock) if stock else 0
-    if stars < 7:
-        return 0, info.get("direction", "flat"), info
-
-    if stars >= 10:    size = ceiling
-    elif stars >= 9:   size = ceiling * 0.90
-    elif stars >= 8:   size = ceiling * 0.75
-    else:              size = ceiling * 0.50  # stars 7
-
-    return size, info["direction"], info
+        return 0                # 1/4 or less — no trade
 
 
 # ── Room-based ceiling ────────────────────────────────────────────────────────
@@ -598,10 +246,6 @@ def get_daily_stats() -> dict:
     ledger = load_ledger()
     today  = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
     if ledger.get("daily_stats_date") != today:
-        # Reset weekly PDT counter on Monday
-        now = datetime.now(pytz.timezone("America/New_York"))
-        if now.weekday() == 0:  # Monday
-            ledger["day_trades_this_week"] = 0
         ledger.update({
             "daily_stats_date":   today,
             "daily_loss_stock":   0.0,
@@ -670,11 +314,6 @@ def can_trade(capital: float, stats: dict, _unused: int = 0) -> tuple:
     MTF conviction handles sizing. This handles daily limits.
     Returns (bool, reason).
     """
-    global _BOT_PAUSED
-    # Check pause state from ledger (survives restarts)
-    if _BOT_PAUSED or load_ledger().get("bot_paused", False):
-        return False, "bot_paused"
-
     # Warmup — skip 9:30-9:45 ET
     et  = pytz.timezone("America/New_York")
     now = datetime.now(et)
@@ -779,146 +418,6 @@ def check_delta_trail(symbol: str, entry_px: float, high_px: float,
     }
 
 
-# ── Spike protection ─────────────────────────────────────────────────────────
-
-def detect_spike(candles: list, spike_mult: float = 2.5) -> dict:
-    """
-    Detects abnormal price bars using ATR(14) x SpikeMult.
-    Dynamic — adjusts to current market pace automatically.
-    Quiet day: small bar triggers it. Busy day: takes a big bar.
-
-    Returns:
-        is_spike: bool
-        direction: "up" | "down" | None
-        bar_range: current bar range
-        atr: current ATR(14)
-        threshold: bar_range needed to be a spike
-    """
-    if len(candles) < 15:
-        return {"is_spike": False, "direction": None}
-
-    try:
-        # ATR(14) — true range average
-        true_ranges = []
-        for i in range(1, min(15, len(candles))):
-            c     = candles[-i]
-            prev  = candles[-i-1]
-            tr    = max(
-                c["high"] - c["low"],
-                abs(c["high"] - prev["close"]),
-                abs(c["low"]  - prev["close"])
-            )
-            true_ranges.append(tr)
-        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0
-
-        if atr == 0:
-            return {"is_spike": False, "direction": None}
-
-        # Current bar range
-        c         = candles[-1]
-        bar_range = c["high"] - c["low"]
-        threshold = atr * spike_mult
-        is_spike  = bar_range > threshold
-
-        # Spike direction
-        direction = None
-        if is_spike:
-            if c["close"] > c["open"]:
-                direction = "up"
-            else:
-                direction = "down"
-
-        return {
-            "is_spike":  is_spike,
-            "direction": direction,
-            "bar_range": round(bar_range, 4),
-            "atr":       round(atr, 4),
-            "threshold": round(threshold, 4),
-        }
-    except Exception:
-        return {"is_spike": False, "direction": None}
-
-
-def check_wick_exit(symbol: str, pos_price: float, buy_price: float,
-                    candles: list, bucket: str = "swing") -> dict:
-    """
-    Wick exit — pressure flip signal.
-    Day:   fires in profit OR loss (cheap insurance, fast exits)
-    Swing: only fires when in profit (let stop handle losses)
-
-    Armed after entry — checks for upper wick rejection (sellers taking control).
-    """
-    if len(candles) < 3:
-        return {"action": None}
-    try:
-        c   = candles[-1]
-        rng = c["high"] - c["low"]
-        if rng == 0:
-            return {"action": None}
-
-        upper_wick = c["high"] - max(c["open"], c["close"])
-        in_profit  = pos_price > buy_price
-
-        # Upper wick > 45% of range = sellers rejecting highs = pressure flip
-        wick_pct = upper_wick / rng
-        if wick_pct < 0.45:
-            return {"action": None}
-
-        # Day: fires in profit OR loss
-        if bucket == "day":
-            return {
-                "action": "wick_exit",
-                "reason": "WICK EXIT (day)",
-                "wick_pct": round(wick_pct * 100, 1),
-                "in_profit": in_profit
-            }
-
-        # Swing: only fires when in profit
-        if bucket == "swing" and in_profit:
-            return {
-                "action": "wick_exit",
-                "reason": "WICK EXIT (swing)",
-                "wick_pct": round(wick_pct * 100, 1),
-                "in_profit": in_profit
-            }
-
-        return {"action": None}
-    except Exception:
-        return {"action": None}
-
-
-def check_spike_on_position(symbol: str, pos_price: float, buy_price: float,
-                             candles: list) -> dict:
-    """
-    Check spike protection on an open position.
-    1. PROFIT GRAB — spike in your favor while in profit → book immediately
-    2. LOSS EXIT  — spike against you → emergency exit before full stop
-    Returns action: "profit_grab" | "loss_exit" | None
-    """
-    spike = detect_spike(candles)
-    if not spike["is_spike"]:
-        return {"action": None}
-
-    in_profit = pos_price > buy_price
-
-    if spike["direction"] == "up" and in_profit:
-        return {
-            "action":  "profit_grab",
-            "reason":  "SPIKE PROFIT GRAB",
-            "bar_range": spike["bar_range"],
-            "atr":     spike["atr"],
-        }
-    elif spike["direction"] == "down":
-        return {
-            "action":  "loss_exit",
-            "reason":  "SPIKE LOSS EXIT",
-            "bar_range": spike["bar_range"],
-            "atr":     spike["atr"],
-        }
-
-    return {"action": None}
-
-
 # ── Execute sell ──────────────────────────────────────────────────────────────
 
 def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
@@ -934,41 +433,14 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
         record_trade_result(profit, "stock")
         update_win_rate(profit)
 
-        # Record for tax tracking
-        try:
-            ledger_t = load_ledger()
-            trade_t  = ledger_t.get("closed_trades", [])
-            hold_days = 180  # default
-            for ct in trade_t:
-                if ct.get("symbol") == symbol:
-                    try:
-                        from datetime import datetime as _dt
-                        b = _dt.strptime(ct.get("bought_at","2000-01-01")[:10], "%Y-%m-%d")
-                        s = _dt.strptime(ct.get("closed_at","2000-01-01")[:10], "%Y-%m-%d")
-                        hold_days = (s - b).days
-                    except Exception:
-                        pass
-                    break
-            record_taxable_event(symbol, profit, hold_days, "stock")
-        except Exception:
-            pass
-
         if profit > 0:
-            msg  = f"[ OUT ] {symbol} +{profit:,.2f}\n"
-            msg += "━━━━━━━━━━━━━━━━━━\n\n"
-            msg += f"PRICE  {price:.2f}\n"
-            msg += f"QTY    {quantity}\n"
-            msg += f"ETF    +{split['etf_cut']:,.2f}\n"
-            msg += f"CASH   +{split['cash_cut']:,.2f}\n"
-            msg += f"BOT    +{split['bot_cut']:,.2f}"
-            send_alert(msg)
+            send_alert(
+                f"💰 Sold {symbol} x{quantity} @ ${price:.2f} | +${profit:,.2f}\n"
+                f"→ ETF ${split['etf_cut']:,.0f} | Cash ${split['cash_cut']:,.0f} | Bot ${split['bot_cut']:,.0f}"
+            )
         else:
-            msg  = f"[ CUT ] {symbol} {profit:,.2f}\n"
-            msg += "━━━━━━━━━━━━━━━━━━\n\n"
-            msg += f"PRICE  {price:.2f}\n"
-            msg += f"QTY    {quantity}\n"
-            msg += f"EXIT   {reason.upper()}"
-            send_alert(msg)
+            tag = "🛑" if "stop" in reason or "trail" in reason or "breakeven" in reason else "📉"
+            send_alert(f"{tag} Sold {symbol} x{quantity} @ ${price:.2f} | ${profit:,.2f}")
         print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {reason}")
     except Exception as ex:
         send_alert(f"Sell error {symbol}: {ex}")
@@ -977,86 +449,44 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
 
 # ── Daily summary ─────────────────────────────────────────────────────────────
 
-def send_premarket_summary():
-    """9:00 AM ET — morning brief before market opens."""
-    ledger  = load_ledger()
-    capital = get_trading_capital()
-    cash_b  = get_cash_bucket()
-    etf_b   = get_etf_bucket()
-    day_cap = capital * DAY_PCT
-    swg_cap = capital * SWING_PCT
-
-    msg  = "Good morning — Pre-Market Brief\n"
-    msg += f"Capital: ${capital:,.0f} | Day: ${day_cap:,.0f} | Swing: ${swg_cap:,.0f}\n"
-    msg += f"ETF bucket: ${etf_b:,.0f} | Cash ready: ${cash_b:,.0f}\n"
-    msg += f"PDT trades used: {ledger.get('day_trades_this_week', 0)}/3 this week"
-    send_alert(msg)
-
-
-def send_session_summary():
-    """4:05 PM ET — end of session summary after market close."""
+def send_daily_summary():
+    """Send 4 PM daily summary with consistency tracking."""
     ledger = load_ledger()
     stats  = get_daily_stats()
     wr_history = ledger.get("win_rate_history", [])
     win_rate   = sum(wr_history) / len(wr_history) * 100 if wr_history else 0
 
+    # Consistency % — how many of last 10 days were profitable
     daily_history = ledger.get("daily_pnl_history", [])
     daily_history.append(stats["daily_profit"])
     ledger["daily_pnl_history"] = daily_history[-10:]
     consistency = sum(1 for d in daily_history if d > 0) / len(daily_history) * 100 if daily_history else 0
-
-    c4 = ledger.get("conviction_4_count", 0)
-    c3 = ledger.get("conviction_3_count", 0)
-    c2 = ledger.get("conviction_2_count", 0)
-    c1 = ledger.get("conviction_1_count", 0)
-
-    for k in ["conviction_4_count", "conviction_3_count", "conviction_2_count", "conviction_1_count"]:
-        ledger[k] = 0
     save_ledger(ledger)
 
     capital    = get_trading_capital()
     stock_cap  = capital * 0.02
     stock_used = stats["daily_loss_stock"] / stock_cap * 100 if stock_cap > 0 else 0
 
-    trades_today = stats["trades_today"]
-    daily_profit = stats["daily_profit"]
-    daily_peak   = stats["daily_peak"]
+    # Conviction breakdown
+    c4 = ledger.get("conviction_4_count", 0)
+    c3 = ledger.get("conviction_3_count", 0)
+    c2 = ledger.get("conviction_2_count", 0)
+    c1 = ledger.get("conviction_1_count", 0)
 
-    msg  = "[ CIRCUIT ] CLOSE 16:05\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"TRADES {trades_today}\n"
-    msg += f"P&L    {daily_profit:+,.2f}\n"
-    msg += f"PEAK   {daily_peak:,.2f}\n"
-    msg += f"WIN    {win_rate:.0f}%\n"
-    msg += f"CONS   {consistency:.0f}%\n"
-    msg += f"CAP    {stock_used:.0f}% used\n"
-    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"4/4 x{c4}  3/4 x{c3}  2/4 x{c2}"
-    send_alert(msg)
+    # Reset conviction counts for tomorrow
+    for k in ["conviction_4_count", "conviction_3_count", "conviction_2_count", "conviction_1_count"]:
+        ledger[k] = 0
+    save_ledger(ledger)
 
-
-def send_eod_summary():
-    """5:00 PM ET — end of day full summary with tax YTD."""
-    ledger  = load_ledger()
-    capital = get_trading_capital()
-    cash_b  = get_cash_bucket()
-    etf_b   = get_etf_bucket()
-    ytd_tax = ledger.get("ytd_tax_owed", 0.0)
-
-    msg  = "[ CIRCUIT ] EOD 17:00\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n\n"
-    msg += f"CAP    {capital:,.2f}\n"
-    msg += f"DAY    {capital*DAY_PCT:,.2f}\n"
-    msg += f"SWING  {capital*SWING_PCT:,.2f}\n"
-    msg += f"ETF    {etf_b:,.2f}\n"
-    msg += f"CASH   {cash_b:,.2f}\n"
-    msg += f"TAX YTD {ytd_tax:,.2f}"
-    send_alert(msg)
-
-
-def send_daily_summary():
-    """Legacy — calls session summary."""
-    send_session_summary()
+    trades_today = stats['trades_today']
+    daily_profit = stats['daily_profit']
+    daily_peak   = stats['daily_peak']
+    msg = "Daily Summary\n"
+    msg += f"Trades: {trades_today} | P&L: ${daily_profit:+,.0f} | Peak: ${daily_peak:,.0f}\n"
+    msg += f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
+    msg += f"Stock cap used: {stock_used:.0f}%\n"
+    msg += f"Signals: 4/4={c4} | 3/4={c3} | 2/4={c2} | 1/4={c1}"
+    send_alert("📊 " + msg)
 
 
 # ── Main strategy ─────────────────────────────────────────────────────────────
@@ -1076,14 +506,6 @@ def run_strategy():
 
         sync_ledger_from_schwab(encrypted)
         check_token_health()
-
-        # Sync Schwab tax history in January
-        from datetime import datetime as _dt2
-        if _dt2.now().month == 1:
-            try:
-                sync_schwab_tax_history(encrypted)
-            except Exception:
-                pass
 
         capital   = get_trading_capital()
         ceiling   = get_ceiling(capital)
@@ -1111,12 +533,6 @@ def run_strategy():
             trigger    = None
 
             # Signal sell handled by dynamic stop and delta trail below
-            # Check cooldown (30 min after loss or spike exit)
-            ledger_cd = load_ledger()
-            last_exit = ledger_cd.get("last_loss_exit_time", 0)
-            if time.time() - last_exit < 1800:  # 30 min cooldown
-                print(f"  {sym}: COOLDOWN active — {int((1800-(time.time()-last_exit))/60)}min remaining")
-                continue
 
             if not trigger and trail_info:
                 buy_px  = trail_info["buy_price"]
@@ -1130,103 +546,17 @@ def run_strategy():
                     send_alert(f"🎯 Trail exit {sym} | Bid ${delta['bid']:.2f} | +{delta['profit_pct']}%")
                 else:
                     # Dynamic stop fallback
-                    # Pull recent candles for spike + candle-strength stop
+                    # Pull recent candles for candle-strength based stop
                     try:
                         from scanner import get_price_history as _gph
                         _candles = _gph(sym)
                     except Exception:
                         _candles = None
-
-                    # Get bucket type for this position
-                    _bucket = trail_info.get("bucket", "swing") if trail_info else "swing"
-
-                    # Wick exit check
-                    if _candles:
-                        wick_check = check_wick_exit(sym, price, buy_px, _candles, _bucket)
-                        if wick_check["action"] == "wick_exit":
-                            trigger = "wick_exit"
-                            _side = "PROFIT" if wick_check["in_profit"] else "LOSS"
-                            msg  = f"[ WICK ] {sym} — {_bucket.upper()}\n"
-                            msg += f"WICK {wick_check['wick_pct']}% — {_side}"
-                            send_alert(msg)
-                            # Record cooldown
-                            _l = load_ledger()
-                            _l["last_loss_exit_time"] = time.time()
-                            save_ledger(_l)
-
-                    # Spike protection check
-                    if not trigger and _candles:
-                        spike_check = check_spike_on_position(sym, price, buy_px, _candles)
-                        if spike_check["action"] == "profit_grab":
-                            trigger = "profit_grab"
-                            msg  = "[ GRAB ] " + sym + "\n"
-                            msg += "BAR " + str(round(spike_check['bar_range'],2)) + " ATR " + str(round(spike_check['atr'],2))
-                            send_alert(msg)
-                            _l = load_ledger()
-                            _l["last_loss_exit_time"] = time.time()
-                            save_ledger(_l)
-                        elif spike_check["action"] == "loss_exit":
-                            trigger = "loss_exit"
-                            msg  = "[ SPIKE CUT ] " + sym + "\n"
-                            msg += "BAR " + str(round(spike_check['bar_range'],2)) + " ATR " + str(round(spike_check['atr'],2))
-                            send_alert(msg)
-                            _l = load_ledger()
-                            _l["last_loss_exit_time"] = time.time()
-                            save_ledger(_l)
-
-                    # Scale-out TP check (1:3 R/R)
-                    if not trigger and trail_info:
-                        tp1_pct = trail_info.get("tp1_pct", 0.105)
-                        tp2_pct = trail_info.get("tp2_pct", 0.175)
-                        tp1_hit = trail_info.get("tp1_hit", False)
-                        tp2_hit = trail_info.get("tp2_hit", False)
-                        profit_pct = (price - buy_px) / buy_px if buy_px > 0 else 0
-
-                        if not tp1_hit and profit_pct >= tp1_pct:
-                            # Sell ⅓ at TP1
-                            tp1_qty = max(1, qty // 3)
-                            try:
-                                place_equity_order(encrypted, sym, tp1_qty, "SELL")
-                                ledger_tp = load_ledger()
-                                if sym in ledger_tp["open_trades"]:
-                                    ledger_tp["open_trades"][sym]["tp1_hit"]  = True
-                                    ledger_tp["open_trades"][sym]["quantity"] -= tp1_qty
-                                save_ledger(ledger_tp)
-                                msg  = f"[ TP1 ] {sym} 1/3\n"
-                                msg += "━━━━━━━━━━━━━━━━━━\n\n"
-                                msg += f"PRICE  {price:.2f}\n"
-                                msg += f"+{profit_pct*100:.1f}%"
-                                send_alert(msg)
-                            except Exception as _e:
-                                print(f"  TP1 error {sym}: {_e}")
-
-                        elif tp1_hit and not tp2_hit and profit_pct >= tp2_pct:
-                            # Sell ⅓ at TP2
-                            tp2_qty = max(1, qty // 3)
-                            try:
-                                place_equity_order(encrypted, sym, tp2_qty, "SELL")
-                                ledger_tp = load_ledger()
-                                if sym in ledger_tp["open_trades"]:
-                                    ledger_tp["open_trades"][sym]["tp2_hit"]  = True
-                                    ledger_tp["open_trades"][sym]["quantity"] -= tp2_qty
-                                save_ledger(ledger_tp)
-                                msg  = f"[ TP2 ] {sym} 2/3\n"
-                                msg += "━━━━━━━━━━━━━━━━━━\n\n"
-                                msg += f"PRICE  {price:.2f}\n"
-                                msg += f"+{profit_pct*100:.1f}%"
-                                send_alert(msg)
-                            except Exception as _e:
-                                print(f"  TP2 error {sym}: {_e}")
-
-                    if not trigger:
-                        # Use pressure trail for exits — more aggressive
-                        stop_info = get_pressure_trail(sym, buy_px, high_px, price, _candles, TRAILING_STOP_PCT)
-                    else:
-                        stop_info = None
+                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles)
                     if price <= stop_info["stop_price"]:
                         trigger = stop_info["reason"]
                         if stop_info["reason"] == "breakeven":
-                            send_alert(f"[ LOCK ] {sym} — BREAKEVEN")
+                            send_alert(f"🛡️ Breakeven exit {sym} | Protected")
 
             if trigger:
                 if check_covered_call_already_open(encrypted, sym):
@@ -1253,56 +583,11 @@ def run_strategy():
                     print(f"  {symbol}: skip — {reason}")
                     continue
 
-                # Volatility guard — skip entry if current bar is a spike
-                try:
-                    from scanner import get_price_history as _gph2
-                    _entry_candles = _gph2(symbol)
-                    _spike = detect_spike(_entry_candles)
-                    if _spike["is_spike"]:
-                        print(f"  {symbol}: skip — VOLATILITY GUARD spike detected")
-                        continue
-                except Exception:
-                    pass
-
-                # Two bucket sizing - day or swing
-                fvg_ok = stock.get("fvg_returning", False)
-                in_gap = False
-                try:
-                    from scanner import detect_fvg, get_price_history as _gph3
-                    _fvg_c = _entry_candles or _gph3(symbol)
-                    _fvg   = detect_fvg(_fvg_c)
-                    fvg_ok = _fvg.get("returning", False)
-                    in_gap = _fvg.get("in_gap", False)
-                except Exception:
-                    pass
-
-                if in_gap:
-                    print(f"  {symbol}: skip — price inside FVG zone")
-                    continue
-
-                position_size = 0
-                bucket = "swing"
-
-                ledger_pdt    = load_ledger()
-                day_trades_wk = ledger_pdt.get("day_trades_this_week", 0)
-
-                if day_trades_wk < MAX_DAY_TRADES_PER_WEEK:
-                    day_stars = get_star_rating(stock)
-                    day_size  = get_day_position_size(symbol, capital, fvg_confirmed=fvg_ok, stars=day_stars)
-                    if day_size > 0:
-                        position_size = day_size
-                        bucket = "day"
-
+                # MTF conviction sizing
+                position_size = get_mtf_position_size(symbol, ceiling)
                 if position_size == 0:
-                    swing_size, direction, swing_info = get_swing_position_size(symbol, capital, stock)
-                    if swing_size > 0 and direction == "up":
-                        position_size = swing_size
-                        bucket = "swing"
-
-                if position_size == 0:
-                    print(f"  {symbol}: skip — no conviction in either bucket")
+                    print(f"  {symbol}: skip — MTF conviction too low")
                     continue
-
                 position_size = green_day_scale(position_size, stats)
                 position_size = min(position_size, cash)
 
@@ -1324,7 +609,7 @@ def run_strategy():
 
                     cash -= cost
                     bought_this_run.add(symbol)
-                    record_buy(symbol, quantity, price, cost, bucket=bucket)
+                    record_buy(symbol, quantity, price, cost)
                     from scanner import get_mtf_conviction
                     conv  = get_mtf_conviction(symbol)
                     stars = get_star_rating(stock)
@@ -1359,6 +644,46 @@ def run_strategy():
 
 
 # ── Options ───────────────────────────────────────────────────────────────────
+
+def run_etf_options(encrypted: str, positions: list, cash: float):
+    """Scan ETF options. Profits: 20% ETF / 50% cash / 30% bot."""
+    try:
+        from options import scan_etf_options, place_covered_call, place_cash_secured_put
+        from options import check_covered_call_already_open, check_put_already_open
+    except ImportError:
+        return
+
+    opps = scan_etf_options(positions, cash)
+    if not opps:
+        return
+
+    print(f"-- ETF options | {len(opps)} opps --")
+
+    for opp in opps[:2]:
+        sym   = opp["symbol"]
+        typ   = opp["type"]
+        prem  = opp["premium"]
+        total = opp["total_premium"]
+        try:
+            if typ == "etf_covered_call":
+                if check_covered_call_already_open(encrypted, sym):
+                    continue
+                place_covered_call(encrypted, opp["option_symbol"], opp["contracts"], prem)
+                send_alert("[ IN ] " + sym + " ETF CALL\nSTRIKE " + str(opp["strike"]) + "\nPREM   " + f"{prem:.2f}" + "\nTOTAL  " + f"{total:.2f}" + "\nSPLIT  ETF20 CASH50 BOT30")
+            elif typ == "etf_put":
+                if check_put_already_open(encrypted, sym):
+                    continue
+                place_cash_secured_put(encrypted, opp["option_symbol"], prem)
+                send_alert("[ IN ] " + sym + " ETF PUT\nSTRIKE " + str(opp["strike"]) + "\nPREM   " + f"{prem:.2f}" + "\nTOTAL  " + f"{total:.2f}" + "\nSPLIT  ETF20 CASH50 BOT30")
+
+            ledger = load_ledger()
+            ledger["etf_bucket"]  = ledger.get("etf_bucket", 0)  + total * ETF_OPTIONS_SPLIT["etf"]
+            ledger["cash_bucket"] = ledger.get("cash_bucket", 0) + total * ETF_OPTIONS_SPLIT["cash"]
+            ledger["bot_bucket"]  = ledger.get("bot_bucket", 0)  + total * ETF_OPTIONS_SPLIT["bot"]
+            save_ledger(ledger)
+        except Exception as ex:
+            print(f"  ETF options error {sym}: {ex}")
+
 
 def run_options(encrypted: str, positions: list, cash: float, stats: dict, capital: float):
     # Options daily cap check — 1% of bot capital
@@ -1395,7 +720,7 @@ def run_options(encrypted: str, positions: list, cash: float, stats: dict, capit
         except Exception as ex:
             print(f"  Call error {sym}: {ex}")
 
-    # Cash secured puts — use swing direction (down bias = better put opportunities)
+    # Cash secured puts
     if cash < 200:
         return
     print(f"\n-- Cash secured puts | ${cash:,.2f} --")
@@ -1404,21 +729,8 @@ def run_options(encrypted: str, positions: list, cash: float, stats: dict, capit
         sym   = stock["symbol"]
         price = stock["price"]
         star  = get_star_rating(stock)
-
-        # Check swing direction for puts
-        try:
-            swing_info = get_swing_conviction(sym)
-            swing_dir  = swing_info.get("direction", "flat")
-            swing_conv = swing_info.get("conviction", 0)
-            # Puts work in any direction but prefer flat/down bias
-            # Skip puts when strong uptrend (better to buy stock instead)
-            if swing_dir == "up" and swing_conv >= 4:
-                continue  # strong uptrend — buy stock not put
-        except Exception:
-            swing_dir = "flat"
-
-        if star < 7:  # 7+ stars required for puts
-            continue
+        if star < 6:
+            continue  # options need strong signal
         if check_put_already_open(encrypted, sym):
             continue
         put = find_best_cash_secured_put(sym, price, cash)
@@ -1635,16 +947,10 @@ def main():
                           "%Y-%m-%dT%H:%M:%SZ")) < 86400)
 
         pulse    = get_market_pulse() if is_market_open() else ""
-        hold_str = f"\nHOLD   {on_hold:,.0f}" if on_hold > 0 else ""
-        msg  = "[ CIRCUIT ] LIVE\n"
-        msg += "━━━━━━━━━━━━━━━━━━\n\n"
-        msg += f"CAP    {capital:,.2f}\n"
-        msg += f"DAY    {capital*DAY_PCT:,.2f}\n"
-        msg += f"SWING  {capital*SWING_PCT:,.2f}\n"
-        msg += f"CASH   {cash_ready:,.2f}"
-        msg += hold_str
+        hold_str = f" | 🔒 ${on_hold:,.0f}" if on_hold > 0 else ""
+        msg = f"✅ Bot online | 💵 ${cash_ready:,.0f} ready{hold_str} | 24h ${p24h:,.0f}"
         if pulse:
-            msg += f"\n━━━━━━━━━━━━━━━━━━\n{pulse}\n"
+            msg += f"\n{pulse}"
         send_alert(msg)
 
     except Exception as ex:
@@ -1655,45 +961,8 @@ def main():
 
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
     schedule.every(5).minutes.do(check_balance_24_7)
-    schedule.every(1).minutes.do(poll_telegram_commands)
-    schedule.every(1).minutes.do(check_telegram_commands)
-    # Pre-market brief at 9:00 AM ET
-    schedule.every().day.at("07:30").do(send_premarket_summary)
-
-    # All times in UTC (Fly.io server is UTC)
-    # 4:05 PM ET = 20:05 UTC
-    schedule.every().day.at("20:05").do(send_session_summary)
-
-    # 5:00 PM ET = 21:00 UTC
-    schedule.every().day.at("21:00").do(send_eod_summary)
-
-    # 4:30 PM ET = 20:30 UTC — backtest
-    def run_post_session_backtest():
-        et  = pytz.timezone("America/New_York")
-        now = datetime.now(et)
-        if now.weekday() < 5:
-            try:
-                from backtest import run_backtest
-                run_backtest(days=14, bot_capital=get_trading_capital())
-            except Exception as ex:
-                print(f"Backtest error: {ex}")
-
-    schedule.every().day.at("20:30").do(run_post_session_backtest)
-
-    # April tax alert — 9:05 AM ET = 13:05 UTC
-    def maybe_send_tax_alert():
-        from datetime import datetime as _dt
-        import pytz as _pytz
-        now = _dt.now(_pytz.timezone("America/New_York"))
-        if now.month == 4 and 1 <= now.day <= 15:
-            try:
-                accts = get_account_numbers()
-                enc   = accts[0]["hashValue"]
-                send_tax_alert(enc)
-            except Exception as ex:
-                print(f"Tax alert error: {ex}")
-
-    schedule.every().day.at("13:05").do(maybe_send_tax_alert)
+    # Daily summary at 4 PM ET
+    schedule.every().day.at("16:00").do(send_daily_summary)
 
     while True:
         schedule.run_pending()
