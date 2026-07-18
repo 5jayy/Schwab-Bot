@@ -645,6 +645,100 @@ def run_strategy():
 
 # ── Options ───────────────────────────────────────────────────────────────────
 
+def run_etf_redirect(encrypted: str, cash: float, capital: float):
+    """
+    When roadmap says ETF options beats swing trading,
+    use a portion of swing capital to buy ETF shares directly.
+    Accelerates roadmap compounding — self-chasing system.
+
+    Only fires when:
+    - Roadmap priority ETF identified
+    - Swing capital has room
+    - ETF not already at 100 shares
+    - Market is open
+    """
+    try:
+        from roadmap import calculate_roadmap, get_priority_etf
+        ledger    = load_ledger()
+        routing   = ledger.get("roadmap_swing_vs_etf", "swing")
+        priority  = ledger.get("roadmap_priority_etf", "SCHB")
+        sweep_spl = ledger.get("roadmap_sweep_split", {priority: 0.70})
+
+        if routing != "etf_options":
+            return  # swing trading wins — don't redirect
+
+        if not priority:
+            return
+
+        # Get current shares of priority ETF
+        accts     = get_account_numbers()
+        encrypted_acc = accts[0]["hashValue"]
+        resp = requests.get(
+            f"{BASE_URL}/accounts/{encrypted_acc}?fields=positions",
+            headers={"Authorization": f"Bearer {get_valid_token()}",
+                     "Content-Type": "application/json"},
+            timeout=15
+        )
+        positions = resp.json()["securitiesAccount"].get("positions", [])
+        current_shares = 0
+        for p in positions:
+            if p["instrument"]["symbol"] == priority:
+                current_shares = p.get("longQuantity", 0)
+                break
+
+        if current_shares >= 100:
+            print(f"  {priority}: already at 100 shares — roadmap redirecting to next ETF")
+            ledger["roadmap_priority_etf"] = None  # trigger recalculate
+            save_ledger(ledger)
+            return
+
+        # Use 15% of swing capital for ETF redirect
+        redirect_amount = capital * SWING_PCT * 0.15
+        redirect_amount = min(redirect_amount, cash * 0.20)  # max 20% of available cash
+
+        if redirect_amount < 50:
+            return  # not enough to matter
+
+        # Get ETF price
+        quote_resp = requests.get(
+            f"https://api.schwabapi.com/marketdata/v1/quotes/{priority}",
+            headers={"Authorization": f"Bearer {get_valid_token()}"},
+            timeout=10
+        )
+        if not quote_resp.ok:
+            return
+
+        price = quote_resp.json().get(priority, {}).get("quote", {}).get("lastPrice", 0)
+        if price <= 0:
+            return
+
+        shares_to_buy = int(redirect_amount // price)
+        if shares_to_buy < 1:
+            return
+
+        # Check if buying would exceed 100 shares
+        shares_to_buy = min(shares_to_buy, int(100 - current_shares))
+        if shares_to_buy < 1:
+            return
+
+        cost = shares_to_buy * price
+
+        # Place order
+        resp = place_equity_order(encrypted, priority, shares_to_buy, "BUY")
+        if resp and resp.headers.get("Location"):
+            print(f"  ETF redirect: bought {shares_to_buy} {priority} @ ${price:.2f} = ${cost:.2f}")
+            new_shares = int(current_shares + shares_to_buy)
+            days_left  = int((100 - new_shares) * price / max(capital * 0.60 * 0.70 / 30, 1))
+            msg  = "[ CIRCUIT ] ETF REDIRECT\n"
+            msg += priority + " x" + str(shares_to_buy) + " @ $" + f"{price:.2f}" + "\n"
+            msg += "ROADMAP: " + str(new_shares) + "/100 shares\n"
+            msg += "NEXT: covered call in ~" + str(days_left) + "d"
+            send_alert(msg)
+
+    except Exception as ex:
+        print(f"ETF redirect error: {ex}")
+
+
 def run_etf_options(encrypted: str, positions: list, cash: float):
     """Scan ETF options. Profits: 20% ETF / 50% cash / 30% bot."""
     try:
