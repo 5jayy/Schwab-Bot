@@ -87,6 +87,107 @@ def headers():
     return {"Authorization": f"Bearer {get_valid_token()}"}
 
 
+def scan_cheap_optionable_etfs(max_price: float = 50.0) -> list:
+    """
+    Use Schwab live scanner to find cheap ETFs with options.
+    Looks for ETFs under max_price with liquid options chains.
+    Cheaper = faster to 100 shares = faster option unlock.
+    """
+    # Schwab ETF movers and known cheap optionable ETFs
+    candidates = [
+        # Already own
+        "SCHB", "SCHG", "SCHD",
+        # Cheap growth/income ETFs with options
+        "SOXL", "TQQQ", "SQQQ", "SPXL", "UPRO",
+        "ARKK", "ARKG", "ARKW", "ARKF",
+        "XLF", "XLE", "XLK", "XLV", "XLY",
+        "GDX", "GDXJ", "SLV", "GLD",
+        "JEPI", "JEPQ", "DIVO", "QYLD", "RYLD",
+        "IWM", "EEM", "EFA", "HYG", "LQD",
+        "BOIL", "KOLD", "UCO", "SCO",
+        "LABU", "LABD", "TECL", "TECS",
+    ]
+
+    results = []
+    for sym in candidates:
+        try:
+            resp = requests.get(
+                f"{MARKET_URL}/quotes/{sym}",
+                headers=headers(), timeout=8
+            )
+            if not resp.ok:
+                continue
+            data  = resp.json().get(sym, {})
+            quote = data.get("quote", {})
+            price = quote.get("lastPrice", 0)
+            vol   = quote.get("totalVolume", 0)
+
+            if price <= 0 or price > max_price:
+                continue
+            if vol < 500_000:  # need liquid ETF
+                continue
+
+            # Check if options exist
+            chain_resp = requests.get(
+                f"{MARKET_URL}/chains",
+                headers=headers(),
+                params={"symbol": sym, "strikeCount": 3,
+                        "optionType": "CALL", "strategy": "SINGLE"},
+                timeout=8
+            )
+            if not chain_resp.ok:
+                continue
+            chain = chain_resp.json()
+            if not chain.get("callExpDateMap"):
+                continue
+
+            # Get best call premium
+            best_prem = 0
+            for expiry, strikes in chain.get("callExpDateMap", {}).items():
+                try:
+                    dte = int(expiry.split(":")[1])
+                except Exception:
+                    continue
+                if not (14 <= dte <= 45):
+                    continue
+                for strike_str, opts in strikes.items():
+                    strike = float(strike_str)
+                    if not (price * 1.01 <= strike <= price * 1.06):
+                        continue
+                    opt    = opts[0] if opts else None
+                    if opt:
+                        bid  = opt.get("bid", 0)
+                        ask  = opt.get("ask", 0)
+                        prem = (bid + ask) / 2
+                        if prem > best_prem:
+                            best_prem = prem
+
+            if best_prem < 0.05:
+                continue
+
+            # Cost to 100 shares
+            cost_to_100  = price * 100
+            premium_yield = best_prem / price * 100  # monthly yield %
+            after_tax_prem = best_prem * 100 * (1 - ST_RATE)
+
+            results.append({
+                "symbol":        sym,
+                "price":         round(price, 2),
+                "volume":        vol,
+                "cost_to_100":   round(cost_to_100, 2),
+                "best_premium":  round(best_prem, 2),
+                "premium_yield": round(premium_yield, 2),
+                "after_tax_100": round(after_tax_prem, 2),
+                "score":         round(premium_yield * (1000 / cost_to_100), 2),
+            })
+
+        except Exception:
+            continue
+
+    # Sort by score (best yield per dollar invested)
+    return sorted(results, key=lambda x: x["score"], reverse=True)
+
+
 def get_etf_positions(encrypted: str) -> dict:
     """Get current ETF positions from Schwab."""
     try:
@@ -215,8 +316,8 @@ def calculate_roadmap(encrypted: str) -> dict:
 
         long_term    = hold_days >= 365
         tax_rate     = LT_RATE if long_term else ST_RATE
-        after_tax_call = call_premium * (1 - ST_RATE)  # call premium always ST
-        after_tax_put  = put_premium * (1 - ST_RATE)
+        after_tax_call = full_call * (1 - ST_RATE)  # use full potential not current
+        after_tax_put  = full_put  * (1 - ST_RATE)
 
         goal = {
             "symbol":          sym,
@@ -245,23 +346,79 @@ def calculate_roadmap(encrypted: str) -> dict:
     roadmap["total_monthly_premium_now"]      = round(total_premium_now, 2)
     roadmap["total_monthly_premium_unlocked"] = round(total_premium_unlocked, 2)
 
-    # Priority ETF — closest to unlocking covered call
+    # Priority ETF — closest to unlocking covered call (cheapest first)
     incomplete = [g for g in roadmap["goals"] if not g["call_unlocked"] and g["shares_needed"] > 0]
     if incomplete:
         roadmap["priority_etf"] = sorted(incomplete, key=lambda x: x["cost_needed"])[0]["symbol"]
 
+    # Scan live for better cheap ETF opportunities
+    try:
+        live_etfs = scan_cheap_optionable_etfs(max_price=50.0)
+        roadmap["live_opportunities"] = live_etfs[:5]
+
+        # Add live ETFs to goals if better than current
+        for etf in live_etfs[:3]:
+            sym = etf["symbol"]
+            if sym not in [g["symbol"] for g in roadmap["goals"]]:
+                pos = positions.get(sym, {})
+                shares = pos.get("shares", 0)
+                shares_needed = max(0, 100 - shares)
+                roadmap["goals"].append({
+                    "symbol":         sym,
+                    "priority":       10,
+                    "category":       "live_scan",
+                    "shares":         round(shares, 2),
+                    "target":         100,
+                    "shares_needed":  round(shares_needed, 2),
+                    "cost_needed":    round(shares_needed * etf["price"], 2),
+                    "pct_to_call":    round(shares / 100 * 100, 1),
+                    "call_unlocked":  shares >= 100,
+                    "call_premium":   etf["best_premium"] * 100 if shares >= 100 else 0,
+                    "put_unlocked":   False,
+                    "put_premium":    0,
+                    "put_collateral": round(etf["price"] * 97, 2),
+                    "days_to_call":   int(shares_needed * etf["price"] / max(avg_daily * 0.60 / etf["price"], 0.01)),
+                    "days_to_put":    int(etf["price"] * 97 / max(avg_daily * 0.30, 1)),
+                    "hold_days":      0,
+                    "long_term":      False,
+                    "after_tax_call": etf["after_tax_100"],
+                    "after_tax_put":  0,
+                    "full_potential": etf["best_premium"] * 100,
+                    "premium_yield":  etf["premium_yield"],
+                    "live_scan":      True,
+                })
+    except Exception as ex:
+        print(f"Live scan error: {ex}")
+        roadmap["live_opportunities"] = []
+
+    # Compounding priority — use premiums to fund next ETF
+    # Sort all goals by: already own shares first, then cheapest cost_needed
+    all_goals = sorted(
+        [g for g in roadmap["goals"] if not g["call_unlocked"]],
+        key=lambda x: (x["cost_needed"])
+    )
+    if all_goals:
+        roadmap["priority_etf"] = all_goals[0]["symbol"]
+
+    # Split sweep: 70% to priority, 30% split next 2
+    sweep_split = {roadmap["priority_etf"]: 0.70}
+    remaining = [g["symbol"] for g in all_goals[1:3]]
+    for sym in remaining:
+        sweep_split[sym] = 0.15
+    roadmap["sweep_split"] = sweep_split
+
     # Smart routing decision
-    # If ETF options monthly premium > 5 days of swing trading → route swing capital to ETF
     swing_5day = avg_daily * 5
     if total_premium_unlocked > swing_5day:
-        roadmap["swing_vs_etf"]      = "etf_options"
-        roadmap["routing_decision"]  = f"ETF options potential ${total_premium_unlocked:.0f}/mo beats 5 swing days ${swing_5day:.0f}"
+        roadmap["swing_vs_etf"]     = "etf_options"
+        roadmap["routing_decision"] = f"ETF options ${total_premium_unlocked:.0f}/mo beats 5 swing days ${swing_5day:.0f}"
     else:
-        roadmap["swing_vs_etf"]      = "swing"
-        roadmap["routing_decision"]  = f"Swing trading ${avg_daily:.0f}/day beats ETF options ${total_premium_unlocked:.0f}/mo for now"
+        roadmap["swing_vs_etf"]     = "swing"
+        roadmap["routing_decision"] = f"Swing ${avg_daily:.0f}/day beats ETF options ${total_premium_unlocked:.0f}/mo for now"
 
     # Save to ledger
     ledger["roadmap_priority_etf"] = roadmap["priority_etf"]
+    ledger["roadmap_sweep_split"]  = sweep_split
     ledger["roadmap_swing_vs_etf"] = roadmap["swing_vs_etf"]
     save_ledger(ledger)
 
