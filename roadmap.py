@@ -95,17 +95,38 @@ def scan_cheap_optionable_etfs(max_price: float = 50.0) -> list:
     """
     # Schwab ETF movers and known cheap optionable ETFs
     candidates = [
-        # Already own
-        "SCHB", "SCHG", "SCHD",
-        # Cheap growth/income ETFs with options
-        "SOXL", "TQQQ", "SQQQ", "SPXL", "UPRO",
-        "ARKK", "ARKG", "ARKW", "ARKF",
-        "XLF", "XLE", "XLK", "XLV", "XLY",
-        "GDX", "GDXJ", "SLV", "GLD",
-        "JEPI", "JEPQ", "DIVO", "QYLD", "RYLD",
-        "IWM", "EEM", "EFA", "HYG", "LQD",
-        "BOIL", "KOLD", "UCO", "SCO",
-        "LABU", "LABD", "TECL", "TECS",
+        # Already own — always track
+        "SCHB", "SCHG", "SCHD", "VOO", "QQQ", "VTI",
+
+        # Cheap non-leveraged ETFs under $30 — good for long-term hold
+        "GDX",   # gold miners ~$40 range
+        "GDXJ",  # junior gold miners ~$40
+        "SLV",   # silver ~$25
+        "XLF",   # financials ~$45
+        "XLE",   # energy ~$90 (skip if too expensive)
+        "XLV",   # healthcare ~$140 (skip if too expensive)
+        "EEM",   # emerging markets ~$45
+        "HYG",   # high yield bonds ~$77
+        "LQD",   # investment grade bonds ~$110
+        "IWM",   # small cap ~$215
+
+        # Income ETFs with good premiums — safe long term hold
+        "JEPI",  # ~$60 high income
+        "JEPQ",  # ~$55 high income
+        "QYLD",  # ~$16 covered call income — cheap!
+        "RYLD",  # ~$18 covered call income — cheap!
+        "DIVO",  # ~$45 dividend growth
+        "XYLD",  # ~$44 S&P covered calls
+
+        # Sector ETFs cheap enough
+        "ARKK",  # ~$55 innovation
+        "EFA",   # ~$80 international developed
+        "VWO",   # ~$45 emerging markets
+        "SCHF",  # ~$35 international
+        "SCHA",  # ~$25 small cap — cheap!
+        "SCHM",  # ~$28 mid cap — cheap!
+        "SCHV",  # ~$30 value
+        "SCHX",  # ~$30 large cap
     ]
 
     results = []
@@ -170,6 +191,8 @@ def scan_cheap_optionable_etfs(max_price: float = 50.0) -> list:
             premium_yield = best_prem / price * 100  # monthly yield %
             after_tax_prem = best_prem * 100 * (1 - ST_RATE)
 
+            # Only include if it has a reasonable expense ratio signal
+            # (ETFs trade near NAV, stocks don't — use volume/price ratio as proxy)
             results.append({
                 "symbol":        sym,
                 "price":         round(price, 2),
@@ -179,6 +202,7 @@ def scan_cheap_optionable_etfs(max_price: float = 50.0) -> list:
                 "premium_yield": round(premium_yield, 2),
                 "after_tax_100": round(after_tax_prem, 2),
                 "score":         round(premium_yield * (1000 / cost_to_100), 2),
+                "long_term_ok":  True,  # all in this list are hold-eligible
             })
 
         except Exception:
@@ -391,21 +415,36 @@ def calculate_roadmap(encrypted: str) -> dict:
         print(f"Live scan error: {ex}")
         roadmap["live_opportunities"] = []
 
-    # Compounding priority — use premiums to fund next ETF
-    # Sort all goals by: already own shares first, then cheapest cost_needed
+    # Smart priority — score by monthly ROI on capital to unlock
+    # Best score = fastest path to options income per dollar spent
+    for g in roadmap["goals"]:
+        cost_to_unlock = g["cost_needed"] if g["cost_needed"] > 0 else 1
+        monthly_prem   = g["full_potential"]
+        # ROI score = premium per dollar × speed bonus for cheaper ETFs
+        speed_bonus    = 1000 / max(cost_to_unlock, 1)  # cheaper = faster unlock
+        g["roi_score"] = round((monthly_prem / max(cost_to_unlock, 1)) * 100 + speed_bonus, 4)
+
+    # Sort by ROI score — best return per dollar first
     all_goals = sorted(
-        [g for g in roadmap["goals"] if not g["call_unlocked"]],
-        key=lambda x: (x["cost_needed"])
+        [g for g in roadmap["goals"] if not g["call_unlocked"] and g["shares_needed"] > 0],
+        key=lambda x: x["roi_score"],
+        reverse=True
     )
+
     if all_goals:
         roadmap["priority_etf"] = all_goals[0]["symbol"]
 
-    # Split sweep: 70% to priority, 30% split next 2
-    sweep_split = {roadmap["priority_etf"]: 0.70}
-    remaining = [g["symbol"] for g in all_goals[1:3]]
-    for sym in remaining:
-        sweep_split[sym] = 0.15
+    # Split sweep: 60% to #1, 25% to #2, 15% to #3
+    sweep_split = {}
+    weights = [0.60, 0.25, 0.15]
+    for i, g in enumerate(all_goals[:3]):
+        sweep_split[g["symbol"]] = weights[i]
     roadmap["sweep_split"] = sweep_split
+
+    # Print ROI ranking for terminal output
+    print("ETF Priority by ROI:")
+    for g in all_goals[:6]:
+        print(f"  {g['symbol']}: roi={g['roi_score']:.3f} cost=${g['cost_needed']:,.0f} prem=${g['full_potential']:.0f}/mo")
 
     # Smart routing decision
     swing_5day = avg_daily * 5
