@@ -357,6 +357,357 @@ def scan_etf_options(positions: list, cash_available: float) -> list:
     return sorted(opportunities, key=lambda x: x["score"], reverse=True)
 
 
+# ── The Wheel Strategy ────────────────────────────────────────────────────────
+# Spins continuously: sell put → get assigned → sell call → called away → repeat
+# Uses swing cash + bot bucket profits — never touches trading capital
+
+WHEEL_ETFS = {
+    # Only ETFs we're comfortable owning long term
+    # Sorted by cost to 100 shares (cheapest first = fastest wheel spin)
+    "QYLD":  {"max_cost": 1800, "target_delta": 0.25, "min_yield": 0.01},
+    "RYLD":  {"max_cost": 2000, "target_delta": 0.25, "min_yield": 0.01},
+    "SCHA":  {"max_cost": 2800, "target_delta": 0.25, "min_yield": 0.008},
+    "SCHM":  {"max_cost": 3000, "target_delta": 0.25, "min_yield": 0.008},
+    "SCHB":  {"max_cost": 3100, "target_delta": 0.25, "min_yield": 0.008},
+    "SCHG":  {"max_cost": 3200, "target_delta": 0.25, "min_yield": 0.008},
+    "SCHD":  {"max_cost": 3300, "target_delta": 0.25, "min_yield": 0.008},
+    "JEPI":  {"max_cost": 6500, "target_delta": 0.20, "min_yield": 0.012},
+}
+
+# Wheel phases
+PHASE_PUT  = "put"   # selling cash secured puts
+PHASE_CALL = "call"  # own shares, selling covered calls
+PHASE_NONE = "none"  # not in wheel for this ETF
+
+
+def get_wheel_state() -> dict:
+    """Load wheel state from ledger."""
+    from ledger import load_ledger
+    ledger = load_ledger()
+    return ledger.get("wheel_state", {})
+
+
+def save_wheel_state(state: dict):
+    """Save wheel state to ledger."""
+    from ledger import load_ledger, save_ledger
+    ledger = load_ledger()
+    ledger["wheel_state"] = state
+    save_ledger(ledger)
+
+
+def get_annualized_yield(premium: float, strike: float, dte: int) -> float:
+    """
+    Calculate annualized yield for option.
+    Formula: (premium / strike) × (365 / dte)
+    Higher = better return per dollar at risk.
+    """
+    if strike <= 0 or dte <= 0:
+        return 0
+    return (premium / strike) * (365 / dte)
+
+
+def find_wheel_put(symbol: str, cash_available: float) -> dict | None:
+    """
+    Find best cash secured put for wheel.
+    Uses delta filter (0.20-0.30) and annualized yield scoring.
+    Delta 0.25 = ~25% chance of assignment — sweet spot.
+    """
+    cfg = WHEEL_ETFS.get(symbol)
+    if not cfg:
+        return None
+
+    # Check cash available
+    if cash_available < cfg["max_cost"]:
+        return None
+
+    chain = get_option_chain(symbol, option_type="PUT")
+    if not chain:
+        return None
+
+    underlying = chain.get("underlyingPrice", 0)
+    if underlying <= 0:
+        return None
+
+    put_map = chain.get("putExpDateMap", {})
+    best    = None
+    best_yield = 0
+
+    for expiry, strikes in put_map.items():
+        try:
+            dte = int(expiry.split(":")[1])
+        except Exception:
+            continue
+        if not (21 <= dte <= 45):  # 3-6 weeks out
+            continue
+
+        for strike_str, options in strikes.items():
+            strike = float(strike_str)
+            cash_needed = strike * 100
+            if cash_needed > cash_available:
+                continue
+
+            opt = options[0] if options else None
+            if not opt:
+                continue
+
+            # Delta filter — only 0.15-0.35
+            delta = abs(opt.get("delta", 0) or 0)
+            if not (0.15 <= delta <= 0.35):
+                continue
+
+            bid     = opt.get("bid", 0)
+            ask     = opt.get("ask", 0)
+            premium = (bid + ask) / 2
+
+            if premium < 0.05 or bid <= 0:
+                continue
+
+            oi  = opt.get("openInterest", 0)
+            vol = opt.get("totalVolume", 0)
+            if oi < 50 or vol < 10:  # need liquid options
+                continue
+
+            # Score by annualized yield
+            ann_yield = get_annualized_yield(premium, strike, dte)
+            if ann_yield < cfg["min_yield"]:
+                continue
+
+            if ann_yield > best_yield:
+                best_yield = ann_yield
+                best = {
+                    "type":          "wheel_put",
+                    "symbol":        symbol,
+                    "option_symbol": opt.get("symbol", ""),
+                    "strike":        strike,
+                    "expiry":        expiry.split(":")[0],
+                    "dte":           dte,
+                    "delta":         round(delta, 3),
+                    "bid":           bid,
+                    "ask":           ask,
+                    "premium":       premium,
+                    "total_premium": premium * 100,
+                    "cash_needed":   cash_needed,
+                    "underlying":    underlying,
+                    "ann_yield":     round(ann_yield * 100, 2),
+                    "phase":         PHASE_PUT,
+                }
+    return best
+
+
+def find_wheel_call(symbol: str, shares_owned: int, avg_cost: float) -> dict | None:
+    """
+    Find best covered call for wheel.
+    Strike above avg cost to ensure profit if called away.
+    Delta 0.20-0.30 — collect premium without giving away too much upside.
+    """
+    if shares_owned < 100:
+        return None
+
+    chain = get_option_chain(symbol, option_type="CALL")
+    if not chain:
+        return None
+
+    underlying = chain.get("underlyingPrice", 0)
+    if underlying <= 0:
+        return None
+
+    # Only sell calls above our cost basis
+    min_strike = max(avg_cost * 1.01, underlying * 1.005)
+
+    call_map  = chain.get("callExpDateMap", {})
+    contracts = shares_owned // 100
+    best      = None
+    best_yield = 0
+
+    for expiry, strikes in call_map.items():
+        try:
+            dte = int(expiry.split(":")[1])
+        except Exception:
+            continue
+        if not (21 <= dte <= 45):
+            continue
+
+        for strike_str, options in strikes.items():
+            strike = float(strike_str)
+            if strike < min_strike:
+                continue
+
+            opt = options[0] if options else None
+            if not opt:
+                continue
+
+            delta = abs(opt.get("delta", 0) or 0)
+            if not (0.15 <= delta <= 0.35):
+                continue
+
+            bid     = opt.get("bid", 0)
+            ask     = opt.get("ask", 0)
+            premium = (bid + ask) / 2
+
+            if premium < 0.05 or bid <= 0:
+                continue
+
+            oi  = opt.get("openInterest", 0)
+            vol = opt.get("totalVolume", 0)
+            if oi < 50 or vol < 10:
+                continue
+
+            ann_yield = get_annualized_yield(premium, strike, dte)
+
+            if ann_yield > best_yield:
+                best_yield = ann_yield
+                best = {
+                    "type":          "wheel_call",
+                    "symbol":        symbol,
+                    "option_symbol": opt.get("symbol", ""),
+                    "strike":        strike,
+                    "expiry":        expiry.split(":")[0],
+                    "dte":           dte,
+                    "delta":         round(delta, 3),
+                    "bid":           bid,
+                    "ask":           ask,
+                    "premium":       premium,
+                    "total_premium": premium * 100 * contracts,
+                    "contracts":     contracts,
+                    "underlying":    underlying,
+                    "avg_cost":      avg_cost,
+                    "ann_yield":     round(ann_yield * 100, 2),
+                    "phase":         PHASE_CALL,
+                }
+    return best
+
+
+def check_roll_needed(encrypted: str) -> list:
+    """
+    Check if any wheel options need rolling.
+    Roll when: within 7 days of expiry AND still OTM AND premium available.
+    Rolling captures more premium instead of letting expire worthless.
+    """
+    try:
+        resp = requests.get(
+            f"{TRADER_URL}/accounts/{encrypted}?fields=positions",
+            headers=headers(), timeout=15
+        )
+        resp.raise_for_status()
+        positions = resp.json()["securitiesAccount"].get("positions", [])
+    except Exception:
+        return []
+
+    rolls_needed = []
+    today        = __import__("datetime").datetime.now()
+
+    for pos in positions:
+        inst = pos.get("instrument", {})
+        if inst.get("assetType") != "OPTION":
+            continue
+
+        sym        = inst.get("symbol", "")
+        underlying = inst.get("underlyingSymbol", "")
+        short_qty  = pos.get("shortQuantity", 0)
+
+        if short_qty <= 0 or underlying not in WHEEL_ETFS:
+            continue
+
+        # Parse expiry from option symbol
+        try:
+            # Option symbol format: SYM YYMMDD C/P STRIKE
+            exp_str   = sym[len(underlying):len(underlying)+6]
+            exp_date  = __import__("datetime").datetime.strptime(exp_str, "%y%m%d")
+            days_left = (exp_date - today).days
+        except Exception:
+            continue
+
+        if days_left <= 7:
+            opt_type = "CALL" if "C" in sym[len(underlying)+6:len(underlying)+7] else "PUT"
+            rolls_needed.append({
+                "symbol":     underlying,
+                "opt_symbol": sym,
+                "opt_type":   opt_type,
+                "days_left":  days_left,
+                "short_qty":  int(short_qty),
+            })
+
+    return rolls_needed
+
+
+def run_wheel(encrypted: str, positions: list, cash_available: float):
+    """
+    Main wheel runner — called every strategy check.
+    Determines phase for each ETF and executes appropriate option.
+    Completely separate from day/swing trading.
+    """
+    from ledger import load_ledger, save_ledger
+    from telegram import send_alert
+
+    wheel_state = get_wheel_state()
+    etf_symbols = {p["instrument"]["symbol"] for p in positions
+                   if p["instrument"].get("assetType") == "EQUITY"}
+
+    # Check rolls first
+    rolls = check_roll_needed(encrypted)
+    for roll in rolls:
+        msg = "[ WHEEL ] ROLL NEEDED\n" + roll["symbol"] + " " + roll["opt_type"] + "\n" + str(roll["days_left"]) + "d left"
+        send_alert(msg)
+
+    # Determine phase for each wheel ETF
+    for sym, cfg in WHEEL_ETFS.items():
+        state = wheel_state.get(sym, {"phase": PHASE_NONE})
+
+        # Check current positions
+        shares = 0
+        avg_cost = 0
+        for p in positions:
+            if p["instrument"]["symbol"] == sym:
+                shares   = p.get("longQuantity", 0)
+                avg_cost = p.get("averagePrice", 0)
+                break
+
+        # Update phase based on actual positions
+        if shares >= 100:
+            state["phase"] = PHASE_CALL
+            state["shares"] = shares
+            state["avg_cost"] = avg_cost
+        elif state["phase"] == PHASE_NONE:
+            state["phase"] = PHASE_PUT
+
+        wheel_state[sym] = state
+
+        # Execute based on phase
+        if state["phase"] == PHASE_PUT:
+            # Check if put already open
+            if check_put_already_open(encrypted, sym):
+                continue
+
+            put = find_wheel_put(sym, cash_available)
+            if not put:
+                continue
+
+            try:
+                place_cash_secured_put(encrypted, put["option_symbol"], put["premium"])
+                msg = "[ WHEEL ] PUT " + sym + "\nSTRIKE " + str(put["strike"]) + " delta " + str(put["delta"]) + "\nPREM   $" + f"{put['total_premium']:.2f}" + "\nYIELD  " + str(put["ann_yield"]) + "% ann\nDTE    " + str(put["dte"]) + "d"
+                send_alert(msg)
+            except Exception as ex:
+                print(f"  Wheel put error {sym}: {ex}")
+
+        elif state["phase"] == PHASE_CALL:
+            if check_covered_call_already_open(encrypted, sym):
+                continue
+
+            call = find_wheel_call(sym, int(shares), avg_cost)
+            if not call:
+                continue
+
+            try:
+                place_covered_call(encrypted, call["option_symbol"],
+                                   call["contracts"], call["premium"])
+                msg = "[ WHEEL ] CALL " + sym + "\nSTRIKE " + str(call["strike"]) + " delta " + str(call["delta"]) + "\nPREM   $" + f"{call['total_premium']:.2f}" + "\nYIELD  " + str(call["ann_yield"]) + "% ann\nDTE    " + str(call["dte"]) + "d"
+                send_alert(msg)
+            except Exception as ex:
+                print(f"  Wheel call error {sym}: {ex}")
+
+    save_wheel_state(wheel_state)
+
+
 # ── Cash secured puts ─────────────────────────────────────────────────────────
 
 def find_best_cash_secured_put(symbol: str, current_price: float, cash_available: float) -> dict | None:

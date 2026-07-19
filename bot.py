@@ -19,7 +19,8 @@ from scanner import (
 )
 from options import (
     find_best_covered_call, place_covered_call, check_covered_call_already_open,
-    find_best_cash_secured_put, place_cash_secured_put, check_put_already_open
+    find_best_cash_secured_put, place_cash_secured_put, check_put_already_open,
+    run_wheel
 )
 from dividends import get_recent_dividends
 from telegram import send_alert
