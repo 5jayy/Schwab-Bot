@@ -361,17 +361,23 @@ def scan_etf_options(positions: list, cash_available: float) -> list:
 # Spins continuously: sell put → get assigned → sell call → called away → repeat
 # Uses swing cash + bot bucket profits — never touches trading capital
 
+# $0.65/contract commission — min premium must clear this meaningfully
+# Min $0.20 premium = $20/contract, commission = $0.65 = 3.25% cost (acceptable)
+# Min $0.15 premium = $15/contract, commission = $0.65 = 4.3% cost (borderline)
+COMMISSION_PER_CONTRACT = 0.65
+
 WHEEL_ETFS = {
     # Only ETFs we're comfortable owning long term
     # Sorted by cost to 100 shares (cheapest first = fastest wheel spin)
-    "QYLD":  {"max_cost": 1800, "target_delta": 0.25, "min_yield": 0.01},
-    "RYLD":  {"max_cost": 2000, "target_delta": 0.25, "min_yield": 0.01},
-    "SCHA":  {"max_cost": 2800, "target_delta": 0.25, "min_yield": 0.008},
-    "SCHM":  {"max_cost": 3000, "target_delta": 0.25, "min_yield": 0.008},
-    "SCHB":  {"max_cost": 3100, "target_delta": 0.25, "min_yield": 0.008},
-    "SCHG":  {"max_cost": 3200, "target_delta": 0.25, "min_yield": 0.008},
-    "SCHD":  {"max_cost": 3300, "target_delta": 0.25, "min_yield": 0.008},
-    "JEPI":  {"max_cost": 6500, "target_delta": 0.20, "min_yield": 0.012},
+    # min_premium raised to clear $0.65 commission meaningfully
+    "QYLD":  {"max_cost": 1800, "target_delta": 0.25, "min_yield": 0.012, "min_premium": 0.20},
+    "RYLD":  {"max_cost": 2000, "target_delta": 0.25, "min_yield": 0.012, "min_premium": 0.20},
+    "SCHA":  {"max_cost": 2800, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
+    "SCHM":  {"max_cost": 3000, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
+    "SCHB":  {"max_cost": 3100, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
+    "SCHG":  {"max_cost": 3200, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
+    "SCHD":  {"max_cost": 3300, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.25},
+    "JEPI":  {"max_cost": 6500, "target_delta": 0.20, "min_yield": 0.012, "min_premium": 0.30},
 }
 
 # Wheel phases
@@ -459,16 +465,22 @@ def find_wheel_put(symbol: str, cash_available: float) -> dict | None:
             ask     = opt.get("ask", 0)
             premium = (bid + ask) / 2
 
-            if premium < 0.05 or bid <= 0:
+            min_prem = cfg.get("min_premium", 0.20)
+            if premium < min_prem or bid <= 0:
+                continue
+
+            # Net premium after commission
+            net_premium = premium - (COMMISSION_PER_CONTRACT / 100)
+            if net_premium <= 0:
                 continue
 
             oi  = opt.get("openInterest", 0)
             vol = opt.get("totalVolume", 0)
-            if oi < 50 or vol < 10:  # need liquid options
+            if oi < 50 or vol < 10:
                 continue
 
-            # Score by annualized yield
-            ann_yield = get_annualized_yield(premium, strike, dte)
+            # Score by annualized yield (using net premium after commission)
+            ann_yield = get_annualized_yield(net_premium, strike, dte)
             if ann_yield < cfg["min_yield"]:
                 continue
 
@@ -544,7 +556,14 @@ def find_wheel_call(symbol: str, shares_owned: int, avg_cost: float) -> dict | N
             ask     = opt.get("ask", 0)
             premium = (bid + ask) / 2
 
-            if premium < 0.05 or bid <= 0:
+            cfg2      = WHEEL_ETFS.get(symbol, {})
+            min_prem2 = cfg2.get("min_premium", 0.20)
+            if premium < min_prem2 or bid <= 0:
+                continue
+
+            # Net after commission
+            net_premium2 = premium - (COMMISSION_PER_CONTRACT / 100)
+            if net_premium2 <= 0:
                 continue
 
             oi  = opt.get("openInterest", 0)
@@ -552,7 +571,7 @@ def find_wheel_call(symbol: str, shares_owned: int, avg_cost: float) -> dict | N
             if oi < 50 or vol < 10:
                 continue
 
-            ann_yield = get_annualized_yield(premium, strike, dte)
+            ann_yield = get_annualized_yield(net_premium2, strike, dte)
 
             if ann_yield > best_yield:
                 best_yield = ann_yield
