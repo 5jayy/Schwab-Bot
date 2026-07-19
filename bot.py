@@ -38,6 +38,12 @@ from ledger import (
 
 load_dotenv()
 
+DAY_PCT   = 0.25
+SWING_PCT = 0.75
+MAX_DAY_TRADES_PER_WEEK = 3
+ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.50, "bot": 0.30}
+COMMISSION_PER_CONTRACT = 0.65
+
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
 MARKET_URL        = "https://api.schwabapi.com/marketdata/v1"
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
@@ -45,8 +51,7 @@ CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 # ── Profit splits ─────────────────────────────────────────────────────────────
 STOCK_SPLIT  = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
-OPTIONS_SPLIT     = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
-ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.50, "bot": 0.30}
+OPTIONS_SPLIT = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
 ETF_SPLITS   = {
     "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
     "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
@@ -435,13 +440,11 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
         update_win_rate(profit)
 
         if profit > 0:
-            send_alert(
-                f"💰 Sold {symbol} x{quantity} @ ${price:.2f} | +${profit:,.2f}\n"
-                f"→ ETF ${split['etf_cut']:,.0f} | Cash ${split['cash_cut']:,.0f} | Bot ${split['bot_cut']:,.0f}"
-            )
+            msg_sell = "[ OUT ] " + symbol + " +" + f"{profit:,.2f}" + "\n━━━━━━━━━━━━━━━━━━\nETF    +" + f"{split['etf_cut']:,.2f}" + "\nCASH   +" + f"{split['cash_cut']:,.2f}" + "\nBOT    +" + f"{split['bot_cut']:,.2f}"
+            send_alert(msg_sell)
         else:
             tag = "🛑" if "stop" in reason or "trail" in reason or "breakeven" in reason else "📉"
-            send_alert(f"{tag} Sold {symbol} x{quantity} @ ${price:.2f} | ${profit:,.2f}")
+            send_alert("[ CUT ] " + symbol + " " + f"{profit:,.2f}" + "\n━━━━━━━━━━━━━━━━━━\nPRICE  " + f"{price:.2f}" + "\nEXIT   " + reason.upper())
         print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {reason}")
     except Exception as ex:
         send_alert(f"Sell error {symbol}: {ex}")
@@ -615,13 +618,17 @@ def run_strategy():
                     conv  = get_mtf_conviction(symbol)
                     stars = get_star_rating(stock)
                     record_conviction_count(conv)
-                    send_alert(f"📈 Bought {symbol} x{quantity} @ ${price:.2f} | {conv}/4 | ⭐{stars} | ${cost:,.0f}")
+                    bucket_tag = "DAY" if bucket == "day" else "SWING"
+                    msg_buy  = "[ IN ] " + symbol + " — " + bucket_tag + "\n━━━━━━━━━━━━━━━━━━\n"
+                    msg_buy += "PRICE  " + f"{price:.2f}" + "\nQTY    " + str(quantity) + "\nCONV   " + str(conv) + "/4 S" + str(stars) + "\nCOST   " + f"{cost:,.2f}"
+                    send_alert(msg_buy)
                     print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
                 except Exception as ex:
                     send_alert(f"Buy error {symbol}: {ex}")
 
         # ── Options ──
         run_options(encrypted, positions, cash, stats, capital)
+        run_wheel(encrypted, positions, cash * 0.75 * 0.40)
 
         # ── ETF sweep ──
         run_etf_sweep(encrypted)
@@ -645,140 +652,6 @@ def run_strategy():
 
 
 # ── Options ───────────────────────────────────────────────────────────────────
-
-def run_etf_redirect(encrypted: str, cash: float, capital: float):
-    """
-    When roadmap says ETF options beats swing trading,
-    use a portion of swing capital to buy ETF shares directly.
-    Accelerates roadmap compounding — self-chasing system.
-
-    Only fires when:
-    - Roadmap priority ETF identified
-    - Swing capital has room
-    - ETF not already at 100 shares
-    - Market is open
-    """
-    try:
-        from roadmap import calculate_roadmap, get_priority_etf
-        ledger    = load_ledger()
-        routing   = ledger.get("roadmap_swing_vs_etf", "swing")
-        priority  = ledger.get("roadmap_priority_etf", "SCHB")
-        sweep_spl = ledger.get("roadmap_sweep_split", {priority: 0.70})
-
-        if routing != "etf_options":
-            return  # swing trading wins — don't redirect
-
-        if not priority:
-            return
-
-        # Get current shares of priority ETF
-        accts     = get_account_numbers()
-        encrypted_acc = accts[0]["hashValue"]
-        resp = requests.get(
-            f"{BASE_URL}/accounts/{encrypted_acc}?fields=positions",
-            headers={"Authorization": f"Bearer {get_valid_token()}",
-                     "Content-Type": "application/json"},
-            timeout=15
-        )
-        positions = resp.json()["securitiesAccount"].get("positions", [])
-        current_shares = 0
-        for p in positions:
-            if p["instrument"]["symbol"] == priority:
-                current_shares = p.get("longQuantity", 0)
-                break
-
-        if current_shares >= 100:
-            print(f"  {priority}: already at 100 shares — roadmap redirecting to next ETF")
-            ledger["roadmap_priority_etf"] = None  # trigger recalculate
-            save_ledger(ledger)
-            return
-
-        # Use 15% of swing capital for ETF redirect
-        redirect_amount = capital * SWING_PCT * 0.15
-        redirect_amount = min(redirect_amount, cash * 0.20)  # max 20% of available cash
-
-        if redirect_amount < 50:
-            return  # not enough to matter
-
-        # Get ETF price
-        quote_resp = requests.get(
-            f"https://api.schwabapi.com/marketdata/v1/quotes/{priority}",
-            headers={"Authorization": f"Bearer {get_valid_token()}"},
-            timeout=10
-        )
-        if not quote_resp.ok:
-            return
-
-        price = quote_resp.json().get(priority, {}).get("quote", {}).get("lastPrice", 0)
-        if price <= 0:
-            return
-
-        shares_to_buy = int(redirect_amount // price)
-        if shares_to_buy < 1:
-            return
-
-        # Check if buying would exceed 100 shares
-        shares_to_buy = min(shares_to_buy, int(100 - current_shares))
-        if shares_to_buy < 1:
-            return
-
-        cost = shares_to_buy * price
-
-        # Place order
-        resp = place_equity_order(encrypted, priority, shares_to_buy, "BUY")
-        if resp and resp.headers.get("Location"):
-            print(f"  ETF redirect: bought {shares_to_buy} {priority} @ ${price:.2f} = ${cost:.2f}")
-            new_shares = int(current_shares + shares_to_buy)
-            days_left  = int((100 - new_shares) * price / max(capital * 0.60 * 0.70 / 30, 1))
-            msg  = "[ CIRCUIT ] ETF REDIRECT\n"
-            msg += priority + " x" + str(shares_to_buy) + " @ $" + f"{price:.2f}" + "\n"
-            msg += "ROADMAP: " + str(new_shares) + "/100 shares\n"
-            msg += "NEXT: covered call in ~" + str(days_left) + "d"
-            send_alert(msg)
-
-    except Exception as ex:
-        print(f"ETF redirect error: {ex}")
-
-
-def run_etf_options(encrypted: str, positions: list, cash: float):
-    """Scan ETF options. Profits: 20% ETF / 50% cash / 30% bot."""
-    try:
-        from options import scan_etf_options, place_covered_call, place_cash_secured_put
-        from options import check_covered_call_already_open, check_put_already_open
-    except ImportError:
-        return
-
-    opps = scan_etf_options(positions, cash)
-    if not opps:
-        return
-
-    print(f"-- ETF options | {len(opps)} opps --")
-
-    for opp in opps[:2]:
-        sym   = opp["symbol"]
-        typ   = opp["type"]
-        prem  = opp["premium"]
-        total = opp["total_premium"]
-        try:
-            if typ == "etf_covered_call":
-                if check_covered_call_already_open(encrypted, sym):
-                    continue
-                place_covered_call(encrypted, opp["option_symbol"], opp["contracts"], prem)
-                send_alert("[ IN ] " + sym + " ETF CALL\nSTRIKE " + str(opp["strike"]) + "\nPREM   " + f"{prem:.2f}" + "\nTOTAL  " + f"{total:.2f}" + "\nSPLIT  ETF20 CASH50 BOT30")
-            elif typ == "etf_put":
-                if check_put_already_open(encrypted, sym):
-                    continue
-                place_cash_secured_put(encrypted, opp["option_symbol"], prem)
-                send_alert("[ IN ] " + sym + " ETF PUT\nSTRIKE " + str(opp["strike"]) + "\nPREM   " + f"{prem:.2f}" + "\nTOTAL  " + f"{total:.2f}" + "\nSPLIT  ETF20 CASH50 BOT30")
-
-            ledger = load_ledger()
-            ledger["etf_bucket"]  = ledger.get("etf_bucket", 0)  + total * ETF_OPTIONS_SPLIT["etf"]
-            ledger["cash_bucket"] = ledger.get("cash_bucket", 0) + total * ETF_OPTIONS_SPLIT["cash"]
-            ledger["bot_bucket"]  = ledger.get("bot_bucket", 0)  + total * ETF_OPTIONS_SPLIT["bot"]
-            save_ledger(ledger)
-        except Exception as ex:
-            print(f"  ETF options error {sym}: {ex}")
-
 
 def run_options(encrypted: str, positions: list, cash: float, stats: dict, capital: float):
     # Options daily cap check — 1% of bot capital
@@ -1008,6 +881,68 @@ def check_balance_24_7():
 _last_run = 0
 
 
+
+_last_update_id = 0
+
+def poll_telegram_commands():
+    global _last_update_id
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat  = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates", params={"offset": _last_update_id + 1, "timeout": 5}, timeout=10)
+        if not resp.ok:
+            return
+        for update in resp.json().get("result", []):
+            _last_update_id = update["update_id"]
+            msg  = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            uid  = str(msg.get("chat", {}).get("id", ""))
+            if uid != str(chat):
+                continue
+            if text == "/pause":
+                ledger = load_ledger(); ledger["bot_paused"] = True; save_ledger(ledger)
+                send_alert("[ CIRCUIT ] PAUSED\nTrading stopped\nPositions held")
+            elif text == "/resume":
+                ledger = load_ledger(); ledger["bot_paused"] = False; save_ledger(ledger)
+                send_alert("[ CIRCUIT ] RESUMED\nTrading active")
+            elif text == "/status":
+                ledger  = load_ledger()
+                capital = ledger.get("trading_capital", 0)
+                cash_b  = ledger.get("cash_bucket", 0)
+                etf_b   = ledger.get("etf_bucket", 0)
+                pdt     = ledger.get("day_trades_this_week", 0)
+                open_t  = list(ledger.get("open_trades", {}).keys())
+                state   = "PAUSED" if ledger.get("bot_paused") else "LIVE"
+                parts   = ["[ CIRCUIT ] STATUS", "STATE  " + state, "CAP    " + f"{capital:,.2f}", "DAY    " + f"{capital*DAY_PCT:,.2f}", "SWING  " + f"{capital*SWING_PCT:,.2f}", "ETF    " + f"{etf_b:,.2f}", "CASH   " + f"{cash_b:,.2f}", "PDT    " + str(pdt) + "/3", "OPEN   " + (", ".join(open_t) if open_t else "none")]
+                send_alert("\n".join(parts))
+            elif text == "/backtest":
+                send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
+                import threading
+                def _run():
+                    from backtest import run_backtest
+                    from ledger import get_trading_capital as _gtc
+                    run_backtest(days=14, bot_capital=_gtc())
+                threading.Thread(target=_run, daemon=True).start()
+            elif text == "/tax":
+                try:
+                    from tax import get_tax_report
+                    r = get_tax_report()
+                    parts = ["[ CIRCUIT ] TAX " + str(r["year"]), "ST GAINS  " + f"{r['short_term_gains']:,.2f}", "LT GAINS  " + f"{r['long_term_gains']:,.2f}", "TAX OWED  " + f"{r['total_tax_owed']:,.2f}"]
+                    send_alert("\n".join(parts))
+                except Exception as ex:
+                    send_alert("Tax error: " + str(ex))
+            elif text == "/roadmap":
+                try:
+                    from roadmap import send_roadmap_alert
+                    accts = requests.get("https://api.schwabapi.com/trader/v1/accounts/accountNumbers", headers={"Authorization": f"Bearer {get_valid_token()}"}).json()
+                    send_roadmap_alert(accts[0]["hashValue"])
+                except Exception as ex:
+                    send_alert("Roadmap error: " + str(ex))
+    except Exception as ex:
+        print(f"Command poll error: {ex}")
+
 def run_strategy_safe():
     global _last_run
     if time.time() - _last_run < 60:
@@ -1043,7 +978,7 @@ def main():
 
         pulse    = get_market_pulse() if is_market_open() else ""
         hold_str = f" | 🔒 ${on_hold:,.0f}" if on_hold > 0 else ""
-        msg = f"✅ Bot online | 💵 ${cash_ready:,.0f} ready{hold_str} | 24h ${p24h:,.0f}"
+        msg = "[ CIRCUIT ] LIVE\n━━━━━━━━━━━━━━━━━━\n" + "CAP    " + f"{capital:,.2f}" + "\nDAY    " + f"{capital*DAY_PCT:,.2f}" + "\nSWING  " + f"{capital*SWING_PCT:,.2f}" + "\nCASH   " + f"{cash_ready:,.2f}"
         if pulse:
             msg += f"\n{pulse}"
         send_alert(msg)
@@ -1055,6 +990,7 @@ def main():
         run_strategy_safe()
 
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
+    schedule.every(1).minutes.do(poll_telegram_commands)
     schedule.every(5).minutes.do(check_balance_24_7)
     # Daily summary at 4 PM ET
     schedule.every().day.at("16:00").do(send_daily_summary)
