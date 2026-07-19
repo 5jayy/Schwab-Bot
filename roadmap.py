@@ -446,14 +446,26 @@ def calculate_roadmap(encrypted: str) -> dict:
     for g in all_goals[:6]:
         print(f"  {g['symbol']}: roi={g['roi_score']:.3f} cost=${g['cost_needed']:,.0f} prem=${g['full_potential']:.0f}/mo")
 
-    # Smart routing decision
-    swing_5day = avg_daily * 5
-    if total_premium_unlocked > swing_5day:
+    # Smart routing decision — compare ACTUAL premium vs opportunity cost
+    # Opportunity cost = 15% swing capital x avg daily rate
+    swing_capital      = capital * 0.75
+    redirect_amount    = swing_capital * 0.15
+    opportunity_cost   = (redirect_amount / max(capital, 1)) * avg_daily  # daily opportunity cost
+
+    # Only redirect if actual unlocked premium covers opportunity cost
+    actual_daily_prem  = total_premium_now / 30  # actual monthly premium / 30 days
+    redirect_worthwhile = actual_daily_prem > opportunity_cost
+
+    if redirect_worthwhile:
         roadmap["swing_vs_etf"]     = "etf_options"
-        roadmap["routing_decision"] = f"ETF options ${total_premium_unlocked:.0f}/mo beats 5 swing days ${swing_5day:.0f}"
+        roadmap["routing_decision"] = f"Actual premium ${actual_daily_prem:.2f}/day > opp cost ${opportunity_cost:.2f}/day — redirect ON"
     else:
         roadmap["swing_vs_etf"]     = "swing"
-        roadmap["routing_decision"] = f"Swing ${avg_daily:.0f}/day beats ETF options ${total_premium_unlocked:.0f}/mo for now"
+        roadmap["routing_decision"] = f"Swing wins — actual premium ${actual_daily_prem:.2f}/day < opp cost ${opportunity_cost:.2f}/day"
+
+    roadmap["actual_daily_prem"]   = round(actual_daily_prem, 2)
+    roadmap["opportunity_cost"]    = round(opportunity_cost, 2)
+    roadmap["redirect_worthwhile"] = redirect_worthwhile
 
     # Save to ledger
     ledger["roadmap_priority_etf"] = roadmap["priority_etf"]
@@ -663,6 +675,191 @@ def send_upgrade_alert(upgrades: list):
         parts.append("BUY   " + u["buy_symbol"] + " x" + str(u["shares_can_buy"]))
         parts.append("PREM  $" + f"{u['old_premium']:.0f}" + " to $" + f"{u['new_premium']:.0f}" + "/mo (+" + f"{u['improvement']:.0f}" + "%)")
     send_alert("\n".join(parts))
+
+
+# ── Roadmap Brain — influences all bot decisions ─────────────────────────────
+
+def get_brain_state(encrypted: str = None) -> dict:
+    """
+    Returns current brain state for bot to use in every decision.
+    Called by bot.py before every strategy check.
+    """
+    ledger  = load_ledger()
+    capital = ledger.get("trading_capital", 2220)
+
+    # Tier progress
+    tiers = [
+        {"name": "Tier 1", "threshold": 0,     "ceiling": 200},
+        {"name": "Tier 2", "threshold": 5000,  "ceiling": 400},
+        {"name": "Tier 3", "threshold": 15000, "ceiling": 600},
+        {"name": "Tier 4", "threshold": 50000, "ceiling": 1000},
+    ]
+    current_tier  = tiers[0]
+    next_tier     = tiers[1]
+    for i, t in enumerate(tiers):
+        if capital >= t["threshold"]:
+            current_tier = t
+            next_tier    = tiers[i+1] if i+1 < len(tiers) else t
+
+    tier_gap     = next_tier["threshold"] - capital
+    tier_pct     = min(capital / max(next_tier["threshold"], 1) * 100, 100)
+    near_upgrade = tier_gap < capital * 0.20  # within 20% of next tier
+
+    # ETF unlock progress
+    priority_etf   = ledger.get("roadmap_priority_etf", "SCHB")
+    sweep_split    = ledger.get("roadmap_sweep_split", {priority_etf: 0.70})
+    redirect_on    = ledger.get("roadmap_swing_vs_etf", "swing") == "etf_options"
+
+    # Daily P&L history
+    daily_history  = ledger.get("daily_pnl_history", [])
+    avg_daily      = sum(daily_history) / len(daily_history) if daily_history else 79.98
+    today_pnl      = ledger.get("daily_profit", 0)
+    losing_today   = today_pnl < -50
+
+    # Weekly P&L
+    weekly_history = ledger.get("weekly_pnl_history", [])
+    avg_weekly     = sum(weekly_history) / len(weekly_history) if weekly_history else avg_daily * 5
+
+    # ETF bucket proximity to sweep threshold
+    etf_bucket     = ledger.get("etf_bucket", 0)
+    near_sweep     = etf_bucket >= 30  # close to $50 threshold
+
+    # Profit split adjustment based on roadmap
+    # Near tier upgrade → push more to bot bucket
+    # Near ETF unlock → push more to ETF bucket
+    if near_upgrade:
+        profit_split = {"etf": 0.50, "cash": 0.25, "bot": 0.25}  # more to bot
+        split_reason = "near_tier_upgrade"
+    elif near_sweep:
+        profit_split = {"etf": 0.70, "cash": 0.20, "bot": 0.10}  # more to ETF
+        split_reason = "near_etf_sweep"
+    else:
+        profit_split = {"etf": 0.60, "cash": 0.30, "bot": 0.10}  # normal
+        split_reason = "normal"
+
+    # Position sizing adjustment
+    # Losing today → conservative (80% of normal)
+    # Near tier upgrade → aggressive (110% of normal)
+    if losing_today:
+        size_mult = 0.80
+        size_reason = "losing_today_conservative"
+    elif near_upgrade:
+        size_mult = 1.10
+        size_reason = "near_upgrade_aggressive"
+    else:
+        size_mult = 1.00
+        size_reason = "normal"
+
+    # ETF sweep threshold adjustment
+    # Within 10 shares of unlock → lower threshold to $30
+    sweep_threshold = 30 if near_sweep else 50
+
+    return {
+        "capital":         round(capital, 2),
+        "current_tier":    current_tier["name"],
+        "next_tier":       next_tier["name"],
+        "tier_gap":        round(tier_gap, 2),
+        "tier_pct":        round(tier_pct, 1),
+        "near_upgrade":    near_upgrade,
+        "priority_etf":    priority_etf,
+        "sweep_split":     sweep_split,
+        "redirect_on":     redirect_on,
+        "avg_daily":       round(avg_daily, 2),
+        "today_pnl":       round(today_pnl, 2),
+        "losing_today":    losing_today,
+        "profit_split":    profit_split,
+        "split_reason":    split_reason,
+        "size_mult":       size_mult,
+        "size_reason":     size_reason,
+        "sweep_threshold": sweep_threshold,
+        "etf_bucket":      round(etf_bucket, 2),
+    }
+
+
+def check_milestones(brain: dict) -> list:
+    """
+    Check if any milestones were just hit.
+    Returns list of milestone alerts to send.
+    """
+    ledger     = load_ledger()
+    milestones = []
+    seen       = set(ledger.get("seen_milestones", []))
+
+    capital = brain["capital"]
+
+    # Tier milestones
+    tier_thresholds = {
+        "tier2_unlock": (5000,  "TIER 2 UNLOCKED
+Ceiling $400 | Day $1,350 | Swing $4,050"),
+        "tier3_unlock": (15000, "TIER 3 UNLOCKED
+Ceiling $600 | Day $3,750 | Swing $11,250"),
+        "tier4_unlock": (50000, "TIER 4 UNLOCKED
+Ceiling $1,000 | Income phase begins"),
+    }
+    for key, (threshold, msg) in tier_thresholds.items():
+        if capital >= threshold and key not in seen:
+            milestones.append(("[ CIRCUIT ] MILESTONE
+" + msg, key))
+
+    # Capital milestones
+    cap_milestones = {
+        "cap_3k":  (3000,  "Capital hit $3,000"),
+        "cap_4k":  (4000,  "Capital hit $4,000"),
+        "cap_5k":  (5000,  "Capital hit $5,000"),
+        "cap_10k": (10000, "Capital hit $10,000"),
+        "cap_15k": (15000, "Capital hit $15,000"),
+    }
+    for key, (threshold, msg) in cap_milestones.items():
+        if capital >= threshold and key not in seen:
+            milestones.append(("[ CIRCUIT ] MILESTONE
+" + msg + "
+" + "ETA Tier 2: " + str(int((5000-capital)/max(brain['avg_daily'],1))) + "d", key))
+
+    # Mark seen
+    if milestones:
+        new_seen = list(seen) + [m[1] for m in milestones]
+        ledger["seen_milestones"] = new_seen
+        save_ledger(ledger)
+
+    return milestones
+
+
+def send_weekly_report(brain: dict):
+    """Weekly P&L + tier progress report. Called every Sunday."""
+    ledger       = load_ledger()
+    capital      = brain["capital"]
+    avg_daily    = brain["avg_daily"]
+    tier_gap     = brain["tier_gap"]
+    next_tier    = brain["next_tier"]
+    days_to_tier = int(tier_gap / max(avg_daily, 1))
+
+    # Weekly P&L
+    daily_history = ledger.get("daily_pnl_history", [])
+    week_pnl      = sum(daily_history[-5:]) if len(daily_history) >= 5 else sum(daily_history)
+
+    # ETF progress
+    priority     = brain["priority_etf"]
+    etf_pct      = 0
+    etf_cfg      = ETF_ROADMAP.get(priority, {})
+
+    parts = [
+        "[ CIRCUIT ] WEEKLY",
+        "P&L    $" + f"{week_pnl:+,.2f}" + " this week",
+        "DAILY  $" + f"{avg_daily:.2f}" + " avg",
+        "CAP    $" + f"{capital:,.2f}",
+        f"{next_tier} gap: $" + f"{tier_gap:,.0f}" + " — " + str(days_to_tier) + "d",
+        "NEXT ETF: " + priority,
+    ]
+    send_alert("\n".join(parts))
+
+
+def record_weekly_pnl(weekly_pnl: float):
+    """Record weekly P&L for trend tracking."""
+    ledger = load_ledger()
+    history = ledger.get("weekly_pnl_history", [])
+    history.append(weekly_pnl)
+    ledger["weekly_pnl_history"] = history[-12:]  # keep 12 weeks
+    save_ledger(ledger)
 
 
 if __name__ == "__main__":
