@@ -789,17 +789,13 @@ def check_milestones(brain: dict) -> list:
 
     # Tier milestones
     tier_thresholds = {
-        "tier2_unlock": (5000,  "TIER 2 UNLOCKED
-Ceiling $400 | Day $1,350 | Swing $4,050"),
-        "tier3_unlock": (15000, "TIER 3 UNLOCKED
-Ceiling $600 | Day $3,750 | Swing $11,250"),
-        "tier4_unlock": (50000, "TIER 4 UNLOCKED
-Ceiling $1,000 | Income phase begins"),
+        "tier2_unlock": (5000,  "TIER 2 UNLOCKED\nCeiling $400 | Day $1,350 | Swing $4,050"),
+        "tier3_unlock": (15000, "TIER 3 UNLOCKED\nCeiling $600 | Day $3,750 | Swing $11,250"),
+        "tier4_unlock": (50000, "TIER 4 UNLOCKED\nIncome phase begins"),
     }
     for key, (threshold, msg) in tier_thresholds.items():
         if capital >= threshold and key not in seen:
-            milestones.append(("[ CIRCUIT ] MILESTONE
-" + msg, key))
+            milestones.append(("[ CIRCUIT ] MILESTONE\n" + msg + "\nETA Tier 2: " + str(int((5000-capital)/max(brain["avg_daily"],1))) + "d", key))
 
     # Capital milestones
     cap_milestones = {
@@ -811,9 +807,7 @@ Ceiling $1,000 | Income phase begins"),
     }
     for key, (threshold, msg) in cap_milestones.items():
         if capital >= threshold and key not in seen:
-            milestones.append(("[ CIRCUIT ] MILESTONE
-" + msg + "
-" + "ETA Tier 2: " + str(int((5000-capital)/max(brain['avg_daily'],1))) + "d", key))
+            milestones.append(("[ CIRCUIT ] MILESTONE\n" + msg + "\nETA Tier 2: " + str(int((5000-capital)/max(brain["avg_daily"],1))) + "d", key))
 
     # Mark seen
     if milestones:
