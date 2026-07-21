@@ -629,6 +629,7 @@ def run_strategy():
         # ── Options ──
         run_options(encrypted, positions, cash, stats, capital)
         run_wheel(encrypted, positions, cash * 0.75 * 0.40)
+        run_sgov_parking(encrypted, cash, capital)
 
         # ── ETF sweep ──
         run_etf_sweep(encrypted)
@@ -652,6 +653,52 @@ def run_strategy():
 
 
 # ── Options ───────────────────────────────────────────────────────────────────
+
+def run_sgov_parking(encrypted: str, cash: float, capital: float):
+    """Smart SGOV parking — only when mathematically worth it."""
+    try:
+        ledger    = load_ledger()
+        tax_owed  = ledger.get("ytd_tax_owed", 0)
+        etf_b     = ledger.get("etf_bucket", 0)
+        bot_b     = ledger.get("bot_bucket", 0)
+        last_sweep = ledger.get("last_etf_sweep_date", "")
+        idle_days = 0
+        if last_sweep:
+            try:
+                from datetime import datetime as _dt
+                last = _dt.strptime(last_sweep[:10], "%Y-%m-%d")
+                idle_days = (_dt.now() - last).days
+            except Exception:
+                pass
+        tax_park = min(tax_owed, cash * 0.30) if tax_owed > 100 else 0
+        etf_park = etf_b if (etf_b < 50 and idle_days >= 7) else 0
+        bot_park = max(bot_b - 200, 0) if bot_b > 300 else 0
+        total_park = tax_park + etf_park + bot_park
+        if total_park < 100:
+            return
+        resp = requests.get(
+            "https://api.schwabapi.com/marketdata/v1/quotes/SGOV",
+            headers={"Authorization": f"Bearer {get_valid_token()}"}, timeout=10
+        )
+        if not resp.ok:
+            return
+        sgov_price = resp.json().get("SGOV", {}).get("quote", {}).get("lastPrice", 0)
+        if sgov_price <= 0:
+            return
+        shares = int(total_park // sgov_price)
+        if shares < 1:
+            return
+        cost = shares * sgov_price
+        order_resp = place_equity_order(encrypted, "SGOV", shares, "BUY")
+        if order_resp and order_resp.headers.get("Location"):
+            msg = "[ CIRCUIT ] SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_price:.2f}" + "\nCOST $" + f"{cost:.2f}" + "\nYIELD ~5%/yr"
+            if tax_park > 0: msg += "\nTAX RESERVE $" + f"{tax_park:.2f}"
+            if etf_park > 0: msg += "\nETF IDLE    $" + f"{etf_park:.2f}"
+            if bot_park > 0: msg += "\nBOT EXCESS  $" + f"{bot_park:.2f}"
+            send_alert(msg)
+    except Exception as ex:
+        print(f"SGOV parking error: {ex}")
+
 
 def run_options(encrypted: str, positions: list, cash: float, stats: dict, capital: float):
     # Options daily cap check — 1% of bot capital
@@ -940,6 +987,24 @@ def poll_telegram_commands():
                     send_roadmap_alert(accts[0]["hashValue"])
                 except Exception as ex:
                     send_alert("Roadmap error: " + str(ex))
+
+            elif text == "/help":
+                msg  = "[ CIRCUIT ] COMMANDS\n"
+                msg += "━━━━━━━━━━━━━━━━━━\n"
+                msg += "/status   — capital, buckets, positions\n"
+                msg += "/pause    — stop trading, hold positions\n"
+                msg += "/resume   — restart trading\n"
+                msg += "/roadmap  — ETF options path + brain state\n"
+                msg += "/backtest — run 14d backtest\n"
+                msg += "/tax      — YTD tax report + ETF exit plan\n"
+                msg += "━━━━━━━━━━━━━━━━━━\n"
+                msg += "Schedules (ET):\n"
+                msg += "7:30 AM  — pre-market brief\n"
+                msg += "4:05 PM  — session summary\n"
+                msg += "4:30 PM  — backtest results\n"
+                msg += "5:00 PM  — EOD summary\n"
+                msg += "Sunday 8 AM — weekly report"
+                send_alert(msg)
     except Exception as ex:
         print(f"Command poll error: {ex}")
 
@@ -994,6 +1059,29 @@ def main():
     schedule.every(5).minutes.do(check_balance_24_7)
     # Daily summary at 4 PM ET
     schedule.every().day.at("16:00").do(send_daily_summary)
+
+    def run_post_session_backtest():
+        et  = pytz.timezone("America/New_York")
+        now = datetime.now(et)
+        if now.weekday() < 5:
+            ledger_bt = load_ledger()
+            last_bt   = ledger_bt.get("last_backtest_date", "")
+            try:
+                from datetime import datetime as _dt2
+                last_dt   = _dt2.strptime(last_bt[:10], "%Y-%m-%d") if last_bt else _dt2(2000,1,1)
+                days_since = (_dt2.now() - last_dt).days
+            except Exception:
+                days_since = 99
+            if days_since >= 3:
+                try:
+                    from backtest import run_backtest
+                    run_backtest(days=14, bot_capital=get_trading_capital())
+                    ledger_bt["last_backtest_date"] = now.strftime("%Y-%m-%d")
+                    save_ledger(ledger_bt)
+                except Exception as ex:
+                    print(f"Backtest error: {ex}")
+
+    schedule.every().day.at("20:30").do(run_post_session_backtest)
 
     while True:
         schedule.run_pending()
