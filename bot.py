@@ -330,9 +330,10 @@ def can_trade(capital: float, stats: dict, _unused: int = 0) -> tuple:
     if stats["consecutive_losses"] >= 2:
         return False, "cooldown_2_losses"
 
-    # Win rate gate
+    # Win rate gate — only applies after 10+ trades
     wr = get_win_rate()
-    if wr < 0.40:
+    wr_hist = load_ledger().get("win_rate_history", [])
+    if len(wr_hist) >= 10 and wr < 0.40:
         return False, f"win_rate_{wr:.0%}"
 
     # Stock daily loss limit — 2% of bot capital
@@ -444,7 +445,7 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
             send_alert(msg_sell)
         else:
             tag = "🛑" if "stop" in reason or "trail" in reason or "breakeven" in reason else "📉"
-            send_alert("[ CUT ] " + symbol + " " + f"{profit:,.2f}" + "\n━━━━━━━━━━━━━━━━━━\nPRICE  " + f"{price:.2f}" + "\nEXIT   " + reason.upper())
+            send_alert("[ CUT ] " + symbol + " " + f"{profit:,.2f}" + "\n━━━━━━━━━━━━━━━━━━\nEXIT   " + reason.upper())
         print(f"  Sold {quantity} {symbol} @ ${price:.2f} | P&L ${profit:+,.2f} | {reason}")
     except Exception as ex:
         send_alert(f"Sell error {symbol}: {ex}")
@@ -536,6 +537,39 @@ def run_strategy():
             trail_info = get_trailing_stop_info(sym)
             trigger    = None
 
+            # ── TP1 / TP2 scale-out ──
+            if trail_info and not trigger:
+                buy_px  = trail_info["buy_price"]
+                tp1_pct = trail_info.get("tp1_pct", 0.07)
+                tp2_pct = trail_info.get("tp2_pct", 0.10)
+                tp1_hit = trail_info.get("tp1_hit", False)
+                tp2_hit = trail_info.get("tp2_hit", False)
+                tp1_px  = buy_px * (1 + tp1_pct)
+                tp2_px  = buy_px * (1 + tp2_pct)
+                if not tp1_hit and price >= tp1_px:
+                    tp1_qty = max(1, qty // 3)
+                    execute_sell(encrypted, sym, tp1_qty, price, cash, "tp1")
+                    from ledger import load_ledger as _ll, save_ledger as _sl
+                    _ld = _ll()
+                    if sym in _ld.get("open_trades", {}):
+                        _ld["open_trades"][sym]["tp1_hit"] = True
+                        _ld["open_trades"][sym]["quantity"] = max(0, qty - tp1_qty)
+                        _sl(_ld)
+                    send_alert("[ TP1 ] " + sym + " 1/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "%")
+                    continue
+                elif tp1_hit and not tp2_hit and price >= tp2_px:
+                    tp2_qty = max(1, qty // 3)
+                    execute_sell(encrypted, sym, tp2_qty, price, cash, "tp2")
+                    from ledger import load_ledger as _ll2, save_ledger as _sl2
+                    _ld2 = _ll2()
+                    if sym in _ld2.get("open_trades", {}):
+                        _ld2["open_trades"][sym]["tp2_hit"] = True
+                        _ld2["open_trades"][sym]["quantity"] = max(0, qty - tp2_qty)
+                        _sl2(_ld2)
+                    send_alert("[ TP2 ] " + sym + " 2/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "%")
+                    continue
+
+
             # Signal sell handled by dynamic stop and delta trail below
 
             if not trigger and trail_info:
@@ -582,15 +616,20 @@ def run_strategy():
                 if price > cash:
                     continue
 
-                ok, reason = can_trade(capital, stats, 5)
+                ok, reason = can_trade(capital, stats)
                 if not ok:
                     print(f"  {symbol}: skip — {reason}")
                     continue
 
                 # MTF conviction sizing
-                position_size = get_mtf_position_size(symbol, ceiling)
+                # Conviction-based sizing
+                from scanner import get_mtf_conviction as _gmc
+                _conv = _gmc(symbol)
+                if _conv >= 4:   position_size = ceiling
+                elif _conv >= 3: position_size = ceiling * 0.70
+                else:            position_size = 0
                 if position_size == 0:
-                    print(f"  {symbol}: skip — MTF conviction too low")
+                    print(f"  {symbol}: skip — conviction {_conv}/4 too low")
                     continue
                 position_size = green_day_scale(position_size, stats)
                 position_size = min(position_size, cash)
@@ -618,8 +657,7 @@ def run_strategy():
                     conv  = get_mtf_conviction(symbol)
                     stars = get_star_rating(stock)
                     record_conviction_count(conv)
-                    bucket_tag = "DAY" if bucket == "day" else "SWING"
-                    msg_buy  = "[ IN ] " + symbol + " — " + bucket_tag + "\n━━━━━━━━━━━━━━━━━━\n"
+                    msg_buy  = "[ IN ] " + symbol + "\n━━━━━━━━━━━━━━━━━━\n"
                     msg_buy += "PRICE  " + f"{price:.2f}" + "\nQTY    " + str(quantity) + "\nCONV   " + str(conv) + "/4 S" + str(stars) + "\nCOST   " + f"{cost:,.2f}"
                     send_alert(msg_buy)
                     print(f"  Bought {quantity} {symbol} @ ${price:.2f} | star={star}")
@@ -628,7 +666,7 @@ def run_strategy():
 
         # ── Options ──
         run_options(encrypted, positions, cash, stats, capital)
-        run_wheel(encrypted, positions, cash * 0.75 * 0.40)
+        run_wheel(encrypted, positions, cash * 0.40)
         run_sgov_parking(encrypted, cash, capital)
 
         # ── ETF sweep ──
@@ -654,8 +692,9 @@ def run_strategy():
 
 # ── Options ───────────────────────────────────────────────────────────────────
 
+
 def run_sgov_parking(encrypted: str, cash: float, capital: float):
-    """Smart SGOV parking — only when mathematically worth it."""
+    """Smart SGOV parking — tax reserve, idle ETF bucket, bot excess."""
     try:
         ledger    = load_ledger()
         tax_owed  = ledger.get("ytd_tax_owed", 0)
@@ -666,15 +705,14 @@ def run_sgov_parking(encrypted: str, cash: float, capital: float):
         if last_sweep:
             try:
                 from datetime import datetime as _dt
-                last = _dt.strptime(last_sweep[:10], "%Y-%m-%d")
-                idle_days = (_dt.now() - last).days
+                idle_days = (_dt.now() - _dt.strptime(last_sweep[:10], "%Y-%m-%d")).days
             except Exception:
                 pass
         tax_park = min(tax_owed, cash * 0.30) if tax_owed > 100 else 0
         etf_park = etf_b if (etf_b < 50 and idle_days >= 7) else 0
         bot_park = max(bot_b - 200, 0) if bot_b > 300 else 0
-        total_park = tax_park + etf_park + bot_park
-        if total_park < 100:
+        total    = tax_park + etf_park + bot_park
+        if total < 100:
             return
         resp = requests.get(
             "https://api.schwabapi.com/marketdata/v1/quotes/SGOV",
@@ -682,23 +720,17 @@ def run_sgov_parking(encrypted: str, cash: float, capital: float):
         )
         if not resp.ok:
             return
-        sgov_price = resp.json().get("SGOV", {}).get("quote", {}).get("lastPrice", 0)
-        if sgov_price <= 0:
+        sgov_px = resp.json().get("SGOV", {}).get("quote", {}).get("lastPrice", 0)
+        if sgov_px <= 0:
             return
-        shares = int(total_park // sgov_price)
+        shares = int(total // sgov_px)
         if shares < 1:
             return
-        cost = shares * sgov_price
-        order_resp = place_equity_order(encrypted, "SGOV", shares, "BUY")
-        if order_resp and order_resp.headers.get("Location"):
-            msg = "[ CIRCUIT ] SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_price:.2f}" + "\nCOST $" + f"{cost:.2f}" + "\nYIELD ~5%/yr"
-            if tax_park > 0: msg += "\nTAX RESERVE $" + f"{tax_park:.2f}"
-            if etf_park > 0: msg += "\nETF IDLE    $" + f"{etf_park:.2f}"
-            if bot_park > 0: msg += "\nBOT EXCESS  $" + f"{bot_park:.2f}"
-            send_alert(msg)
+        r = place_equity_order(encrypted, "SGOV", shares, "BUY")
+        if r and r.headers.get("Location"):
+            send_alert("[ CIRCUIT ] SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_px:.2f}" + "\nYIELD ~5%/yr")
     except Exception as ex:
-        print(f"SGOV parking error: {ex}")
-
+        print(f"SGOV error: {ex}")
 
 def run_options(encrypted: str, positions: list, cash: float, stats: dict, capital: float):
     # Options daily cap check — 1% of bot capital
@@ -938,7 +970,10 @@ def poll_telegram_commands():
     if not token or not chat:
         return
     try:
-        resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates", params={"offset": _last_update_id + 1, "timeout": 5}, timeout=10)
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": _last_update_id + 1, "timeout": 5}, timeout=10
+        )
         if not resp.ok:
             return
         for update in resp.json().get("result", []):
@@ -948,21 +983,35 @@ def poll_telegram_commands():
             uid  = str(msg.get("chat", {}).get("id", ""))
             if uid != str(chat):
                 continue
+            ledger = load_ledger()
             if text == "/pause":
-                ledger = load_ledger(); ledger["bot_paused"] = True; save_ledger(ledger)
+                ledger["bot_paused"] = True
+                save_ledger(ledger)
                 send_alert("[ CIRCUIT ] PAUSED\nTrading stopped\nPositions held")
             elif text == "/resume":
-                ledger = load_ledger(); ledger["bot_paused"] = False; save_ledger(ledger)
+                ledger["bot_paused"] = False
+                save_ledger(ledger)
                 send_alert("[ CIRCUIT ] RESUMED\nTrading active")
             elif text == "/status":
-                ledger  = load_ledger()
                 capital = ledger.get("trading_capital", 0)
                 cash_b  = ledger.get("cash_bucket", 0)
                 etf_b   = ledger.get("etf_bucket", 0)
                 pdt     = ledger.get("day_trades_this_week", 0)
                 open_t  = list(ledger.get("open_trades", {}).keys())
                 state   = "PAUSED" if ledger.get("bot_paused") else "LIVE"
-                parts   = ["[ CIRCUIT ] STATUS", "STATE  " + state, "CAP    " + f"{capital:,.2f}", "DAY    " + f"{capital*DAY_PCT:,.2f}", "SWING  " + f"{capital*SWING_PCT:,.2f}", "ETF    " + f"{etf_b:,.2f}", "CASH   " + f"{cash_b:,.2f}", "PDT    " + str(pdt) + "/3", "OPEN   " + (", ".join(open_t) if open_t else "none")]
+                wr      = ledger.get("current_win_rate", 0)
+                parts   = [
+                    "[ CIRCUIT ] STATUS",
+                    "STATE  " + state,
+                    "CAP    " + f"{capital:,.2f}",
+                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
+                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
+                    "ETF    " + f"{etf_b:,.2f}",
+                    "CASH   " + f"{cash_b:,.2f}",
+                    "PDT    " + str(pdt) + "/3",
+                    "WIN    " + f"{wr:.1%}",
+                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
+                ]
                 send_alert("\n".join(parts))
             elif text == "/backtest":
                 send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
@@ -976,35 +1025,43 @@ def poll_telegram_commands():
                 try:
                     from tax import get_tax_report
                     r = get_tax_report()
-                    parts = ["[ CIRCUIT ] TAX " + str(r["year"]), "ST GAINS  " + f"{r['short_term_gains']:,.2f}", "LT GAINS  " + f"{r['long_term_gains']:,.2f}", "TAX OWED  " + f"{r['total_tax_owed']:,.2f}"]
+                    parts = [
+                        "[ CIRCUIT ] TAX " + str(r["year"]),
+                        "ST GAINS  " + f"{r['short_term_gains']:,.2f}",
+                        "LT GAINS  " + f"{r['long_term_gains']:,.2f}",
+                        "TAX OWED  " + f"{r['total_tax_owed']:,.2f}",
+                    ]
                     send_alert("\n".join(parts))
                 except Exception as ex:
                     send_alert("Tax error: " + str(ex))
             elif text == "/roadmap":
                 try:
                     from roadmap import send_roadmap_alert
-                    accts = requests.get("https://api.schwabapi.com/trader/v1/accounts/accountNumbers", headers={"Authorization": f"Bearer {get_valid_token()}"}).json()
+                    accts = requests.get(
+                        "https://api.schwabapi.com/trader/v1/accounts/accountNumbers",
+                        headers={"Authorization": f"Bearer {get_valid_token()}"}
+                    ).json()
                     send_roadmap_alert(accts[0]["hashValue"])
                 except Exception as ex:
                     send_alert("Roadmap error: " + str(ex))
-
             elif text == "/help":
-                msg  = "[ CIRCUIT ] COMMANDS\n"
-                msg += "━━━━━━━━━━━━━━━━━━\n"
-                msg += "/status   — capital, buckets, positions\n"
-                msg += "/pause    — stop trading, hold positions\n"
-                msg += "/resume   — restart trading\n"
-                msg += "/roadmap  — ETF options path + brain state\n"
-                msg += "/backtest — run 14d backtest\n"
-                msg += "/tax      — YTD tax report + ETF exit plan\n"
-                msg += "━━━━━━━━━━━━━━━━━━\n"
-                msg += "Schedules (ET):\n"
-                msg += "7:30 AM  — pre-market brief\n"
-                msg += "4:05 PM  — session summary\n"
-                msg += "4:30 PM  — backtest results\n"
-                msg += "5:00 PM  — EOD summary\n"
-                msg += "Sunday 8 AM — weekly report"
-                send_alert(msg)
+                parts = [
+                    "[ CIRCUIT ] COMMANDS",
+                    "━━━━━━━━━━━━━━━━━━",
+                    "/status   — capital, buckets, win rate",
+                    "/pause    — stop trading, hold positions",
+                    "/resume   — restart trading",
+                    "/roadmap  — ETF options path",
+                    "/backtest — run 14d backtest",
+                    "/tax      — YTD tax report",
+                    "━━━━━━━━━━━━━━━━━━",
+                    "7:30 AM  — pre-market",
+                    "4:05 PM  — session summary",
+                    "4:30 PM  — backtest",
+                    "5:00 PM  — EOD",
+                    "Sunday 8 AM — weekly report",
+                ]
+                send_alert("\n".join(parts))
     except Exception as ex:
         print(f"Command poll error: {ex}")
 
@@ -1059,29 +1116,6 @@ def main():
     schedule.every(5).minutes.do(check_balance_24_7)
     # Daily summary at 4 PM ET
     schedule.every().day.at("16:00").do(send_daily_summary)
-
-    def run_post_session_backtest():
-        et  = pytz.timezone("America/New_York")
-        now = datetime.now(et)
-        if now.weekday() < 5:
-            ledger_bt = load_ledger()
-            last_bt   = ledger_bt.get("last_backtest_date", "")
-            try:
-                from datetime import datetime as _dt2
-                last_dt   = _dt2.strptime(last_bt[:10], "%Y-%m-%d") if last_bt else _dt2(2000,1,1)
-                days_since = (_dt2.now() - last_dt).days
-            except Exception:
-                days_since = 99
-            if days_since >= 3:
-                try:
-                    from backtest import run_backtest
-                    run_backtest(days=14, bot_capital=get_trading_capital())
-                    ledger_bt["last_backtest_date"] = now.strftime("%Y-%m-%d")
-                    save_ledger(ledger_bt)
-                except Exception as ex:
-                    print(f"Backtest error: {ex}")
-
-    schedule.every().day.at("20:30").do(run_post_session_backtest)
 
     while True:
         schedule.run_pending()
