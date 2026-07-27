@@ -618,12 +618,10 @@ def run_strategy():
                     continue
 
                 # MTF conviction sizing
-                # Conviction-based sizing
+                # Conviction-based sizing — portfolio-aware, no FVG gate
                 from scanner import get_mtf_conviction as _gmc
                 _conv = _gmc(symbol)
-                if _conv >= 4:   position_size = ceiling
-                elif _conv >= 3: position_size = ceiling * 0.70
-                else:            position_size = 0
+                position_size = get_swing_position_size_v2(_conv, encrypted, cash)
                 if position_size == 0:
                     print(f"  {symbol}: skip — conviction {_conv}/4 too low")
                     continue
@@ -687,6 +685,65 @@ def run_strategy():
 
 
 # ── Options ───────────────────────────────────────────────────────────────────
+
+
+def get_total_portfolio(encrypted: str = None) -> float:
+    """Total portfolio = bot capital + ETF portfolio + cash."""
+    try:
+        from auth import get_valid_token as _gvt
+        _headers = {"Authorization": f"Bearer {_gvt()}"}
+        if not encrypted:
+            resp = requests.get(
+                "https://api.schwabapi.com/trader/v1/accounts/accountNumbers",
+                headers=_headers, timeout=10
+            )
+            encrypted = resp.json()[0]["hashValue"]
+        resp = requests.get(
+            f"https://api.schwabapi.com/trader/v1/accounts/{encrypted}?fields=positions",
+            headers=_headers, timeout=15
+        )
+        if resp.ok:
+            acct   = resp.json()["securitiesAccount"]
+            liquid = acct["currentBalances"].get("liquidationValue", 0)
+            return liquid
+    except Exception:
+        pass
+    ledger = load_ledger()
+    return ledger.get("trading_capital", 2167)
+
+
+def get_swing_ceiling(encrypted: str = None, cash_available: float = 0) -> float:
+    """
+    Calculate swing position ceiling based on total portfolio.
+    Uses 2% portfolio risk / 5% stop = proper swing size.
+    Capped at 80% of available cash.
+    Never shows exact amounts in Telegram.
+    """
+    total    = get_total_portfolio(encrypted)
+    risk_amt = total * 0.02         # 2% of total portfolio at risk
+    stop_pct = 0.05                 # 5% stop loss
+    risk_pos = risk_amt / stop_pct  # position size to risk 2%
+    cash_cap = cash_available * 0.80 if cash_available > 0 else risk_pos
+    ceiling  = min(risk_pos, cash_cap)
+    return round(ceiling, 2)
+
+
+def get_swing_position_size_v2(conviction: int, encrypted: str = None, cash: float = 0) -> float:
+    """
+    Swing position size based on conviction only. No FVG gate.
+    4/4 → full ceiling
+    3/4 → 70% ceiling
+    2/4 → 50% ceiling
+    Below 2/4 → no trade
+    """
+    ceiling = get_swing_ceiling(encrypted, cash)
+    if conviction >= 4:
+        return ceiling
+    elif conviction >= 3:
+        return ceiling * 0.70
+    elif conviction >= 2:
+        return ceiling * 0.50
+    return 0
 
 
 def run_sgov_parking(encrypted: str, cash: float, capital: float):
@@ -1000,7 +1057,7 @@ def poll_telegram_commands():
                     "[ CIRCUIT ] STATUS",
                     "STATE  " + state,
                     "CAP    " + f"{capital:,.2f}",
-                    "SWING  " + f"{capital:,.2f}",
+                    "SWING  ON",
                     "ETF    " + f"{etf_b:,.2f}",
                     "CASH   " + f"{cash_b:,.2f}",
                     "PDT    " + str(pdt) + "/3",
