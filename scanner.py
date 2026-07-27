@@ -259,170 +259,45 @@ MTF_THRESHOLDS = {
 }
 
 
-def get_4h_candles(symbol: str) -> list:
+def get_mtf_conviction(symbol: str) -> int:
     """
-    Build 4H candles by aggregating 8x30min candles.
-    Schwab doesn't have native 4H so we build it.
-    """
-    try:
-        import requests as _req
-        from auth import get_valid_token as _gvt
-        _h = {"Authorization": f"Bearer {_gvt()}"}
-        _r = _req.get(
-            "https://api.schwabapi.com/marketdata/v1/pricehistory",
-            headers=_h,
-            params={"symbol": symbol, "periodType": "day", "period": 10,
-                    "frequencyType": "minute", "frequency": 30,
-                    "needExtendedHoursData": False},
-            timeout=10
-        )
-        candles_30m = _r.json().get("candles", []) if _r.ok else []
-        if len(candles_30m) < 8:
-            return []
+    4-frame MA conviction system.
+    Each frame: price > 20-period MA = bullish.
 
-        # Aggregate every 8 bars into one 4H candle
-        candles_4h = []
-        for i in range(0, len(candles_30m) - 7, 8):
-            chunk = candles_30m[i:i+8]
-            candles_4h.append({
-                "open":     chunk[0]["open"],
-                "high":     max(c["high"]   for c in chunk),
-                "low":      min(c["low"]    for c in chunk),
-                "close":    chunk[-1]["close"],
-                "volume":   sum(c["volume"] for c in chunk),
-                "datetime": chunk[0]["datetime"]
-            })
-        return candles_4h
-    except Exception:
-        return []
-
-
-def get_day_conviction(symbol: str) -> int:
-    """
-    DAY TRADING bucket (25%) — 4-frame system.
-    Frames: 4H, 15m, 5m, 1m
-    4H  = direction/bias for the day
-    15m = alignment
-    5m  = trigger
-    1m  = entry timing + order flow
-
-    Stars 7+ required (checked in bot.py)
-    4/4 → full day ceiling
-    3/4 → 50% day ceiling (or 70% with FVG)
-    2/4 → no trade
+    Frames: 30m, 15m, 5m, 1m
+    4/4 aligned → full ceiling (return 4)
+    3/4 aligned → 50% ceiling (return 3)
+    2/4 aligned → 35% ceiling (return 2)
+    1/4 or less → no trade (return 0)
     """
     try:
         frames = [
-            get_4h_candles(symbol),                              # 4H — bias
-            get_price_history(symbol, period=5,  frequency=15), # 15m — align
-            get_price_history(symbol, period=5,  frequency=5),  # 5m  — trigger
-            get_price_history(symbol, period=2,  frequency=1),  # 1m  — entry
+            get_price_history(symbol, period=10, frequency=30),  # 30m
+            get_price_history(symbol, period=5,  frequency=15),  # 15m
+            get_price_history(symbol, period=5,  frequency=5),   # 5m
+            get_price_history(symbol, period=2,  frequency=1),   # 1m
         ]
+
         aligned = 0
         for candles in frames:
-            if len(candles) < 10:
+            if len(candles) < 20:
                 continue
             closes = [c["close"] for c in candles]
-            ma20   = sum(closes[-min(20,len(closes)):]) / min(20,len(closes))
+            ma20   = sum(closes[-20:]) / 20
             if closes[-1] > ma20:
                 aligned += 1
 
-        if aligned >= 4:   return 4
-        elif aligned == 3: return 3
-        else:              return 0
+        if aligned >= 4:
+            return 4
+        elif aligned == 3:
+            return 3
+        elif aligned == 2:
+            return 2
+        else:
+            return 0
+
     except Exception:
         return 0
-
-
-def get_swing_conviction(symbol: str) -> dict:
-    """
-    SWING bucket (75%) — 4-frame system with direction awareness.
-    Frames: Daily, 30m, 15m, 5m
-
-    Daily = direction/bias (mandatory)
-    30m   = alignment
-    15m   = confirmation
-    5m    = trigger + order flow
-
-    4/4 → full ceiling x stars
-    3/4 → 50% ceiling x stars
-    2/4 → no trade
-
-    Up bias   → long stock entries
-    Down bias → put selling opportunities
-    Flat bias → covered calls only
-    """
-    try:
-        # Daily candles — bias/direction
-        import requests as _req
-        from auth import get_valid_token as _gvt
-        _h = {"Authorization": f"Bearer {_gvt()}"}
-        _r = _req.get(
-            "https://api.schwabapi.com/marketdata/v1/pricehistory",
-            headers=_h,
-            params={"symbol": symbol, "periodType": "month", "period": 1,
-                    "frequencyType": "daily", "frequency": 1,
-                    "needExtendedHoursData": False},
-            timeout=10
-        )
-        daily = _r.json().get("candles", []) if _r.ok else []
-
-        # 30m candles — alignment
-        candles_30m = get_price_history(symbol, period=5,  frequency=30)
-        # 15m candles — confirmation
-        candles_15m = get_price_history(symbol, period=5,  frequency=15)
-        # 5m candles — trigger
-        candles_5m  = get_price_history(symbol, period=2,  frequency=5)
-
-        # Daily direction
-        daily_bias    = "flat"
-        daily_aligned = False
-        if len(daily) >= 10:
-            closes_d = [c["close"] for c in daily]
-            ma10_d   = sum(closes_d[-10:]) / 10
-            ma20_d   = sum(closes_d[-20:]) / 20 if len(closes_d) >= 20 else ma10_d
-            if closes_d[-1] > ma10_d and ma10_d > ma20_d:
-                daily_bias    = "up"
-                daily_aligned = True
-            elif closes_d[-1] < ma10_d and ma10_d < ma20_d:
-                daily_bias    = "down"
-                daily_aligned = True
-
-        def frame_aligned(candles, direction):
-            if len(candles) < 20:
-                return False
-            closes = [c["close"] for c in candles]
-            ma20   = sum(closes[-20:]) / 20
-            if direction == "up":   return closes[-1] > ma20
-            if direction == "down": return closes[-1] < ma20
-            return False
-
-        aligned_30m = frame_aligned(candles_30m, daily_bias)
-        aligned_15m = frame_aligned(candles_15m, daily_bias)
-        aligned_5m  = frame_aligned(candles_5m,  daily_bias)
-
-        frames_aligned = sum([daily_aligned, aligned_30m, aligned_15m, aligned_5m])
-
-        if frames_aligned >= 4:   conviction = 4
-        elif frames_aligned >= 3: conviction = 3
-        else:                     conviction = 0
-
-        return {
-            "conviction": conviction,
-            "direction":  daily_bias,
-            "daily_ok":   daily_aligned,
-            "30m_ok":     aligned_30m,
-            "15m_ok":     aligned_15m,
-            "5m_ok":      aligned_5m,
-        }
-    except Exception:
-        return {"conviction": 0, "direction": "flat", "daily_ok": False,
-                "30m_ok": False, "15m_ok": False, "5m_ok": False}
-
-
-def get_mtf_conviction(symbol: str) -> int:
-    """Legacy wrapper — uses day conviction for backward compatibility."""
-    return get_day_conviction(symbol)
 
 
 def candlestick_bonus(candles: list) -> float:
@@ -543,101 +418,6 @@ def order_flow(symbol: str, candles: list) -> float:
         return 0
 
 
-def wick_rejection(candles: list) -> float:
-    """
-    Detects wick rejection — price pushed to an extreme then violently rejected.
-    Strong lower wick = buyers rejecting lower prices (bullish).
-    Boosts entry score 0-15. Also used for exit pressure flip signal.
-    Dynamic — uses candle range so it scales with volatility.
-    """
-    if len(candles) < 3:
-        return 0
-    try:
-        c   = candles[-1]
-        o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
-        rng = h - l
-        if rng == 0:
-            return 0
-
-        lower_wick = min(o, cl) - l  # wick below body
-        upper_wick = h - max(o, cl)  # wick above body
-        body       = abs(cl - o)
-
-        # Bullish wick rejection — big lower wick, small upper wick, closes green
-        if cl > o and lower_wick > rng * 0.45 and upper_wick < rng * 0.2:
-            strength = lower_wick / rng
-            return min(strength * 20, 15)
-
-        # Pressure flip signal — previous bar had big upper wick (sellers rejected)
-        # current bar closes green = buyers took control
-        if len(candles) >= 2:
-            prev = candles[-2]
-            prev_rng  = prev["high"] - prev["low"]
-            prev_wick = prev["high"] - max(prev["open"], prev["close"])
-            if prev_rng > 0 and prev_wick > prev_rng * 0.5 and cl > prev["close"]:
-                return 10  # pressure flip bonus
-
-        return 0
-    except Exception:
-        return 0
-
-
-def detect_fvg(candles: list) -> dict:
-    """
-    Fair Value Gap (FVG) detection.
-    A FVG is a 3-candle pattern where candle 1 high and candle 3 low don't overlap.
-    Gap = inefficiency that price tends to return to.
-
-    Entry use: price returning to fresh FVG = boost score (strong institutional level)
-    Safety use: price still INSIDE FVG = skip entry (unstable, gap still filling)
-
-    Returns:
-        has_fvg: bool
-        in_gap: bool (price currently inside the gap = unsafe)
-        returning: bool (price just returned to gap edge = entry boost)
-        gap_top: float
-        gap_bottom: float
-        boost: float (score bonus 0-12)
-    """
-    if len(candles) < 4:
-        return {"has_fvg": False, "in_gap": False, "returning": False, "boost": 0}
-    try:
-        current_price = candles[-1]["close"]
-        result = {"has_fvg": False, "in_gap": False, "returning": False, "boost": 0}
-
-        # Check last 10 candles for FVG patterns
-        for i in range(2, min(10, len(candles))):
-            c1 = candles[-i-1]  # oldest
-            c2 = candles[-i]    # middle
-            c3 = candles[-i+1] if i > 1 else candles[-1]  # newest
-
-            # Bullish FVG — gap between c1 high and c3 low
-            gap_bottom = c1["high"]
-            gap_top    = c3["low"]
-
-            if gap_top > gap_bottom:  # valid gap
-                result["has_fvg"]   = True
-                result["gap_top"]   = gap_top
-                result["gap_bottom"] = gap_bottom
-
-                # Price inside gap — unstable, skip entry
-                if gap_bottom <= current_price <= gap_top:
-                    result["in_gap"] = True
-                    result["boost"]  = 0
-                    return result
-
-                # Price returning to gap from above — strong entry signal
-                gap_size = gap_top - gap_bottom
-                if gap_top < current_price <= gap_top + gap_size * 0.5:
-                    result["returning"] = True
-                    result["boost"]     = 12
-                    return result
-
-        return result
-    except Exception:
-        return {"has_fvg": False, "in_gap": False, "returning": False, "boost": 0}
-
-
 def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     """
     Score a stock using candle strength + order flow.
@@ -690,7 +470,7 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         return None
 
     # Order flow — bid/ask + volume delta
-    flow = order_flow(symbol, candles)
+    flow = 0  # removed — pure price action
 
     # Dynamic volume threshold per conviction
     vol_ok_dynamic = volume_ok(candles, threshold=thresholds["volume"])
@@ -705,17 +485,8 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     if thresholds["candle_required"] and sweep_bonus < thresholds["sweep_min"] and candle_bonus < 3:
         return None
 
-    # Wick rejection bonus
-    wick_bonus = wick_rejection(candles)
-
-    # FVG detection — boost or block
-    fvg = detect_fvg(candles)
-    if fvg["in_gap"]:
-        return None  # price inside FVG — unstable, skip entry
-    fvg_bonus = fvg["boost"]
-
-    # Total score — candle strength + order flow + sweep + wick + fvg + candle patterns
-    total_score = (strength * 0.4) + (flow * 0.4) + sweep_bonus + candle_bonus + wick_bonus + fvg_bonus + (change_pct * 2)
+    # Total score — candle strength + order flow + sweep + candle patterns
+    total_score = (strength * 0.7) + sweep_bonus + candle_bonus + (change_pct * 2)
 
     if total_score < 10:
         return None
@@ -729,9 +500,6 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
         "atr_pct":      round(atr_pct, 2),
         "sweep_bonus":  round(sweep_bonus, 1),
         "candle_bonus": round(candle_bonus, 1),
-        "wick_bonus":   round(wick_bonus, 1),
-        "fvg_bonus":    round(fvg_bonus, 1),
-        "fvg_returning": fvg["returning"],
         "conviction":   conviction,
         "score":        round(total_score, 1),
         "score": total_score,
@@ -766,7 +534,7 @@ def scan_best_stocks(cash: float, bot_capital: float = 2400) -> list:
     top = unique[:top_n]
 
     for r in top:
-        print(f"  {r['symbol']}: score={r['score']:.1f} ADX={r.get('adx') or 0:.1f} ATR={r.get('atr_pct') or 0:.1f}% price=${r['price']:.2f}")
+        print(f"  {r['symbol']}: score={r['score']:.1f} RSI={r['rsi']:.1f} ADX={r['adx'] or 0:.1f} ATR={r['atr_pct'] or 0:.1f}% price=${r['price']:.2f}")
 
     return top
 
