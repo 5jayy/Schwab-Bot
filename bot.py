@@ -38,9 +38,9 @@ from ledger import (
 
 load_dotenv()
 
-DAY_PCT   = 0.25
-SWING_PCT = 0.75
-MAX_DAY_TRADES_PER_WEEK = 3
+DAY_PCT   = 0.00  # No day trades
+SWING_PCT = 1.00  # All capital for swing
+MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled
 ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.50, "bot": 0.30}
 COMMISSION_PER_CONTRACT = 0.65
 
@@ -320,11 +320,7 @@ def can_trade(capital: float, stats: dict, _unused: int = 0) -> tuple:
     MTF conviction handles sizing. This handles daily limits.
     Returns (bool, reason).
     """
-    # Warmup — skip 9:30-9:45 ET
-    et  = pytz.timezone("America/New_York")
-    now = datetime.now(et)
-    if now.replace(hour=9, minute=30) <= now <= now.replace(hour=9, minute=45):
-        return False, "warmup"
+    # No warmup needed — swing trades only
 
     # Cooldown — 2 consecutive losses
     if stats["consecutive_losses"] >= 2:
@@ -1004,8 +1000,7 @@ def poll_telegram_commands():
                     "[ CIRCUIT ] STATUS",
                     "STATE  " + state,
                     "CAP    " + f"{capital:,.2f}",
-                    "DAY    " + f"{capital*DAY_PCT:,.2f}",
-                    "SWING  " + f"{capital*SWING_PCT:,.2f}",
+                    "SWING  " + f"{capital:,.2f}",
                     "ETF    " + f"{etf_b:,.2f}",
                     "CASH   " + f"{cash_b:,.2f}",
                     "PDT    " + str(pdt) + "/3",
@@ -1100,7 +1095,7 @@ def main():
 
         pulse    = get_market_pulse() if is_market_open() else ""
         hold_str = f" | 🔒 ${on_hold:,.0f}" if on_hold > 0 else ""
-        msg = "[ CIRCUIT ] LIVE\n━━━━━━━━━━━━━━━━━━\n" + "CAP    " + f"{capital:,.2f}" + "\nDAY    " + f"{capital*DAY_PCT:,.2f}" + "\nSWING  " + f"{capital*SWING_PCT:,.2f}" + "\nCASH   " + f"{cash_ready:,.2f}"
+        msg = "[ CIRCUIT ] LIVE\n━━━━━━━━━━━━━━━━━━\n" + "CAP    " + f"{capital:,.2f}" + "\nSWING  " + f"{capital:,.2f}" + "\nCASH   " + f"{cash_ready:,.2f}" + "\nMODE   SWING + OPTIONS"
         if pulse:
             msg += f"\n{pulse}"
         send_alert(msg)
