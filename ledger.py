@@ -233,7 +233,14 @@ def get_trailing_stop_info(symbol: str) -> dict | None:
     return {
         "buy_price":  trade["buy_price"],
         "high_price": trade.get("high_price", trade["buy_price"]),
-        "quantity":   trade["quantity"]
+        "quantity":   trade.get("quantity", 0),
+        "tp1_hit":    trade.get("tp1_hit", False),
+        "tp2_hit":    trade.get("tp2_hit", False),
+        "tp1_pct":    trade.get("tp1_pct", 0.07),
+        "tp2_pct":    trade.get("tp2_pct", 0.12),
+        "stop_pct":   trade.get("stop_pct", 0.05),
+        "bucket":     trade.get("bucket", "swing"),
+        "atr_pct":    trade.get("atr_pct", 2.0),
     }
 
 

@@ -530,11 +530,12 @@ def run_strategy():
                 continue
 
             update_high_price(sym, price)
-            trail_info = get_trailing_stop_info(sym)
+            trail_info = get_trailing_stop_info(sym)  # always fresh from ledger
             trigger    = None
 
-            # ── TP1 / TP2 scale-out ──
-            if trail_info and not trigger:
+            # ── TP1 / TP2 scale-out — only for bot-entered positions ──
+            bot_trade = load_ledger().get("open_trades", {}).get(sym, {})
+            if trail_info and not trigger and bot_trade:
                 buy_px  = trail_info["buy_price"]
                 tp1_pct = trail_info.get("tp1_pct", 0.07)
                 tp2_pct = trail_info.get("tp2_pct", 0.10)
@@ -544,25 +545,42 @@ def run_strategy():
                 tp2_px  = buy_px * (1 + tp2_pct)
                 if not tp1_hit and price >= tp1_px:
                     tp1_qty = max(1, qty // 3)
-                    execute_sell(encrypted, sym, tp1_qty, price, cash, "tp1")
-                    from ledger import load_ledger as _ll, save_ledger as _sl
-                    _ld = _ll()
-                    if sym in _ld.get("open_trades", {}):
-                        _ld["open_trades"][sym]["tp1_hit"] = True
-                        _ld["open_trades"][sym]["quantity"] = max(0, qty - tp1_qty)
-                        _sl(_ld)
-                    send_alert("[ TP1 ] " + sym + " 1/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "%")
+                    try:
+                        place_equity_order(encrypted, sym, tp1_qty, "SELL")
+                        profit_tp1 = tp1_qty * (price - buy_px)
+                        # Save to ledger immediately and persistently
+                        _ld = load_ledger()
+                        if sym in _ld.get("open_trades", {}):
+                            _ld["open_trades"][sym]["tp1_hit"] = True
+                            _ld["open_trades"][sym]["tp2_hit"] = False
+                            _ld["open_trades"][sym]["quantity"] = max(0, qty - tp1_qty)
+                            _ld["open_trades"][sym]["stop_pct"] = 0.0  # stop at breakeven
+                            save_ledger(_ld)
+                        # Update trail_info in memory so current cycle knows tp1 is hit
+                        if trail_info:
+                            trail_info["tp1_hit"] = True
+                        send_alert("[ TP1 ] " + sym + " 1/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "% +$" + f"{profit_tp1:.2f}")
+                        print(f"  TP1 hit {sym} — ledger updated, tp1_hit=True")
+                    except Exception as ex:
+                        print(f"TP1 error {sym}: {ex}")
                     continue
                 elif tp1_hit and not tp2_hit and price >= tp2_px:
                     tp2_qty = max(1, qty // 3)
-                    execute_sell(encrypted, sym, tp2_qty, price, cash, "tp2")
-                    from ledger import load_ledger as _ll2, save_ledger as _sl2
-                    _ld2 = _ll2()
-                    if sym in _ld2.get("open_trades", {}):
-                        _ld2["open_trades"][sym]["tp2_hit"] = True
-                        _ld2["open_trades"][sym]["quantity"] = max(0, qty - tp2_qty)
-                        _sl2(_ld2)
-                    send_alert("[ TP2 ] " + sym + " 2/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "%")
+                    try:
+                        place_equity_order(encrypted, sym, tp2_qty, "SELL")
+                        profit_tp2 = tp2_qty * (price - buy_px)
+                        _ld2 = load_ledger()
+                        if sym in _ld2.get("open_trades", {}):
+                            _ld2["open_trades"][sym]["tp2_hit"] = True
+                            _ld2["open_trades"][sym]["quantity"] = max(0, qty - tp2_qty)
+                            save_ledger(_ld2)
+                        # Update trail_info in memory
+                        if trail_info:
+                            trail_info["tp2_hit"] = True
+                        send_alert("[ TP2 ] " + sym + " 2/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "% +$" + f"{profit_tp2:.2f}")
+                        print(f"  TP2 hit {sym} — ledger updated, tp2_hit=True")
+                    except Exception as ex:
+                        print(f"TP2 error {sym}: {ex}")
                     continue
 
 
