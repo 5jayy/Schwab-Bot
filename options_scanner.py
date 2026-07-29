@@ -22,7 +22,8 @@ LEDGER_PATH = "/data/trade_ledger.json" if os.path.exists("/data") else "trade_l
 # ── DTE windows ──
 DAILY_DTE_MIN   = 0
 DAILY_DTE_MAX   = 1
-WEEKLY_DTE_MIN  = 2
+WEEKLY_DTE_MIN  = 0  # 0 DTE included — real money
+WEEKLY_DTE_PREF = 3  # 3 DTE preferred — best from backtest (87% win, 50% exit)
 WEEKLY_DTE_MAX  = 7
 MONTHLY_DTE_MIN = 21
 MONTHLY_DTE_MAX = 45
@@ -203,6 +204,9 @@ def find_best_put_tiered(symbol: str, cash_available: float,
                 continue
 
             sc = score_option(prem, strike, dte, delta, oi, tier)
+            # 20% bonus for 3 DTE — backtest confirmed best combo
+            dte_bonus = 1.20 if abs(dte - WEEKLY_DTE_PREF) <= 1 else 1.0
+            sc = sc * dte_bonus
             if sc > best_score:
                 best_score = sc
                 best = {
