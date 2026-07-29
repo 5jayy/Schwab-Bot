@@ -688,6 +688,51 @@ def run_strategy():
 
         # ── Options ──
         run_options(encrypted, positions, cash, stats, capital)
+        # ── Monitor open option positions — exit at 50% profit ──
+        try:
+            from options import get_open_options
+            open_opts = get_open_options(encrypted)
+            for opt_pos in open_opts:
+                inst       = opt_pos.get("instrument", {})
+                opt_sym    = inst.get("symbol", "")
+                short_qty  = opt_pos.get("shortQuantity", 0)
+                if short_qty <= 0:
+                    continue
+                # Get current mark price
+                mkt_val    = abs(opt_pos.get("marketValue", 0))
+                avg_price  = abs(opt_pos.get("averagePrice", 0))
+                if avg_price <= 0:
+                    continue
+                # Exit at 50% profit (current value ≤ 50% of entry premium)
+                if mkt_val <= avg_price * 0.50:
+                    try:
+                        from options import place_equity_order as _peo
+                        resp = requests.post(
+                            f"https://api.schwabapi.com/trader/v1/accounts/{encrypted}/orders",
+                            headers={"Authorization": f"Bearer {get_valid_token()}", "Content-Type": "application/json"},
+                            json={
+                                "orderType": "MARKET",
+                                "session": "NORMAL",
+                                "duration": "DAY",
+                                "orderStrategyType": "SINGLE",
+                                "orderLegCollection": [{
+                                    "instruction": "BUY_TO_CLOSE",
+                                    "quantity": short_qty,
+                                    "instrument": {"symbol": opt_sym, "assetType": "OPTION"}
+                                }]
+                            },
+                            timeout=15
+                        )
+                        if resp.ok or resp.status_code == 201:
+                            profit = (avg_price - mkt_val / 100) * short_qty * 100
+                            underlying = opt_sym[:4].strip()
+                            send_alert("[ OPT EXIT ] " + underlying + "\nPREM $" + f"{avg_price:.2f}" + " → $" + f"{mkt_val/100:.2f}" + "\nPROFIT +$" + f"{profit:.2f}" + " (50% hit)")
+                            print(f"  Option exit: {opt_sym} at 50% profit ${profit:.2f}")
+                    except Exception as ex:
+                        print(f"Option exit error {opt_sym}: {ex}")
+        except Exception as ex:
+            print(f"Options monitor error: {ex}")
+
         # ── Stock Options (15% of cash, monthly high IV) ──
         try:
             from options_scanner import scan_stock_options
