@@ -25,7 +25,7 @@ from options import (
 from options_scanner import scan_stock_options, scan_etf_options_live
 from scanner import (
     get_price_history, get_mtf_conviction, score_stock,
-    scan_best_stocks, get_star_rating
+    scan_best_stocks
 )
 from dividends import get_recent_dividends
 from telegram import send_alert
