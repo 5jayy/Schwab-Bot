@@ -20,7 +20,7 @@ from scanner import (
 from options import (
     find_best_covered_call, place_covered_call, check_covered_call_already_open,
     find_best_cash_secured_put, place_cash_secured_put, check_put_already_open,
-    run_wheel
+    get_open_options, run_wheel
 )
 from dividends import get_recent_dividends
 from telegram import send_alert
@@ -690,7 +690,6 @@ def run_strategy():
         run_options(encrypted, positions, cash, stats, capital)
         # ── Monitor open option positions — exit at 50% profit ──
         try:
-            from options import get_open_options
             open_opts = get_open_options(encrypted)
             for opt_pos in open_opts:
                 inst       = opt_pos.get("instrument", {})
@@ -706,7 +705,6 @@ def run_strategy():
                 # Exit at 50% profit (current value ≤ 50% of entry premium)
                 if mkt_val <= avg_price * 0.50:
                     try:
-                        from options import place_equity_order as _peo
                         resp = requests.post(
                             f"https://api.schwabapi.com/trader/v1/accounts/{encrypted}/orders",
                             headers={"Authorization": f"Bearer {get_valid_token()}", "Content-Type": "application/json"},
@@ -741,8 +739,6 @@ def run_strategy():
         # ── Stock Options (15% of cash, monthly high IV) ──
         try:
             from options_scanner import scan_stock_options
-            from options import place_cash_secured_put, check_put_already_open
-
             stock_opt_budget = cash * STOCK_OPT_PCT
             stock_opts = scan_stock_options(cash_available=stock_opt_budget)
 
@@ -764,9 +760,6 @@ def run_strategy():
         # ── ETF Options (10% of cash, builds toward roadmap) ──
         try:
             from options_scanner import scan_etf_options_live
-            from options import place_cash_secured_put, place_covered_call
-            from options import check_put_already_open, check_covered_call_already_open
-
             etf_opt_budget = cash * ETF_OPT_PCT
             etf_opts = scan_etf_options_live(
                 cash_available=etf_opt_budget,
