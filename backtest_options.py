@@ -179,35 +179,7 @@ def run_options_backtest(symbols: list = None, days: int = 14,
 
         print(f"  {sym}: {len(candles)} candles | testing {len(dte_range) * len(exit_pcts)} combos")
 
-        for i in range(20, len(candles) - 8):  # walk every bar
-            c      = candles[i]
-            closes = [candles[j]["close"] for j in range(max(0, i-20), i+1)]
-            if len(closes) < 20:
-                continue
-
-            # Real entry signals — only enter on qualified setups
-            rng    = c["high"] - c["low"]
-            body   = abs(c["close"] - c["open"])
-            if rng == 0:
-                continue
-            strength  = body / rng
-            close_pos = (c["close"] - c["low"]) / rng
-            candle_sc = strength * 50 + close_pos * 30
-            if candle_sc < 20:
-                continue
-
-            # Volume spike check
-            vols    = [candles[j]["volume"] for j in range(max(0, i-20), i+1)]
-            avg_vol = sum(vols[:-1]) / max(len(vols)-1, 1)
-            if avg_vol > 0 and vols[-1] < avg_vol * 1.2:
-                continue
-
-            # MTF alignment — uptrend only
-            ma20 = sum(closes[-20:]) / 20
-            ma10 = sum(closes[-10:]) / 10
-            if closes[-1] <= ma20 or closes[-1] <= ma10:
-                continue
-
+        for i in range(5, len(candles) - 8, 2):  # every 2 days — options entry is premium/delta based
             for dte in dte_range:
                 for ep in exit_pcts:
                     r = simulate_put(
@@ -263,6 +235,62 @@ def run_options_backtest(symbols: list = None, days: int = 14,
         print(f"  Exit at: {ep:.0%} profit")
         print(f"  Win rate: {wr:.0f}%")
         print(f"  Avg ROI per trade: {roi:+.3f}%")
+
+    # ── ACTIONABLE FIXES (like swing backtest) ──
+    print(f"\n{'='*60}")
+    print("WHAT TO FIX:")
+    print(f"{'='*60}")
+
+    if best_combo:
+        dte, ep, wr, roi = best_combo
+        fixes = []
+
+        # Compare DTE performance
+        dte_scores = {}
+        for (d, e), data in results.items():
+            if data["trades"] > 0:
+                w = data["wins"] / data["trades"] * 100
+                dte_scores.setdefault(d, []).append(w)
+        dte_avg = {d: sum(ws)/len(ws) for d, ws in dte_scores.items()}
+
+        best_dte = max(dte_avg, key=dte_avg.get) if dte_avg else 3
+        worst_dte = min(dte_avg, key=dte_avg.get) if dte_avg else 7
+
+        if best_dte != 3:
+            fixes.append(f"➤ Change WEEKLY_DTE_PREF from 3 to {best_dte} (higher win rate {dte_avg[best_dte]:.0f}%)")
+        else:
+            fixes.append(f"✅ Keep 3 DTE preferred — confirmed best ({dte_avg.get(3, 0):.0f}% win)")
+
+        # Compare exit %
+        exit_scores = {}
+        for (d, e), data in results.items():
+            if data["trades"] > 0:
+                r = data["total_roi"] / data["trades"]
+                exit_scores.setdefault(e, []).append(r)
+        exit_avg = {e: sum(rs)/len(rs) for e, rs in exit_scores.items()}
+        best_exit = max(exit_avg, key=exit_avg.get) if exit_avg else 0.5
+
+        if abs(best_exit - 0.50) > 0.01:
+            fixes.append(f"➤ Change exit from 50% to {best_exit:.0%} (better ROI {exit_avg[best_exit]:+.3f}%)")
+        else:
+            fixes.append(f"✅ Keep 50% exit rule — confirmed best")
+
+        # Win rate check
+        if wr < 60:
+            fixes.append(f"⚠️  Win rate {wr:.0f}% is low — tighten delta range (0.20-0.30) for safer strikes")
+        elif wr >= 80:
+            fixes.append(f"✅ Win rate {wr:.0f}% is strong — could widen delta for more premium")
+
+        # Assignment risk
+        if best_combo:
+            breakdown = results[(dte, ep)]["results"]
+            total = sum(breakdown.values())
+            itm = breakdown.get("expired_itm", 0)
+            if total > 0 and itm / total > 0.15:
+                fixes.append(f"⚠️  {itm/total*100:.0f}% assigned ITM — move strikes further OTM (lower delta)")
+
+        for fix in fixes:
+            print(f"  {fix}")
 
         # Monthly projection at $502 budget
         budget    = 502
