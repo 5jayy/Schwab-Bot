@@ -328,7 +328,9 @@ def scan_stock_options(cash_available: float) -> list:
     Budget: 15% of swing cash.
     """
     symbols = list(set(get_movers("$SPX") + get_movers("$COMP")))
+    daily   = []  # placeholder for return statement
     weekly  = []
+    monthly = []  # placeholder for return statement
     scanned = set()
 
     print(f"  Stock options WEEKLY scan: {len(symbols)} symbols | ${cash_available:,.0f} budget")

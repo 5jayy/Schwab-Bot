@@ -251,8 +251,8 @@ def get_ceiling(bot_capital: float) -> float:
     if room < 500:     return 50
     if room < 1000:    return 100
     if room < 2000:    return 200
-    if room < 5000:    return 400
-    if room < 10000:   return 600
+    if room < 5000:    return round(bot_capital * 0.25, 2)
+    if room < 10000:   return round(bot_capital * 0.25, 2)
     return 1000
 
 
