@@ -316,6 +316,9 @@ def find_best_call_tiered(symbol: str, shares: int, avg_cost: float,
 # ── SCANNER 1: Stock Options (Daily + Weekly + Monthly) ───────────────────────
 
 def scan_stock_options(cash_available: float) -> list:
+    if cash_available < 100:  # need at least $100 to do anything
+        print(f"  Stock options: budget ${cash_available:.0f} too small — skip")
+        return []
     """
     Scans for WEEKLY stock options only (1-7 DTE).
     Weekly wins 15x over monthly on same collateral.
@@ -342,9 +345,13 @@ def scan_stock_options(cash_available: float) -> list:
 
         q     = get_quote(sym)
         price = q.get("price", 0)
-        if price <= 0 or price * 100 > cash_available:
+        if price <= 0:
             continue
-        if price < 10:
+        # Must afford at least 1 contract (100 shares collateral)
+        if price * 100 > cash_available:
+            continue
+        # Skip penny stocks under $2 (poor liquidity)
+        if price < 2:
             continue
 
         # Weekly only — 1-7 DTE
@@ -375,6 +382,9 @@ def scan_stock_options(cash_available: float) -> list:
 # ── SCANNER 2: ETF Options (Roadmap Building) ─────────────────────────────────
 
 def scan_etf_options_live(cash_available: float, positions: list = None) -> list:
+    if cash_available < 100:
+        print(f"  ETF options: budget ${cash_available:.0f} too small — skip")
+        return []
     """
     ETF options scanner — roadmap building.
     Covered calls on owned ETFs first (any DTE).
