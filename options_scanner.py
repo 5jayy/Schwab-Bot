@@ -426,10 +426,10 @@ def scan_etf_options_live(cash_available: float, positions: list = None) -> list
         if collat_needed > cash_available:
             continue
 
-        # ETF puts — weekly or monthly only (no daily on ETFs)
+        # ETF puts — weekly only (1-7 DTE), same as stock options
+        # More cycles = more premium even with lower ETF IV
         for tier, dmin, dmax, dymin, doi, dvol, dmin_d, dmax_d in [
-            ("weekly",  WEEKLY_DTE_MIN,  WEEKLY_DTE_MAX,  WEEKLY_MIN_YIELD,  WEEKLY_MIN_OI,  WEEKLY_MIN_VOL,  WEEKLY_DELTA_MIN,  WEEKLY_DELTA_MAX),
-            ("monthly", MONTHLY_DTE_MIN, MONTHLY_DTE_MAX, ETF_MIN_YIELD,     MONTHLY_MIN_OI, MONTHLY_MIN_VOL, MONTHLY_DELTA_MIN, MONTHLY_DELTA_MAX),
+            ("weekly", WEEKLY_DTE_MIN, WEEKLY_DTE_MAX, WEEKLY_MIN_YIELD, WEEKLY_MIN_OI, WEEKLY_MIN_VOL, WEEKLY_DELTA_MIN, WEEKLY_DELTA_MAX),
         ]:
             put = find_best_put_tiered(
                 sym, cash_available,
@@ -439,8 +439,9 @@ def scan_etf_options_live(cash_available: float, positions: list = None) -> list
                 strike_max_pct=0.99,
             )
             if put:
-                put["category"]      = "etf_put"
-                put["roadmap_note"]  = str(pct_to_call) + "% to call unlock"
+                put["category"]      = "etf_put_weekly"
+                put["exit_at"]       = round(put["premium"] * 0.50, 2)
+                put["roadmap_note"]  = str(pct_to_call) + "% to call | weekly"
                 put["shares_owned"]  = shares_owned
                 opportunities.append(put)
                 scanned.add(sym)
