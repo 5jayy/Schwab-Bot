@@ -40,6 +40,10 @@ load_dotenv()
 
 DAY_PCT          = 0.00   # No day trades
 SWING_PCT        = 0.65   # 65% swing trades (up to 3 positions)
+
+# Pre-bot positions — never apply TP1/TP2/trail to these
+# These were held before the bot started trading
+PRE_BOT_POSITIONS = {"LCID", "OPEN"}  # add any others here
 STOCK_OPT_PCT    = 0.15   # 15% stock options (monthly high IV)
 ETF_OPT_PCT      = 0.10   # 10% ETF options (builds toward roadmap)
 RESERVE_PCT      = 0.10   # 10% SGOV/reserve
@@ -539,6 +543,9 @@ def run_strategy():
 
             # ── TP1 / TP2 scale-out — only for bot-entered positions ──
             bot_trade = load_ledger().get("open_trades", {}).get(sym, {})
+            # Skip TP1/TP2 for pre-bot positions and positions not in ledger
+            if sym in PRE_BOT_POSITIONS:
+                bot_trade = {}
             if trail_info and not trigger and bot_trade:
                 buy_px  = trail_info["buy_price"]
                 tp1_pct = trail_info.get("tp1_pct", 0.07)
@@ -551,7 +558,8 @@ def run_strategy():
                     tp1_qty = max(1, qty // 3)
                     try:
                         place_equity_order(encrypted, sym, tp1_qty, "SELL")
-                        profit_tp1 = tp1_qty * (price - buy_px)
+                        profit_tp1 = round(tp1_qty * (price - buy_px), 2)
+                        pct_gain   = round((price / buy_px - 1) * 100, 1)
                         # Save to ledger immediately and persistently
                         _ld = load_ledger()
                         if sym in _ld.get("open_trades", {}):
@@ -563,7 +571,7 @@ def run_strategy():
                         # Update trail_info in memory so current cycle knows tp1 is hit
                         if trail_info:
                             trail_info["tp1_hit"] = True
-                        send_alert("[ TP1 ] " + sym + " 1/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "% +$" + f"{profit_tp1:.2f}")
+                        send_alert("[ TP1 ] " + sym + " 1/3\nPRICE $" + f"{price:.2f}" + " | +" + f"{pct_gain}" + "%\nPROFIT +$" + f"{profit_tp1:.2f}")
                         print(f"  TP1 hit {sym} — ledger updated, tp1_hit=True")
                     except Exception as ex:
                         print(f"TP1 error {sym}: {ex}")
@@ -572,7 +580,8 @@ def run_strategy():
                     tp2_qty = max(1, qty // 3)
                     try:
                         place_equity_order(encrypted, sym, tp2_qty, "SELL")
-                        profit_tp2 = tp2_qty * (price - buy_px)
+                        profit_tp2 = round(tp2_qty * (price - buy_px), 2)
+                        pct_gain2  = round((price / buy_px - 1) * 100, 1)
                         _ld2 = load_ledger()
                         if sym in _ld2.get("open_trades", {}):
                             _ld2["open_trades"][sym]["tp2_hit"] = True
@@ -581,7 +590,7 @@ def run_strategy():
                         # Update trail_info in memory
                         if trail_info:
                             trail_info["tp2_hit"] = True
-                        send_alert("[ TP2 ] " + sym + " 2/3\nPRICE $" + f"{price:.2f}" + "\n+" + f"{((price/buy_px)-1)*100:.1f}" + "% +$" + f"{profit_tp2:.2f}")
+                        send_alert("[ TP2 ] " + sym + " 2/3\nPRICE $" + f"{price:.2f}" + " | +" + f"{pct_gain2}" + "%\nPROFIT +$" + f"{profit_tp2:.2f}")
                         print(f"  TP2 hit {sym} — ledger updated, tp2_hit=True")
                     except Exception as ex:
                         print(f"TP2 error {sym}: {ex}")
