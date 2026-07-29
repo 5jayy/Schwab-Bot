@@ -366,19 +366,56 @@ def scan_etf_options(positions: list, cash_available: float) -> list:
 # Min $0.15 premium = $15/contract, commission = $0.65 = 4.3% cost (borderline)
 COMMISSION_PER_CONTRACT = 0.65
 
-WHEEL_ETFS = {
-    # Only ETFs we're comfortable owning long term
-    # Sorted by cost to 100 shares (cheapest first = fastest wheel spin)
-    # min_premium raised to clear $0.65 commission meaningfully
-    "QYLD":  {"max_cost": 1800, "target_delta": 0.25, "min_yield": 0.012, "min_premium": 0.20},
-    "RYLD":  {"max_cost": 2000, "target_delta": 0.25, "min_yield": 0.012, "min_premium": 0.20},
-    "SCHA":  {"max_cost": 2800, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
-    "SCHM":  {"max_cost": 3000, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
-    "SCHB":  {"max_cost": 3100, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
-    "SCHG":  {"max_cost": 3200, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.20},
-    "SCHD":  {"max_cost": 3300, "target_delta": 0.25, "min_yield": 0.010, "min_premium": 0.25},
-    "JEPI":  {"max_cost": 6500, "target_delta": 0.20, "min_yield": 0.012, "min_premium": 0.30},
-}
+def get_wheel_etfs(cash_available: float = 5000) -> dict:
+    """
+    Get wheel ETF universe dynamically from live scanner results.
+    Falls back to positions already owned if scanner hasn't run yet.
+    Never hardcoded — always from live data.
+    """
+    import json, os
+    ledger_path = "/data/trade_ledger.json" if os.path.exists("/data") else "trade_ledger.json"
+    try:
+        with open(ledger_path) as f:
+            ledger = json.load(f)
+    except Exception:
+        ledger = {}
+
+    # Get live scanner results stored by roadmap.py
+    live_opps = ledger.get("live_etf_opportunities", [])
+    wheel_etfs = {}
+
+    for etf in live_opps:
+        sym   = etf.get("symbol", "")
+        price = etf.get("price", 0)
+        if not sym or price <= 0:
+            continue
+        max_cost = price * 100
+        if max_cost > cash_available * 1.5:
+            continue  # too expensive for current cash
+        wheel_etfs[sym] = {
+            "max_cost":      max_cost,
+            "target_delta":  0.25,
+            "min_yield":     0.008,
+            "min_premium":   max(0.10, price * 0.005),  # 0.5% of price
+        }
+
+    # Also include any ETFs already owned (from positions)
+    owned_etfs = ledger.get("owned_etfs", {})
+    for sym, data in owned_etfs.items():
+        if sym not in wheel_etfs:
+            price = data.get("avg_price", 50)
+            wheel_etfs[sym] = {
+                "max_cost":     price * 100,
+                "target_delta": 0.25,
+                "min_yield":    0.008,
+                "min_premium":  max(0.10, price * 0.005),
+            }
+
+    return wheel_etfs
+
+
+# Keep WHEEL_ETFS as empty — always use get_wheel_etfs() instead
+WHEEL_ETFS = {}
 
 # Wheel phases
 PHASE_PUT  = "put"   # selling cash secured puts
@@ -624,7 +661,7 @@ def check_roll_needed(encrypted: str) -> list:
         underlying = inst.get("underlyingSymbol", "")
         short_qty  = pos.get("shortQuantity", 0)
 
-        if short_qty <= 0 or underlying not in WHEEL_ETFS:
+        if short_qty <= 0 or underlying not in get_wheel_etfs():
             continue
 
         # Parse expiry from option symbol
@@ -669,7 +706,8 @@ def run_wheel(encrypted: str, positions: list, cash_available: float):
         send_alert(msg)
 
     # Determine phase for each wheel ETF
-    for sym, cfg in WHEEL_ETFS.items():
+    wheel_etfs_dynamic = get_wheel_etfs(cash_available)
+    for sym, cfg in wheel_etfs_dynamic.items():
         state = wheel_state.get(sym, {"phase": PHASE_NONE})
 
         # Check current positions

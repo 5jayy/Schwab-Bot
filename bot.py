@@ -38,10 +38,14 @@ from ledger import (
 
 load_dotenv()
 
-DAY_PCT   = 0.00  # No day trades
-SWING_PCT = 1.00  # All capital for swing
+DAY_PCT          = 0.00   # No day trades
+SWING_PCT        = 0.65   # 65% swing trades (up to 3 positions)
+STOCK_OPT_PCT    = 0.15   # 15% stock options (monthly high IV)
+ETF_OPT_PCT      = 0.10   # 10% ETF options (builds toward roadmap)
+RESERVE_PCT      = 0.10   # 10% SGOV/reserve
+MAX_SWING_POSITIONS = 3
 MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled
-ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.50, "bot": 0.30}
+ETF_OPTIONS_SPLIT = {"etf": 0.30, "cash": 0.50, "bot": 0.10}
 COMMISSION_PER_CONTRACT = 0.65
 
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
@@ -50,8 +54,8 @@ TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 # ── Profit splits ─────────────────────────────────────────────────────────────
-STOCK_SPLIT  = {"etf": 0.60, "cash": 0.30, "bot": 0.10}
-OPTIONS_SPLIT = {"etf": 0.60, "cash": 0.40, "bot": 0.00}
+STOCK_SPLIT  = {"etf": 0.30, "cash": 0.50, "bot": 0.10}
+OPTIONS_SPLIT = {"etf": 0.30, "cash": 0.50, "bot": 0.10}
 ETF_SPLITS   = {
     "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
     "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
@@ -635,6 +639,12 @@ def run_strategy():
                     print(f"  {symbol}: skip — {reason}")
                     continue
 
+                # Max 3 swing positions at once
+                open_count = len(load_ledger().get("open_trades", {}))
+                if open_count >= MAX_SWING_POSITIONS:
+                    print(f"  {symbol}: skip — max {MAX_SWING_POSITIONS} positions open")
+                    break
+
                 # MTF conviction sizing
                 # Conviction-based sizing — portfolio-aware, no FVG gate
                 from scanner import get_mtf_conviction as _gmc
@@ -678,7 +688,71 @@ def run_strategy():
 
         # ── Options ──
         run_options(encrypted, positions, cash, stats, capital)
-        run_wheel(encrypted, positions, cash * 0.40)
+        # ── Stock Options (15% of cash, monthly high IV) ──
+        try:
+            from options_scanner import scan_stock_options
+            from options import place_cash_secured_put, check_put_already_open
+
+            stock_opt_budget = cash * STOCK_OPT_PCT
+            stock_opts = scan_stock_options(cash_available=stock_opt_budget)
+
+            for opp in stock_opts[:1]:  # max 1 stock option at a time
+                sym  = opp["symbol"]
+                prem = opp["premium"]
+                if check_put_already_open(encrypted, sym):
+                    continue
+                place_cash_secured_put(encrypted, opp["opt_symbol"], prem)
+                msg  = "[ STOCK OPT ] " + sym + " PUT\n"
+                msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
+                msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
+                msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
+                msg += "DTE    " + str(opp["dte"]) + "d (monthly)"
+                send_alert(msg)
+        except Exception as ex:
+            print(f"Stock options error: {ex}")
+
+        # ── ETF Options (10% of cash, builds toward roadmap) ──
+        try:
+            from options_scanner import scan_etf_options_live
+            from options import place_cash_secured_put, place_covered_call
+            from options import check_put_already_open, check_covered_call_already_open
+
+            etf_opt_budget = cash * ETF_OPT_PCT
+            etf_opts = scan_etf_options_live(
+                cash_available=etf_opt_budget,
+                positions=positions
+            )
+
+            for opp in etf_opts[:1]:  # max 1 ETF option at a time
+                sym  = opp["symbol"]
+                typ  = opp["type"]
+                prem = opp["premium"]
+
+                if typ == "put":
+                    if check_put_already_open(encrypted, sym):
+                        continue
+                    place_cash_secured_put(encrypted, opp["opt_symbol"], prem)
+                    msg  = "[ ETF OPT ] " + sym + " PUT\n"
+                    msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
+                    msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
+                    msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
+                    msg += "DTE    " + str(opp["dte"]) + "d | roadmap: " + opp.get("roadmap_note", "")
+                    send_alert(msg)
+
+                elif typ == "call":
+                    if check_covered_call_already_open(encrypted, sym):
+                        continue
+                    place_covered_call(encrypted, opp["opt_symbol"],
+                                      opp.get("contracts", 1), prem)
+                    msg  = "[ ETF OPT ] " + sym + " CALL\n"
+                    msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
+                    msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
+                    msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
+                    msg += "DTE    " + str(opp["dte"]) + "d | roadmap: " + opp.get("roadmap_note", "")
+                    send_alert(msg)
+
+        except Exception as ex:
+            print(f"ETF options error: {ex}")
         run_sgov_parking(encrypted, cash, capital)
 
         # ── ETF sweep ──
@@ -732,18 +806,20 @@ def get_total_portfolio(encrypted: str = None) -> float:
 
 def get_swing_ceiling(encrypted: str = None, cash_available: float = 0) -> float:
     """
-    Calculate swing position ceiling based on total portfolio.
-    Uses 2% portfolio risk / 5% stop = proper swing size.
-    Capped at 80% of available cash.
-    Never shows exact amounts in Telegram.
+    Swing position ceiling = 65% of cash / 3 positions = ~21.67% per trade.
+    Allows 3 concurrent swing positions.
+    65% swing | 25% options | 10% SGOV reserve.
+
+    At $3,340 cash:
+    65% = $2,171 for swings
+    Per position: $724 (allows 3 at once)
     """
-    total    = get_total_portfolio(encrypted)
-    risk_amt = total * 0.02         # 2% of total portfolio at risk
-    stop_pct = 0.05                 # 5% stop loss
-    risk_pos = risk_amt / stop_pct  # position size to risk 2%
-    cash_cap = cash_available * 0.80 if cash_available > 0 else risk_pos
-    ceiling  = min(risk_pos, cash_cap)
-    return round(ceiling, 2)
+    if cash_available <= 0:
+        ledger = load_ledger()
+        cash_available = ledger.get("cash_balance", 1000)
+    swing_budget = cash_available * SWING_PCT
+    per_position = swing_budget / MAX_SWING_POSITIONS
+    return round(per_position, 2)
 
 
 def get_swing_position_size_v2(conviction: int, encrypted: str = None, cash: float = 0) -> float:
@@ -781,8 +857,9 @@ def run_sgov_parking(encrypted: str, cash: float, capital: float):
                 pass
         tax_park = min(tax_owed, cash * 0.30) if tax_owed > 100 else 0
         etf_park = etf_b if (etf_b < 50 and idle_days >= 7) else 0
-        bot_park = max(bot_b - 200, 0) if bot_b > 300 else 0
-        total    = tax_park + etf_park + bot_park
+        bot_park    = max(bot_b - 200, 0) if bot_b > 300 else 0
+        reserve_amt = cash * RESERVE_PCT if cash > 500 else 0  # 10% always in reserve
+        total       = tax_park + etf_park + bot_park + reserve_amt
         if total < 100:
             return
         resp = requests.get(

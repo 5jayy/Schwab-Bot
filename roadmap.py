@@ -467,10 +467,20 @@ def calculate_roadmap(encrypted: str) -> dict:
     roadmap["opportunity_cost"]    = round(opportunity_cost, 2)
     roadmap["redirect_worthwhile"] = redirect_worthwhile
 
-    # Save to ledger
-    ledger["roadmap_priority_etf"] = roadmap["priority_etf"]
-    ledger["roadmap_sweep_split"]  = sweep_split
-    ledger["roadmap_swing_vs_etf"] = roadmap["swing_vs_etf"]
+    # Save to ledger — including live opportunities for wheel to use
+    ledger["roadmap_priority_etf"]    = roadmap["priority_etf"]
+    ledger["roadmap_sweep_split"]     = sweep_split
+    ledger["roadmap_swing_vs_etf"]    = roadmap["swing_vs_etf"]
+    ledger["live_etf_opportunities"]  = roadmap.get("live_opportunities", [])
+
+    # Save owned ETF positions for wheel
+    owned = {}
+    for sym, pos in positions.items():
+        owned[sym] = {
+            "shares":    pos.get("shares", 0),
+            "avg_price": pos.get("avg_price", 0),
+        }
+    ledger["owned_etfs"] = owned
     save_ledger(ledger)
 
     return roadmap
@@ -479,7 +489,7 @@ def calculate_roadmap(encrypted: str) -> dict:
 def get_priority_etf() -> str:
     """Returns which ETF to prioritize in sweeps. Called by bot.py."""
     ledger = load_ledger()
-    return ledger.get("roadmap_priority_etf", "SCHB")
+    return ledger.get("roadmap_priority_etf", None)
 
 
 def send_roadmap_alert(encrypted: str):
@@ -734,7 +744,7 @@ def get_brain_state(encrypted: str = None) -> dict:
         profit_split = {"etf": 0.70, "cash": 0.20, "bot": 0.10}  # more to ETF
         split_reason = "near_etf_sweep"
     else:
-        profit_split = {"etf": 0.60, "cash": 0.30, "bot": 0.10}  # normal
+        profit_split = {"etf": 0.30, "cash": 0.50, "bot": 0.10}  # normal
         split_reason = "normal"
 
     # Position sizing adjustment
