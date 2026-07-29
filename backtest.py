@@ -135,34 +135,46 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
                 in_trade = False
             continue
 
-        # Entry signal scoring
-        ema9  = ema(closes, 9)
-        ema21 = ema(closes, 21)
-        rsi14 = rsi(closes, 14)
-        if not ema9 or not ema21 or not rsi14:
+        # ── Real bot entry signals (matches live scanner) ──
+        # 1. Candle strength — body/range ratio
+        c      = candles[i]
+        rng    = c["high"] - c["low"]
+        body   = abs(c["close"] - c["open"])
+        if rng == 0:
             continue
-        if ema9 <= ema21 or rsi14 >= 72 or rsi14 <= 28:
+        strength = body / rng
+        close_pos = (c["close"] - c["low"]) / rng
+        candle_score = strength * 50 + close_pos * 30
+
+        if candle_score < 20:  # weak candle — skip
             continue
 
-        score = ((ema9 - ema21) / ema21) * 100 * 35 + (100 - abs(rsi14 - 55)) * 0.35
+        # 2. Volume spike — must be 1.3x 20-bar average
+        vols = [candles[j]["volume"] for j in range(max(0, i-20), i+1)]
+        if len(vols) < 5:
+            continue
+        avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
+        cur_vol = vols[-1]
+        if avg_vol > 0 and cur_vol < avg_vol * 1.3:
+            continue  # no volume spike — skip
 
-        if strategy["use_adx"]:
-            adx_val = calc_adx(window)
-            if adx_val is not None and adx_val < 20:
-                continue
-            score += min(adx_val or 0, 50) * 0.3
+        # 3. MTF alignment — price above MA20 and MA10
+        if len(closes) < 20:
+            continue
+        ma20 = sum(closes[-20:]) / 20
+        ma10 = sum(closes[-10:]) / 10
+        if current <= ma20 or current <= ma10:
+            continue  # not in uptrend — skip
 
-        if strategy["use_macd"]:
-            hist = macd_hist(closes)
-            if hist is not None and hist < 0:
-                continue
-            score += min((hist or 0) * 100, 10)
+        # 4. Wick rejection bonus
+        lower_wick = min(c["open"], c["close"]) - c["low"]
+        wick_bonus = 10 if rng > 0 and lower_wick / rng > 0.45 else 0
 
-        if strategy["use_sweep"]:
-            score += liquidity_sweep(window)
+        # 5. Liquidity sweep bonus
+        sweep_bonus = liquidity_sweep(window) if strategy.get("use_sweep") else 0
 
-        if strategy["use_candles"]:
-            score += candlestick_bonus(window)
+        # Total score
+        score = candle_score * 0.7 + sweep_bonus + wick_bonus + (change_pct * 2 if (change_pct := (current - candles[i-1]["close"]) / candles[i-1]["close"] * 100 if candles[i-1]["close"] > 0 else 0) else 0)
 
         if score < min_score:
             continue

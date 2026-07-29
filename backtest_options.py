@@ -179,7 +179,35 @@ def run_options_backtest(symbols: list = None, days: int = 14,
 
         print(f"  {sym}: {len(candles)} candles | testing {len(dte_range) * len(exit_pcts)} combos")
 
-        for i in range(5, len(candles) - 8, 3):  # every 3 days
+        for i in range(20, len(candles) - 8):  # walk every bar
+            c      = candles[i]
+            closes = [candles[j]["close"] for j in range(max(0, i-20), i+1)]
+            if len(closes) < 20:
+                continue
+
+            # Real entry signals — only enter on qualified setups
+            rng    = c["high"] - c["low"]
+            body   = abs(c["close"] - c["open"])
+            if rng == 0:
+                continue
+            strength  = body / rng
+            close_pos = (c["close"] - c["low"]) / rng
+            candle_sc = strength * 50 + close_pos * 30
+            if candle_sc < 20:
+                continue
+
+            # Volume spike check
+            vols    = [candles[j]["volume"] for j in range(max(0, i-20), i+1)]
+            avg_vol = sum(vols[:-1]) / max(len(vols)-1, 1)
+            if avg_vol > 0 and vols[-1] < avg_vol * 1.2:
+                continue
+
+            # MTF alignment — uptrend only
+            ma20 = sum(closes[-20:]) / 20
+            ma10 = sum(closes[-10:]) / 10
+            if closes[-1] <= ma20 or closes[-1] <= ma10:
+                continue
+
             for dte in dte_range:
                 for ep in exit_pcts:
                     r = simulate_put(
