@@ -706,7 +706,7 @@ def run_strategy():
                 msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
                 msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
                 msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
-                msg += "DTE    " + str(opp["dte"]) + "d (monthly)"
+                msg += "DTE    " + str(opp["dte"]) + "d weekly\nEXIT @ $" + str(opp.get("exit_at", "50%"))
                 send_alert(msg)
         except Exception as ex:
             print(f"Stock options error: {ex}")

@@ -1,21 +1,12 @@
 """
-Circuit Options Scanner — Two Separate Systems
+Circuit Options Scanner — 3-Tier System
 
-1. scan_stock_options() — Stock options (monthly high IV)
-   - Finds high IV stocks from movers
-   - 21-45 DTE (monthly cycle)
-   - Best premium yield per dollar
-   - Pure income — doesn't need to own shares
-   - Budget: 15% of cash
+DAILY   (0-1 DTE):   Highest yield, gamma plays, high IV movers
+WEEKLY  (1-7 DTE):   Earnings/news plays, very high yield
+MONTHLY (21-45 DTE): Stable income, ETF roadmap building
 
-2. scan_etf_options_live() — ETF options (roadmap building)
-   - Uses live scanner to find cheap optionable ETFs
-   - Prioritizes ETFs close to 100 shares (roadmap)
-   - Covered calls on owned ETFs first
-   - Cash secured puts on ETFs we want to own
-   - Budget: 10% of cash
-
-Completely separate — no mixing, no competition.
+Priority: Daily > Weekly > Monthly
+Budget: 15% stock options + 10% ETF options = 25% total
 """
 
 import requests
@@ -28,23 +19,39 @@ MARKET_URL  = "https://api.schwabapi.com/marketdata/v1"
 COMMISSION  = 0.65
 LEDGER_PATH = "/data/trade_ledger.json" if os.path.exists("/data") else "trade_ledger.json"
 
-# Stock options settings
-STOCK_MIN_YIELD   = 0.15   # 15% annualized minimum
-STOCK_MIN_OI      = 100
-STOCK_MIN_VOL     = 10
-STOCK_DELTA_MIN   = 0.18
-STOCK_DELTA_MAX   = 0.35
-STOCK_DTE_MIN     = 21
-STOCK_DTE_MAX     = 45
+# ── DTE windows ──
+DAILY_DTE_MIN   = 0
+DAILY_DTE_MAX   = 1
+WEEKLY_DTE_MIN  = 2
+WEEKLY_DTE_MAX  = 7
+MONTHLY_DTE_MIN = 21
+MONTHLY_DTE_MAX = 45
 
-# ETF options settings
-ETF_MIN_YIELD     = 0.08   # 8% annualized (ETFs have lower IV)
-ETF_MIN_OI        = 50
-ETF_MIN_VOL       = 5
-ETF_DELTA_MIN     = 0.18
-ETF_DELTA_MAX     = 0.35
-ETF_DTE_MIN       = 21
-ETF_DTE_MAX       = 45
+# ── Delta targets ──
+DAILY_DELTA_MIN   = 0.15   # tighter on daily — less risk
+DAILY_DELTA_MAX   = 0.30
+WEEKLY_DELTA_MIN  = 0.18
+WEEKLY_DELTA_MAX  = 0.32
+MONTHLY_DELTA_MIN = 0.18
+MONTHLY_DELTA_MAX = 0.35
+
+# ── Minimum yields ──
+DAILY_MIN_YIELD   = 0.50   # 50%+ annualized for daily (very high)
+WEEKLY_MIN_YIELD  = 0.25   # 25%+ annualized for weekly
+MONTHLY_MIN_YIELD = 0.10   # 10%+ annualized for monthly
+
+# ── Liquidity ──
+DAILY_MIN_OI   = 200   # daily needs more liquidity
+DAILY_MIN_VOL  = 50
+WEEKLY_MIN_OI  = 100
+WEEKLY_MIN_VOL = 20
+MONTHLY_MIN_OI = 50
+MONTHLY_MIN_VOL = 5
+
+# ── Profit exit targets ──
+DAILY_EXIT_PCT   = 0.50   # exit at 50% profit same day
+WEEKLY_EXIT_PCT  = 0.50   # exit at 50% profit during week
+MONTHLY_EXIT_PCT = 0.50   # exit at 50% profit
 
 
 def headers():
@@ -59,25 +66,43 @@ def load_ledger() -> dict:
         return {}
 
 
-def get_movers() -> list:
-    """Get top movers from SPX and NASDAQ."""
-    symbols = []
-    for index in ["$SPX", "$COMP"]:
-        try:
-            resp = requests.get(
-                f"{MARKET_URL}/movers/{index}",
-                headers=headers(),
-                params={"sort": "VOLUME", "frequency": 1},
-                timeout=10
-            )
-            if resp.ok:
-                symbols += [m["symbol"] for m in resp.json().get("screeners", [])[:15]]
-        except Exception:
-            pass
-    return list(set(symbols))
+def get_movers(index: str = "$SPX") -> list:
+    try:
+        resp = requests.get(
+            f"{MARKET_URL}/movers/{index}",
+            headers=headers(),
+            params={"sort": "VOLUME", "frequency": 1},
+            timeout=10
+        )
+        if resp.ok:
+            return [m["symbol"] for m in resp.json().get("screeners", [])[:20]]
+    except Exception:
+        pass
+    return []
 
 
-def get_option_chain(symbol: str, option_type: str = "PUT") -> dict:
+def get_quote(symbol: str) -> dict:
+    try:
+        resp = requests.get(
+            f"{MARKET_URL}/quotes/{symbol}",
+            headers=headers(),
+            params={"fields": "quote"},
+            timeout=8
+        )
+        if resp.ok:
+            q = resp.json().get(symbol, {}).get("quote", {})
+            return {
+                "price":  q.get("lastPrice", 0),
+                "iv":     q.get("volatility", 0),
+                "volume": q.get("totalVolume", 0),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def get_option_chain(symbol: str, option_type: str = "PUT",
+                     dte_min: int = 0, dte_max: int = 45) -> dict:
     try:
         resp = requests.get(
             f"{MARKET_URL}/chains",
@@ -85,8 +110,10 @@ def get_option_chain(symbol: str, option_type: str = "PUT") -> dict:
             params={
                 "symbol":       symbol,
                 "contractType": option_type,
-                "strikeCount":  15,
+                "strikeCount":  20,
                 "strategy":     "SINGLE",
+                "daysToExpiration": dte_max,
+                "fromDate":     None,
             },
             timeout=15
         )
@@ -95,35 +122,41 @@ def get_option_chain(symbol: str, option_type: str = "PUT") -> dict:
         return {}
 
 
-def get_quote_price(symbol: str) -> float:
-    try:
-        resp = requests.get(
-            f"{MARKET_URL}/quotes/{symbol}",
-            headers=headers(),
-            timeout=8
-        )
-        if resp.ok:
-            return resp.json().get(symbol, {}).get("quote", {}).get("lastPrice", 0)
-    except Exception:
-        pass
-    return 0
+def score_option(prem: float, strike: float, dte: int,
+                 delta: float, oi: int, tier: str) -> float:
+    """
+    Score option by:
+    - Annualized yield (primary)
+    - Delta proximity to 0.25 (secondary)
+    - Liquidity (tertiary)
+    """
+    if strike <= 0 or dte <= 0:
+        return 0
+    net_prem  = prem - (COMMISSION / 100)
+    if net_prem <= 0:
+        return 0
+    ann_yield = (net_prem / strike) * (365 / max(dte, 1))
+    delta_score = 1 - abs(delta - 0.25) * 4  # peak at 0.25
+    liq_score   = min(oi / 1000, 1.0)
+    return ann_yield * 100 * (0.80 + delta_score * 0.10 + liq_score * 0.10)
 
 
-def find_best_put(symbol: str, cash_available: float,
-                  min_yield: float, min_oi: int, min_vol: int,
-                  delta_min: float, delta_max: float,
-                  dte_min: int, dte_max: int,
-                  strike_min_pct: float = 0.85,
-                  strike_max_pct: float = 0.99) -> dict | None:
-    """Generic put finder — used by both stock and ETF scanners."""
-    chain      = get_option_chain(symbol, "PUT")
+def find_best_put_tiered(symbol: str, cash_available: float,
+                         dte_min: int, dte_max: int,
+                         delta_min: float, delta_max: float,
+                         min_yield: float, min_oi: int, min_vol: int,
+                         tier: str,
+                         strike_min_pct: float = 0.85,
+                         strike_max_pct: float = 0.99) -> dict | None:
+    """Find best put for given DTE tier."""
+    chain      = get_option_chain(symbol, "PUT", dte_min, dte_max)
     underlying = chain.get("underlyingPrice", 0)
     if underlying <= 0:
         return None
 
     put_map    = chain.get("putExpDateMap", {})
     best       = None
-    best_yield = 0
+    best_score = 0
 
     for expiry, strikes in put_map.items():
         try:
@@ -156,7 +189,7 @@ def find_best_put(symbol: str, cash_available: float,
             oi    = opt.get("openInterest", 0)
             vol   = opt.get("totalVolume", 0)
 
-            if bid <= 0 or prem < 0.10:
+            if bid <= 0 or prem < 0.05:
                 continue
             if oi < min_oi or vol < min_vol:
                 continue
@@ -165,15 +198,17 @@ def find_best_put(symbol: str, cash_available: float,
             if net_prem <= 0:
                 continue
 
-            ann_yield = (net_prem / strike) * (365 / dte)
-            if ann_yield < min_yield:
+            ann_yield = (net_prem / strike) * (365 / max(dte, 1)) * 100
+            if ann_yield < min_yield * 100:
                 continue
 
-            if ann_yield > best_yield:
-                best_yield = ann_yield
+            sc = score_option(prem, strike, dte, delta, oi, tier)
+            if sc > best_score:
+                best_score = sc
                 best = {
                     "symbol":      symbol,
                     "type":        "put",
+                    "tier":        tier,
                     "strike":      strike,
                     "expiry":      expiry.split(":")[0],
                     "dte":         dte,
@@ -183,28 +218,31 @@ def find_best_put(symbol: str, cash_available: float,
                     "net_premium": round(net_prem, 2),
                     "total_prem":  round(net_prem * 100, 2),
                     "collateral":  round(collat, 2),
-                    "ann_yield":   round(ann_yield * 100, 1),
+                    "ann_yield":   round(ann_yield, 1),
                     "underlying":  round(underlying, 2),
                     "opt_symbol":  opt.get("symbol", ""),
+                    "exit_target": round(net_prem * 100 * 0.50, 2),
+                    "score":       round(sc, 2),
                 }
 
     return best
 
 
-def find_best_call(symbol: str, shares: int, avg_cost: float,
-                   min_yield: float, min_oi: int, min_vol: int,
-                   delta_min: float, delta_max: float,
-                   dte_min: int, dte_max: int) -> dict | None:
-    """Generic call finder for covered calls."""
+def find_best_call_tiered(symbol: str, shares: int, avg_cost: float,
+                          dte_min: int, dte_max: int,
+                          delta_min: float, delta_max: float,
+                          min_yield: float, min_oi: int, min_vol: int,
+                          tier: str) -> dict | None:
+    """Find best covered call for given DTE tier."""
     if shares < 100:
         return None
 
-    chain      = get_option_chain(symbol, "CALL")
+    chain      = get_option_chain(symbol, "CALL", dte_min, dte_max)
     underlying = chain.get("underlyingPrice", avg_cost)
     call_map   = chain.get("callExpDateMap", {})
     contracts  = shares // 100
     best       = None
-    best_yield = 0
+    best_score = 0
 
     for expiry, strikes in call_map.items():
         try:
@@ -216,7 +254,7 @@ def find_best_call(symbol: str, shares: int, avg_cost: float,
 
         for strike_str, opts in strikes.items():
             strike = float(strike_str)
-            if strike < avg_cost * 1.01 or strike > underlying * 1.10:
+            if strike < avg_cost * 1.01 or strike > underlying * 1.08:
                 continue
 
             opt = opts[0] if opts else None
@@ -233,22 +271,23 @@ def find_best_call(symbol: str, shares: int, avg_cost: float,
             oi    = opt.get("openInterest", 0)
             vol   = opt.get("totalVolume", 0)
 
-            if bid <= 0 or prem < 0.10:
+            if bid <= 0 or prem < 0.05:
                 continue
             if oi < min_oi or vol < min_vol:
                 continue
 
             net_prem  = prem - (COMMISSION / 100)
-            ann_yield = (net_prem / strike) * (365 / dte)
-
-            if ann_yield < min_yield:
+            ann_yield = (net_prem / strike) * (365 / max(dte, 1)) * 100
+            if ann_yield < min_yield * 100:
                 continue
 
-            if ann_yield > best_yield:
-                best_yield = ann_yield
+            sc = score_option(prem, strike, dte, delta, oi, tier)
+            if sc > best_score:
+                best_score = sc
                 best = {
                     "symbol":      symbol,
                     "type":        "call",
+                    "tier":        tier,
                     "strike":      strike,
                     "expiry":      expiry.split(":")[0],
                     "dte":         dte,
@@ -259,205 +298,197 @@ def find_best_call(symbol: str, shares: int, avg_cost: float,
                     "total_prem":  round(net_prem * 100 * contracts, 2),
                     "contracts":   contracts,
                     "collateral":  0,
-                    "ann_yield":   round(ann_yield * 100, 1),
+                    "ann_yield":   round(ann_yield, 1),
                     "underlying":  round(underlying, 2),
                     "avg_cost":    avg_cost,
                     "opt_symbol":  opt.get("symbol", ""),
+                    "exit_target": round(net_prem * 100 * contracts * 0.50, 2),
+                    "score":       round(sc, 2),
                 }
 
     return best
 
 
-# ── SCANNER 1: Stock Options (monthly high IV) ────────────────────────────────
+# ── SCANNER 1: Stock Options (Daily + Weekly + Monthly) ───────────────────────
 
 def scan_stock_options(cash_available: float) -> list:
     """
-    Finds best cash secured puts on high IV stocks.
-    Monthly cycle (21-45 DTE).
-    Pure income — doesn't need to own the stock.
+    Scans for WEEKLY stock options only (1-7 DTE).
+    Weekly wins 15x over monthly on same collateral.
+
+    At $1,500 budget:
+    Weekly: $150/contract × 4 = $600/mo
+    Monthly: $25/mo — not worth it
+
+    Exit at 50% profit — never hold to expiry.
     Budget: 15% of swing cash.
     """
-    opportunities = []
-    symbols       = get_movers()
-    scanned       = set()
+    symbols = list(set(get_movers("$SPX") + get_movers("$COMP")))
+    weekly  = []
+    scanned = set()
 
-    print(f"  Stock options scan: {len(symbols)} movers | ${cash_available:,.0f} budget")
+    print(f"  Stock options WEEKLY scan: {len(symbols)} symbols | ${cash_available:,.0f} budget")
 
     for sym in symbols:
         if sym in scanned:
             continue
         scanned.add(sym)
 
-        price = get_quote_price(sym)
-        if price <= 0:
+        q     = get_quote(sym)
+        price = q.get("price", 0)
+        if price <= 0 or price * 100 > cash_available:
             continue
-
-        # Skip if stock too expensive for collateral
-        if price * 100 > cash_available:
-            continue
-
-        # Skip very cheap stocks (poor premium quality)
         if price < 10:
             continue
 
-        put = find_best_put(
+        # Weekly only — 1-7 DTE
+        w = find_best_put_tiered(
             sym, cash_available,
-            min_yield=STOCK_MIN_YIELD,
-            min_oi=STOCK_MIN_OI,
-            min_vol=STOCK_MIN_VOL,
-            delta_min=STOCK_DELTA_MIN,
-            delta_max=STOCK_DELTA_MAX,
-            dte_min=STOCK_DTE_MIN,
-            dte_max=STOCK_DTE_MAX,
-            strike_min_pct=0.87,
+            WEEKLY_DTE_MIN, WEEKLY_DTE_MAX,
+            WEEKLY_DELTA_MIN, WEEKLY_DELTA_MAX,
+            WEEKLY_MIN_YIELD, WEEKLY_MIN_OI, WEEKLY_MIN_VOL,
+            "weekly",
+            strike_min_pct=0.90,
             strike_max_pct=0.99,
         )
-        if put:
-            put["category"] = "stock"
-            opportunities.append(put)
+        if w:
+            w["exit_at"] = round(w["premium"] * 0.50, 2)  # exit at 50% profit
+            weekly.append(w)
 
-        time.sleep(0.15)
+        time.sleep(0.12)
 
-    return sorted(opportunities, key=lambda x: x["ann_yield"], reverse=True)
+    # Sort each tier by score
+    daily.sort(key=lambda x: x["score"], reverse=True)
+    weekly.sort(key=lambda x: x["score"], reverse=True)
+    monthly.sort(key=lambda x: x["score"], reverse=True)
+
+    # Priority: daily first, then weekly, then monthly
+    return daily[:2] + weekly[:2] + monthly[:2]
 
 
-# ── SCANNER 2: ETF Options (roadmap building) ─────────────────────────────────
+# ── SCANNER 2: ETF Options (Roadmap Building) ─────────────────────────────────
 
 def scan_etf_options_live(cash_available: float, positions: list = None) -> list:
     """
-    Finds best ETF options using live scanner results from roadmap.
-    Priority:
-    1. Covered calls on ETFs you already own (100+ shares)
-    2. Cash secured puts on ETFs near 100 shares (building roadmap)
-    3. Cash secured puts on any cheap optionable ETF from live scanner
+    ETF options scanner — roadmap building.
+    Covered calls on owned ETFs first (any DTE).
+    Puts on ETFs near 100 shares.
     Budget: 10% of swing cash.
     """
     opportunities = []
     ledger        = load_ledger()
+    live_etfs     = ledger.get("live_etf_opportunities", [])
+    owned_etfs    = ledger.get("owned_etfs", {})
 
-    # Get live ETF opportunities from roadmap scanner
-    live_etfs   = ledger.get("live_etf_opportunities", [])
-    owned_etfs  = ledger.get("owned_etfs", {})
-
-    # 1. Covered calls on owned ETFs (100+ shares) — highest priority
+    # 1. Covered calls on owned ETFs (100+ shares) — all tiers
     if positions:
         for p in positions:
-            inst   = p.get("instrument", {})
-            sym    = inst.get("symbol", "")
-            asset  = inst.get("assetType", "")
-            if asset != "EQUITY":
+            inst     = p.get("instrument", {})
+            sym      = inst.get("symbol", "")
+            if inst.get("assetType") != "EQUITY":
                 continue
             shares   = int(p.get("longQuantity", 0))
             avg_cost = p.get("averagePrice", 0)
             if shares < 100 or avg_cost <= 0:
                 continue
 
-            call = find_best_call(
-                sym, shares, avg_cost,
-                min_yield=ETF_MIN_YIELD,
-                min_oi=ETF_MIN_OI,
-                min_vol=ETF_MIN_VOL,
-                delta_min=ETF_DELTA_MIN,
-                delta_max=ETF_DELTA_MAX,
-                dte_min=ETF_DTE_MIN,
-                dte_max=ETF_DTE_MAX,
-            )
-            if call:
-                call["category"]     = "etf_call"
-                call["roadmap_note"] = "covered call — " + str(shares) + " shares owned"
-                opportunities.append(call)
+            # Try weekly first then monthly for ETF calls
+            for tier, dmin, dmax, dymin, doi, dvol, dmin_d, dmax_d in [
+                ("weekly",  WEEKLY_DTE_MIN,  WEEKLY_DTE_MAX,  WEEKLY_MIN_YIELD,  WEEKLY_MIN_OI,  WEEKLY_MIN_VOL,  WEEKLY_DELTA_MIN,  WEEKLY_DELTA_MAX),
+                ("monthly", MONTHLY_DTE_MIN, MONTHLY_DTE_MAX, MONTHLY_MIN_YIELD, MONTHLY_MIN_OI, MONTHLY_MIN_VOL, MONTHLY_DELTA_MIN, MONTHLY_DELTA_MAX),
+            ]:
+                call = find_best_call_tiered(
+                    sym, shares, avg_cost,
+                    dmin, dmax, dmin_d, dmax_d,
+                    dymin, doi, dvol, tier
+                )
+                if call:
+                    call["category"]     = "etf_call"
+                    call["roadmap_note"] = str(shares) + " shares owned"
+                    opportunities.append(call)
+                    break
 
             time.sleep(0.15)
 
-    # 2. Puts on ETFs from live scanner — prioritize cheapest/closest to 100
+    # 2. Puts on ETFs from live scanner
     scanned = {o["symbol"] for o in opportunities}
-
-    # Sort live ETFs by ROI score (set by roadmap)
     sorted_live = sorted(live_etfs, key=lambda x: x.get("score", 0), reverse=True)
 
     for etf in sorted_live[:10]:
         sym   = etf.get("symbol", "")
         price = etf.get("price", 0)
-
         if not sym or price <= 0 or sym in scanned:
             continue
 
-        # Check how many shares we own (roadmap progress)
-        shares_owned = owned_etfs.get(sym, {}).get("shares", 0)
-        shares_needed = max(0, 100 - shares_owned)
+        shares_owned  = owned_etfs.get(sym, {}).get("shares", 0)
         pct_to_call   = int(shares_owned / 100 * 100)
-
-        # Only sell puts on ETFs we want to own more of
-        collat_needed = price * 0.97 * 100  # 3% OTM put
+        collat_needed = price * 0.97 * 100
         if collat_needed > cash_available:
             continue
 
-        put = find_best_put(
-            sym, cash_available,
-            min_yield=ETF_MIN_YIELD,
-            min_oi=ETF_MIN_OI,
-            min_vol=ETF_MIN_VOL,
-            delta_min=ETF_DELTA_MIN,
-            delta_max=ETF_DELTA_MAX,
-            dte_min=ETF_DTE_MIN,
-            dte_max=ETF_DTE_MAX,
-            strike_min_pct=0.90,
-            strike_max_pct=0.99,
-        )
-        if put:
-            put["category"]     = "etf_put"
-            put["roadmap_note"] = str(pct_to_call) + "% to call unlock"
-            put["shares_owned"] = shares_owned
-            put["shares_needed"] = shares_needed
-            opportunities.append(put)
-            scanned.add(sym)
+        # ETF puts — weekly or monthly only (no daily on ETFs)
+        for tier, dmin, dmax, dymin, doi, dvol, dmin_d, dmax_d in [
+            ("weekly",  WEEKLY_DTE_MIN,  WEEKLY_DTE_MAX,  WEEKLY_MIN_YIELD,  WEEKLY_MIN_OI,  WEEKLY_MIN_VOL,  WEEKLY_DELTA_MIN,  WEEKLY_DELTA_MAX),
+            ("monthly", MONTHLY_DTE_MIN, MONTHLY_DTE_MAX, ETF_MIN_YIELD,     MONTHLY_MIN_OI, MONTHLY_MIN_VOL, MONTHLY_DELTA_MIN, MONTHLY_DELTA_MAX),
+        ]:
+            put = find_best_put_tiered(
+                sym, cash_available,
+                dmin, dmax, dmin_d, dmax_d,
+                dymin, doi, dvol, tier,
+                strike_min_pct=0.90,
+                strike_max_pct=0.99,
+            )
+            if put:
+                put["category"]      = "etf_put"
+                put["roadmap_note"]  = str(pct_to_call) + "% to call unlock"
+                put["shares_owned"]  = shares_owned
+                opportunities.append(put)
+                scanned.add(sym)
+                break
 
         time.sleep(0.15)
 
-    # Sort: covered calls first (already own shares), then puts by yield
     calls = [o for o in opportunities if o["type"] == "call"]
     puts  = sorted([o for o in opportunities if o["type"] == "put"],
-                   key=lambda x: x["ann_yield"], reverse=True)
-
+                   key=lambda x: x["score"], reverse=True)
     return calls + puts
 
 
-# ── COMBINED SCAN (for testing) ───────────────────────────────────────────────
+ETF_MIN_YIELD = 0.08  # 8% for ETFs
+
 
 def scan_options(cash_available: float, positions: list = None,
                  extra_symbols: list = None) -> list:
-    """Legacy combined scan — kept for backtest compatibility."""
-    stock_budget = cash_available * 0.60
-    etf_budget   = cash_available * 0.40
-    results      = scan_stock_options(stock_budget)
-    results     += scan_etf_options_live(etf_budget, positions)
-    return sorted(results, key=lambda x: x["ann_yield"], reverse=True)
+    """Legacy combined scan — kept for compatibility."""
+    results  = scan_stock_options(cash_available * 0.60)
+    results += scan_etf_options_live(cash_available * 0.40, positions)
+    return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
 if __name__ == "__main__":
-    print("\n[ CIRCUIT ] OPTIONS SCANNER TEST")
-    print("="*50)
+    print("\n[ CIRCUIT ] OPTIONS SCANNER — 3 TIERS")
+    print("="*55)
 
-    CASH = 835  # 15% of $3,340 for stock options test
+    STOCK_CASH = 502   # 15% of $3,340
+    ETF_CASH   = 334   # 10% of $3,340
 
-    print(f"\nSTOCK OPTIONS (${CASH:,.0f} budget, 15% monthly):")
-    stock_results = scan_stock_options(cash_available=CASH)
-    if stock_results:
-        for r in stock_results[:5]:
-            print(f"  {r['symbol']} PUT | strike ${r['strike']} | {r['dte']}d | delta {r['delta']}")
-            print(f"    yield {r['ann_yield']}%/yr | net ${r['total_prem']:.2f}/mo | collat ${r['collateral']:,.0f}")
+    print(f"\nSTOCK OPTIONS (${STOCK_CASH:,.0f} | daily > weekly > monthly):")
+    stock = scan_stock_options(STOCK_CASH)
+    if stock:
+        for r in stock[:6]:
+            print(f"  [{r['tier'].upper()}] {r['symbol']} PUT | strike ${r['strike']} | {r['dte']}d | delta {r['delta']}")
+            print(f"    yield {r['ann_yield']}%/yr | net ${r['total_prem']:.2f} | exit @50% = ${r['exit_target']:.2f}")
     else:
-        print("  No qualifying stock options")
+        print("  No qualifying options (market closed or low IV)")
 
-    ETF_CASH = 334  # 10% of $3,340 for ETF options test
-    print(f"\nETF OPTIONS (${ETF_CASH:,.0f} budget, 10% roadmap):")
-    etf_results = scan_etf_options_live(cash_available=ETF_CASH)
-    if etf_results:
-        for r in etf_results[:5]:
+    print(f"\nETF OPTIONS (${ETF_CASH:,.0f} | weekly > monthly):")
+    etf = scan_etf_options_live(ETF_CASH)
+    if etf:
+        for r in etf[:4]:
             typ = r["type"].upper()
-            print(f"  {r['symbol']} {typ} | strike ${r['strike']} | {r['dte']}d | delta {r['delta']}")
-            print(f"    yield {r['ann_yield']}%/yr | net ${r['total_prem']:.2f}/mo | {r.get('roadmap_note','')}")
+            print(f"  [{r['tier'].upper()}] {r['symbol']} {typ} | strike ${r['strike']} | {r['dte']}d | {r.get('roadmap_note','')}")
+            print(f"    yield {r['ann_yield']}%/yr | net ${r['total_prem']:.2f} | exit @50% = ${r['exit_target']:.2f}")
     else:
         print("  No qualifying ETF options")
 
-    print("\n" + "="*50)
+    print("\n" + "="*55)
