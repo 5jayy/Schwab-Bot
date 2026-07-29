@@ -22,6 +22,11 @@ from options import (
     find_best_cash_secured_put, place_cash_secured_put, check_put_already_open,
     get_open_options, run_wheel
 )
+from options_scanner import scan_stock_options, scan_etf_options_live
+from scanner import (
+    get_price_history, get_mtf_conviction, score_stock,
+    scan_best_stocks, get_star_rating
+)
 from dividends import get_recent_dividends
 from telegram import send_alert
 from token_manager import check_token_health
@@ -222,7 +227,7 @@ def get_mtf_position_size(symbol: str, ceiling: float) -> float:
     2/4 → 35% ceiling (~$70 at $200 ceiling)
     1/4 or less → no trade (returns 0)
     """
-    from scanner import get_mtf_conviction
+    # imports at top level
     conviction = get_mtf_conviction(symbol)
     if conviction >= 4:
         return ceiling          # 4/4 full
@@ -613,7 +618,7 @@ def run_strategy():
                     # Dynamic stop fallback
                     # Pull recent candles for candle-strength based stop
                     try:
-                        from scanner import get_price_history as _gph
+                        # imports at top level
                         _candles = _gph(sym)
                     except Exception:
                         _candles = None
@@ -656,8 +661,7 @@ def run_strategy():
 
                 # MTF conviction sizing
                 # Conviction-based sizing — portfolio-aware, no FVG gate
-                from scanner import get_mtf_conviction as _gmc
-                _conv = _gmc(symbol)
+                _conv = get_mtf_conviction(symbol)
                 position_size = get_swing_position_size_v2(_conv, encrypted, cash)
                 if position_size == 0:
                     print(f"  {symbol}: skip — conviction {_conv}/4 too low")
@@ -684,7 +688,7 @@ def run_strategy():
                     cash -= cost
                     bought_this_run.add(symbol)
                     record_buy(symbol, quantity, price, cost)
-                    from scanner import get_mtf_conviction
+                    # imports at top level
                     conv  = get_mtf_conviction(symbol)
                     stars = get_star_rating(stock)
                     record_conviction_count(conv)
@@ -745,9 +749,9 @@ def run_strategy():
         except Exception as ex:
             print(f"Options monitor error: {ex}")
 
-        # ── Stock Options (15% of cash, monthly high IV) ──
+        # ── Stock Options (15% = weekly 0-7 DTE, 3 DTE preferred per backtest) ──
         try:
-            from options_scanner import scan_stock_options
+            # imports at top level
             stock_opt_budget = cash * STOCK_OPT_PCT
             stock_opts = scan_stock_options(cash_available=stock_opt_budget)
 
@@ -768,7 +772,7 @@ def run_strategy():
 
         # ── ETF Options (10% of cash, builds toward roadmap) ──
         try:
-            from options_scanner import scan_etf_options_live
+            # imports at top level
             etf_opt_budget = cash * ETF_OPT_PCT
             etf_opts = scan_etf_options_live(
                 cash_available=etf_opt_budget,
@@ -1217,8 +1221,7 @@ def poll_telegram_commands():
                 import threading
                 def _run():
                     from backtest import run_backtest
-                    from ledger import get_trading_capital as _gtc
-                    run_backtest(days=14, bot_capital=_gtc())
+                    run_backtest(days=14, bot_capital=load_ledger().get("trading_capital", 2167))
                 threading.Thread(target=_run, daemon=True).start()
             elif text == "/tax":
                 try:

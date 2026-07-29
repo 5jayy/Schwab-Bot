@@ -860,7 +860,7 @@ def find_best_cash_secured_put(symbol: str, current_price: float, cash_available
 def place_covered_call(encrypted: str, option_symbol: str, contracts: int, premium: float):
     """Sell to open a covered call at limit (mid price)."""
     order = {
-        "orderType":         "LIMIT",
+        "orderType":          "LIMIT",
         "session":           "NORMAL",
         "duration":          "DAY",
         "price":             round(premium, 2),
@@ -888,7 +888,7 @@ def place_cash_secured_put(encrypted: str, option_symbol: str, premium: float) -
     limit_price = round(premium, 2)
 
     order = {
-        "orderType":         "LIMIT",
+        "orderType":          "LIMIT",
         "session":           "NORMAL",
         "duration":          "DAY",
         "price":             limit_price,
