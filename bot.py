@@ -718,7 +718,12 @@ def run_strategy():
                                 "orderLegCollection": [{
                                     "instruction": "BUY_TO_CLOSE",
                                     "quantity": short_qty,
-                                    "instrument": {"symbol": opt_sym, "assetType": "OPTION"}
+                                    "instrument": {
+                                        "symbol":            opt_sym,
+                                        "assetType":         "OPTION",
+                                        "putCall":           "PUT" if "P" in opt_sym[-10:] else "CALL",
+                                        "underlyingSymbol":  opt_sym[:4].strip()
+                                    }
                                 }]
                             },
                             timeout=15
