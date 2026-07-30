@@ -78,8 +78,13 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
     bot_value   = 0.0
     new_found   = []
 
+    # Pre-bot positions — never register these (they corrupt win rate)
+    PRE_BOT = {"LCID", "OPEN"}
+
     for p in positions:
         sym = p["instrument"]["symbol"]
+        if sym in PRE_BOT:
+            continue  # skip pre-bot covered call positions
         if sym not in BOT_STOCKS:
             continue
         qty  = p["longQuantity"]
