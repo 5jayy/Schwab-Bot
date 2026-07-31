@@ -36,7 +36,7 @@ def get_historical_candles(symbol: str, days: int = 90, frequency: int = 30) -> 
             params={
                 "symbol":        symbol,
                 "periodType":    "day",
-                "period":        min(days // 30, 6),
+                "period":        10,   # max for day+minute; matches live scanner
                 "frequencyType": "minute",
                 "frequency":     frequency,
                 "needExtendedHoursData": False,
