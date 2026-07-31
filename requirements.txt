@@ -3,3 +3,4 @@ python-dotenv==1.2.2
 flask==3.1.3
 schedule==1.2.2
 pytz
+websockets==13.1
