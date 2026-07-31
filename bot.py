@@ -1047,12 +1047,55 @@ def _record_options_income(total: float):
 # ── ETF sweep ─────────────────────────────────────────────────────────────────
 
 def run_etf_sweep(encrypted: str):
+    """
+    Smart ETF accumulation — builds toward 100 shares to unlock covered calls.
+    Priority: finish the ETF closest to 100 shares first (fastest to income).
+    Falls back to scanner picks only if all owned ETFs already at 100+.
+    """
+    from roadmap import get_etf_build_target
+
     etf_bucket = get_etf_bucket()
-    probe      = scan_best_etfs(etf_bucket, top_n=1)
-    threshold  = probe[0]["price"] if probe else ETF_MIN_SWEEP
-    print(f"\n-- ETF bucket: ${etf_bucket:,.2f} | Threshold: ${threshold:,.2f} --")
-    if etf_bucket < threshold:
+
+    # Get smart build target — which ETF to finish toward 100 shares
+    target_info = get_etf_build_target(encrypted)
+    build       = target_info.get("build_target") if target_info else None
+
+    if build:
+        sym   = build["symbol"]
+        price = build["share_price"]
+        needed = build["shares_needed"]
+        threshold = price  # need at least 1 share worth
+
+        print(f"\n-- ETF build: {sym} {build['shares']}/100 | bucket ${etf_bucket:,.2f} --")
+
+        if etf_bucket < threshold:
+            print(f"   Need ${threshold:.2f} for 1 share — accumulating")
+            return
+
+        # Buy as many shares as bucket allows, capped at what's needed to hit 100
+        affordable = int(etf_bucket // price)
+        qty = min(affordable, needed)
+        if qty < 1:
+            return
+
+        try:
+            place_equity_order(encrypted, sym, qty, "BUY")
+            cost = qty * price
+            deduct_etf_bucket(cost)
+            new_total = build["shares"] + qty
+            if new_total >= 100:
+                send_alert(f"🎯 Bought {qty} {sym} @ ${price:.2f} → {int(new_total)} shares! COVERED CALLS UNLOCKED")
+            else:
+                send_alert(f"📊 Bought {qty} {sym} @ ${price:.2f} → {int(new_total)}/100 shares (building)")
+        except Exception as ex:
+            print(f"  ETF build error {sym}: {ex}")
         return
+
+    # All owned ETFs already at 100+ — use scanner for new positions
+    ready = target_info.get("ready_to_write", []) if target_info else []
+    if ready:
+        print(f"\n-- ETF sweep: {len(ready)} ETF(s) writing calls | bucket ${etf_bucket:,.2f} --")
+
     best = scan_best_etfs(etf_bucket, top_n=2)
     if not best:
         return

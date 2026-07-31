@@ -222,14 +222,27 @@ def get_etf_positions(encrypted: str) -> dict:
         resp.raise_for_status()
         positions = resp.json()["securitiesAccount"].get("positions", [])
         result = {}
+        # Known ETF symbols (broad list — anything that's an ETF, not just roadmap)
+        KNOWN_ETFS = {
+            "SCHB", "SCHG", "SCHD", "SCHA", "SCHF", "SCHE", "SCHX", "SCHZ",
+            "VOO", "VTI", "VUG", "VYM", "VIG", "VXUS", "VEA", "VWO", "BND",
+            "QQQ", "QQQM", "SPY", "IVV", "DIA", "IWM", "JEPI", "JEPQ",
+            "DGRO", "HDV", "NOBL", "SPLG", "SPYG", "SPYD", "RSP",
+        }
         for p in positions:
-            sym = p["instrument"]["symbol"]
-            if sym in ETF_ROADMAP:
+            sym       = p["instrument"]["symbol"]
+            asset_typ = p["instrument"].get("assetType", "")
+            # Track if it's a known ETF OR marked as ETF asset type
+            is_etf = sym in KNOWN_ETFS or asset_typ == "ETF" or sym in ETF_ROADMAP
+            if is_etf:
+                shares = p.get("longQuantity", 0)
                 result[sym] = {
-                    "shares":     p.get("longQuantity", 0),
-                    "avg_price":  p.get("averagePrice", 0),
-                    "mkt_value":  p.get("marketValue", 0),
-                    "cost_basis": p.get("longQuantity", 0) * p.get("averagePrice", 0),
+                    "shares":       shares,
+                    "avg_price":    p.get("averagePrice", 0),
+                    "mkt_value":    p.get("marketValue", 0),
+                    "cost_basis":   shares * p.get("averagePrice", 0),
+                    "shares_to_100": max(0, 100 - int(shares)),  # how many more to unlock covered calls
+                    "can_write_call": shares >= 100,
                 }
         return result
     except Exception as ex:
@@ -484,6 +497,64 @@ def calculate_roadmap(encrypted: str) -> dict:
     save_ledger(ledger)
 
     return roadmap
+
+
+
+
+def get_etf_build_target(encrypted: str) -> dict:
+    """
+    Decides which ETF to build toward 100 shares to unlock covered calls.
+    Logic: prioritize the ETF that is CLOSEST to 100 shares AND affordable.
+    Returns the best build target with reasoning.
+    """
+    etfs = get_etf_positions(encrypted)
+    if not etfs:
+        return {}
+
+    candidates = []
+    for sym, data in etfs.items():
+        shares       = data.get("shares", 0)
+        price        = data.get("avg_price", 0)
+        shares_to_100 = data.get("shares_to_100", 100)
+
+        if data.get("can_write_call"):
+            # Already at 100+ — this one generates income now
+            candidates.append({
+                "symbol":        sym,
+                "shares":        shares,
+                "status":        "READY",
+                "priority":      0,  # highest — already earning
+                "cost_to_finish": 0,
+                "reason":        f"{int(shares)} shares — writing covered calls now",
+            })
+        else:
+            # Cost to reach 100 shares
+            cost_to_finish = shares_to_100 * price
+            # Priority: fewer shares needed = build this first
+            # But weight by affordability (cheaper share price = easier to accumulate)
+            candidates.append({
+                "symbol":         sym,
+                "shares":         shares,
+                "status":         "BUILDING",
+                "priority":       shares_to_100,  # lower = closer to done
+                "cost_to_finish": round(cost_to_finish, 2),
+                "shares_needed":  shares_to_100,
+                "share_price":    price,
+                "reason":         f"{int(shares)}/100 shares — need {shares_to_100} more (${cost_to_finish:.0f})",
+            })
+
+    # Sort: READY first, then closest to 100
+    candidates.sort(key=lambda x: (x["priority"], x.get("cost_to_finish", 0)))
+
+    ready   = [c for c in candidates if c["status"] == "READY"]
+    building = [c for c in candidates if c["status"] == "BUILDING"]
+
+    return {
+        "ready_to_write":  ready,           # ETFs already at 100+ (income now)
+        "build_target":    building[0] if building else None,  # next to build
+        "all_building":    building,
+        "total_etfs":      len(candidates),
+    }
 
 
 def get_priority_etf() -> str:
