@@ -85,9 +85,9 @@ def get_movers(index: str = "$SPX") -> list:
 def get_quote(symbol: str) -> dict:
     try:
         resp = requests.get(
-            f"{MARKET_URL}/quotes/{symbol}",
+            f"{MARKET_URL}/quotes",
             headers=headers(),
-            params={"fields": "quote"},
+            params={"symbols": symbol, "fields": "quote"},
             timeout=8
         )
         if resp.ok:

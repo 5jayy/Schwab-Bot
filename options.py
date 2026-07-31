@@ -154,8 +154,8 @@ def scan_etf_options(cash_available: float, positions: list) -> list:
     for sym in ETF_OPTIONS_SYMBOLS:
         try:
             quote = requests.get(
-                f"https://api.schwabapi.com/marketdata/v1/quotes/{sym}",
-                headers=headers(), timeout=10
+                f"https://api.schwabapi.com/marketdata/v1/quotes",
+                headers=headers(), params={"symbols": sym}, timeout=10
             )
             if not quote.ok:
                 continue
@@ -342,8 +342,8 @@ def scan_etf_options(positions: list, cash_available: float) -> list:
         if cash_available >= cfg["min_shares"] * 20:  # rough min
             try:
                 resp = requests.get(
-                    f"{BASE_URL}/quotes/{sym}",
-                    headers=headers(), timeout=10
+                    f"{BASE_URL}/quotes",
+                    headers=headers(), params={"symbols": sym}, timeout=10
                 )
                 if resp.ok:
                     price = resp.json().get(sym, {}).get("quote", {}).get("lastPrice", 0)

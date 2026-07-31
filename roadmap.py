@@ -133,8 +133,8 @@ def scan_cheap_optionable_etfs(max_price: float = 50.0) -> list:
     for sym in candidates:
         try:
             resp = requests.get(
-                f"{MARKET_URL}/quotes/{sym}",
-                headers=headers(), timeout=8
+                f"{MARKET_URL}/quotes",
+                headers=headers(), params={"symbols": sym}, timeout=8
             )
             if not resp.ok:
                 continue
