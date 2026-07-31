@@ -784,18 +784,37 @@ def run_strategy():
             stock_opt_budget = cash * STOCK_OPT_PCT
             stock_opts = scan_stock_options(cash_available=stock_opt_budget)
 
-            for opp in stock_opts[:1]:  # max 1 stock option at a time
-                sym  = opp["symbol"]
-                prem = opp["premium"]
+            # DEPLOY MULTIPLE PUTS until budget is used — don't leave capital idle
+            budget_left = stock_opt_budget
+            puts_opened = 0
+            MAX_STOCK_PUTS = 5  # cap concurrent puts for diversification
+            for opp in stock_opts:
+                if puts_opened >= MAX_STOCK_PUTS:
+                    break
+                sym    = opp["symbol"]
+                prem   = opp["premium"]
+                strike = opp.get("strike", 0)
+                collateral = strike * 100  # cash-secured put needs strike × 100
+
+                # Only open if we have collateral left for this put
+                if collateral > budget_left:
+                    continue
                 if check_put_already_open(encrypted, sym):
                     continue
+
                 place_cash_secured_put(encrypted, opp["opt_symbol"], prem)
+                budget_left -= collateral
+                puts_opened += 1
+
                 msg  = "[ STOCK OPT ] " + sym + " PUT\n"
                 msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
                 msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
                 msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
                 msg += "DTE    " + str(opp["dte"]) + "d weekly\nEXIT @ $" + str(opp.get("exit_at", "50%"))
                 send_alert(msg)
+
+            if puts_opened > 0:
+                print(f"  Stock options: opened {puts_opened} puts | ${stock_opt_budget - budget_left:.0f} deployed | ${budget_left:.0f} left")
         except Exception as ex:
             print(f"Stock options error: {ex}")
 
@@ -809,7 +828,7 @@ def run_strategy():
                 positions=positions
             )
 
-            for opp in etf_opts[:1]:  # max 1 ETF option at a time
+            for opp in etf_opts[:3]:  # write calls on up to 3 owned ETFs
                 sym  = opp["symbol"]
                 typ  = opp["type"]
                 prem = opp["premium"]
