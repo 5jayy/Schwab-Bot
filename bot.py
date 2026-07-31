@@ -945,13 +945,22 @@ def run_sgov_parking(encrypted: str, cash: float, capital: float):
         tax_park = min(tax_owed, cash * 0.30) if tax_owed > 100 else 0
         etf_park = etf_b if (etf_b < 50 and idle_days >= 7) else 0
         bot_park    = max(bot_b - 200, 0) if bot_b > 300 else 0
-        reserve_amt = cash * RESERVE_PCT if cash > 500 else 0  # 10% always in reserve
+
+        # Reserve — maintain 10% of capital in SGOV, don't re-buy if already parked
+        sgov_owned  = ledger.get("sgov_shares", 0)
+        sgov_value  = ledger.get("sgov_value", 0)
+        target_reserve = capital * RESERVE_PCT
+        reserve_gap    = max(0, target_reserve - sgov_value)
+        # Only park the gap needed to reach target, and only if cash allows
+        reserve_amt = min(reserve_gap, cash * 0.50) if (cash > 500 and reserve_gap > 50) else 0
+
         total       = tax_park + etf_park + bot_park + reserve_amt
         if total < 100:
             return
         resp = requests.get(
-            "https://api.schwabapi.com/marketdata/v1/quotes/SGOV",
-            headers={"Authorization": f"Bearer {get_valid_token()}"}, timeout=10
+            "https://api.schwabapi.com/marketdata/v1/quotes",
+            headers={"Authorization": f"Bearer {get_valid_token()}"},
+            params={"symbols": "SGOV"}, timeout=10
         )
         if not resp.ok:
             return
@@ -963,7 +972,12 @@ def run_sgov_parking(encrypted: str, cash: float, capital: float):
             return
         r = place_equity_order(encrypted, "SGOV", shares, "BUY")
         if r and r.headers.get("Location"):
-            send_alert("[ CIRCUIT ] SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_px:.2f}" + "\nYIELD ~5%/yr")
+            # Track SGOV holdings so we don't over-park
+            lg = load_ledger()
+            lg["sgov_shares"] = lg.get("sgov_shares", 0) + shares
+            lg["sgov_value"]  = lg.get("sgov_value", 0) + shares * sgov_px
+            save_ledger(lg)
+            send_alert("[ CIRCUIT ] SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_px:.2f}" + "\nRESERVE ~5%/yr")
     except Exception as ex:
         print(f"SGOV error: {ex}")
 
