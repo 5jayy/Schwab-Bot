@@ -20,7 +20,8 @@ from scanner import (
 from options import (
     find_best_covered_call, place_covered_call, check_covered_call_already_open,
     find_best_cash_secured_put, place_cash_secured_put, check_put_already_open,
-    get_open_options, run_wheel
+    get_open_options, run_wheel,
+    find_swing_covered_call, get_swing_call_contracts, close_swing_call
 )
 from options_scanner import scan_stock_options, scan_etf_options_live
 from scanner import (
@@ -459,7 +460,6 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
     try:
         # CALL FOLLOWS SWING: if a covered call is open on this swing,
         # buy-to-close it FIRST (never leave a naked call) before selling shares.
-        from options import get_swing_call_contracts, close_swing_call
         call_contracts = get_swing_call_contracts(encrypted, symbol)
         if call_contracts > 0:
             res = close_swing_call(encrypted, symbol, 0)  # close ALL on full exit
@@ -480,10 +480,9 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
         # Does NOT touch trading. Just accumulates so we know how much
         # ETF to sell later to cover it. Swings/options run full speed.
         if profit > 0:
-            from ledger import load_ledger as _ll, save_ledger as _sl
-            _tl = _ll()
+            _tl = load_ledger()
             _tl["ytd_tax_owed"] = _tl.get("ytd_tax_owed", 0.0) + profit * 0.3775
-            _sl(_tl)
+            save_ledger(_tl)
 
         if profit > 0:
             msg_sell = "[ OUT ] " + symbol + " +" + f"{profit:,.2f}" + "\n━━━━━━━━━━━━━━━━━━\nETF    +" + f"{split['etf_cut']:,.2f}" + "\nCASH   +" + f"{split['cash_cut']:,.2f}" + "\nBOT    +" + f"{split['bot_cut']:,.2f}"
@@ -595,7 +594,6 @@ def run_strategy():
                         # Momentum check — sell call only if FADING (won't moonshot)
                         conv_now = get_mtf_conviction(sym)
                         if conv_now <= 2:  # weak/fading — safe to cap with a call
-                            from options import find_swing_covered_call, place_covered_call, check_covered_call_already_open
                             if not check_covered_call_already_open(encrypted, sym):
                                 call = find_swing_covered_call(sym, qty, buy_p)
                                 if call:
@@ -629,7 +627,6 @@ def run_strategy():
                         # CALL FOLLOWS SWING (scale): after selling tp1_qty shares,
                         # remaining shares must still cover the call. Close whole
                         # contracts to stay covered (never naked).
-                        from options import get_swing_call_contracts, close_swing_call
                         call_ct = get_swing_call_contracts(encrypted, sym)
                         if call_ct > 0:
                             shares_after = qty - tp1_qty
@@ -663,7 +660,6 @@ def run_strategy():
                     tp2_qty = max(1, qty // 3)
                     try:
                         # CALL FOLLOWS SWING (scale) — keep covered on TP2 too
-                        from options import get_swing_call_contracts, close_swing_call
                         call_ct2 = get_swing_call_contracts(encrypted, sym)
                         if call_ct2 > 0:
                             shares_after2 = qty - tp2_qty
@@ -855,7 +851,6 @@ def run_strategy():
                             is_call = "C" in opt_sym[-10:] and "P" not in opt_sym[-9:]
 
                             # Route profit: ETF covered calls use 50/50, stock puts use 30/50/20
-                            from ledger import load_ledger, save_ledger
                             owned_etfs = load_ledger().get("owned_etfs", {})
                             is_etf_call = is_call and underlying in owned_etfs
 
@@ -1439,7 +1434,6 @@ def poll_telegram_commands():
                 threading.Thread(target=_run, daemon=True).start()
             elif text == "/tax":
                 try:
-                    from ledger import load_ledger as _ll
                     from roadmap import get_etf_tax_coverage
                     accts = requests.get(
                         "https://api.schwabapi.com/trader/v1/accounts/accountNumbers",
@@ -1447,7 +1441,7 @@ def poll_telegram_commands():
                     ).json()
                     enc = accts[0]["hashValue"]
 
-                    tax_owed = _ll().get("ytd_tax_owed", 0.0)
+                    tax_owed = load_ledger().get("ytd_tax_owed", 0.0)
                     cov = get_etf_tax_coverage(enc)
 
                     parts = [
