@@ -316,6 +316,33 @@ def find_best_call_tiered(symbol: str, shares: int, avg_cost: float,
 
 # ── SCANNER 1: Stock Options (Daily + Weekly + Monthly) ───────────────────────
 
+def get_put_universe() -> list:
+    """
+    Dedicated universe for CASH-SECURED PUTS — its own setup.
+    Wider net than the old 10-symbol list: SPX + Nasdaq + Dow movers,
+    PLUS a curated list of liquid, affordable put-selling names.
+    Separate from the swing scanner and ETF scanner.
+    """
+    # Live movers across all 3 indexes (correct symbols)
+    live = get_movers("$SPX") + get_movers("$COMPX") + get_movers("$DJI")
+
+    # Curated liquid + affordable put-selling names (tight spreads, active weeklies)
+    # These reliably have good put premium and fit small-account collateral.
+    curated = [
+        "F", "INTC", "T", "PFE", "SOFI", "PLTR", "HOOD", "MARA", "RIOT",
+        "NIO", "RIVN", "LCID", "CCL", "AAL", "SNAP", "BAC", "WBD", "VALE",
+        "AMD", "PYPL", "UBER", "COIN", "DKNG", "CLSK", "AFRM", "CHPT",
+    ]
+
+    # Merge, dedupe, drop index symbols
+    seen, universe = set(), []
+    for s in live + curated:
+        if s and s not in seen and not s.startswith("$"):
+            seen.add(s)
+            universe.append(s)
+    return universe
+
+
 def scan_stock_options(cash_available: float) -> list:
     if cash_available < 100:  # need at least $100 to do anything
         print(f"  Stock options: budget ${cash_available:.0f} too small — skip")
@@ -331,7 +358,7 @@ def scan_stock_options(cash_available: float) -> list:
     Exit at 50% profit — never hold to expiry.
     Budget: 15% of swing cash.
     """
-    symbols = list(set(get_movers("$SPX") + get_movers("$COMP")))
+    symbols = get_put_universe()
     daily   = []  # placeholder for return statement
     weekly  = []
     monthly = []  # placeholder for return statement
