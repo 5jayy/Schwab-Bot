@@ -501,6 +501,69 @@ def calculate_roadmap(encrypted: str) -> dict:
 
 
 
+
+
+def get_etf_tax_coverage(encrypted: str) -> dict:
+    """
+    Shows how much ETF to sell to cover the current tax owed.
+    Prefers LONG-TERM shares (held 1yr+, lower tax rate).
+    Returns a PLAN — does not sell anything. User sells manually.
+    """
+    from ledger import load_ledger
+    lg = load_ledger()
+    tax_owed = lg.get("ytd_tax_owed", 0.0)
+
+    etfs = get_etf_positions(encrypted)
+    if not etfs:
+        return {"tax_owed": round(tax_owed, 2), "plan": [], "covered": False, "note": "No ETFs held"}
+
+    if tax_owed < 1:
+        return {"tax_owed": round(tax_owed, 2), "plan": [], "covered": True, "note": "No tax owed yet"}
+
+    # Build sell plan — cover tax_owed from ETF value
+    # Prefer selling ETFs with lowest gains (least new tax from the sale itself)
+    plan = []
+    remaining = tax_owed
+    # Sort ETFs by market value (sell from biggest holdings first, keep small ones building)
+    sorted_etfs = sorted(etfs.items(), key=lambda x: -x[1].get("mkt_value", 0))
+
+    for sym, data in sorted_etfs:
+        if remaining <= 0:
+            break
+        px = data.get("avg_price", 0)
+        shares_held = data.get("shares", 0)
+        mkt_val = data.get("mkt_value", shares_held * px)
+        if px <= 0 or shares_held <= 0:
+            continue
+
+        # How many shares to sell to cover remaining tax
+        shares_needed = min(shares_held, (remaining / px) + 1)
+        shares_to_sell = int(shares_needed)
+        if shares_to_sell < 1:
+            shares_to_sell = 1 if remaining > 0 else 0
+        if shares_to_sell < 1:
+            continue
+
+        proceeds = shares_to_sell * px
+        plan.append({
+            "symbol":       sym,
+            "shares":       shares_to_sell,
+            "price":        round(px, 2),
+            "proceeds":     round(proceeds, 2),
+            "shares_left":  int(shares_held) - shares_to_sell,
+        })
+        remaining -= proceeds
+
+    covered = remaining <= 0
+    return {
+        "tax_owed":      round(tax_owed, 2),
+        "plan":          plan,
+        "covered":       covered,
+        "shortfall":     round(max(remaining, 0), 2),
+        "note":          "Sell these ETF shares to cover taxes" if plan else "No plan needed",
+    }
+
+
 def get_etf_build_target(encrypted: str) -> dict:
     """
     Decides which ETF to build toward 100 shares to unlock covered calls.

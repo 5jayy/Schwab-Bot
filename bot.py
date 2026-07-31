@@ -50,11 +50,21 @@ SWING_PCT        = 0.40   # 40% swing trades (up to 3 positions)
 # These were held before the bot started trading
 PRE_BOT_POSITIONS = {"LCID", "OPEN"}  # hardcoded base; snapshot merged at runtime
 
-def get_pre_bot_positions():
-    """Pre-bot base + auto-snapshot of pre-existing holdings (hands-off)."""
+def get_pre_bot_positions(held_symbols=None):
+    """
+    Hands-off positions = pre-bot base + snapshot + ANYTHING the bot didn't buy.
+    Whole-portfolio protection: if the bot didn't personally purchase it
+    (not in bot_owned), it's protected — never sold, never counts toward max.
+    """
     try:
-        snap = set(load_ledger().get("pre_bot_snapshot", []))
-        return PRE_BOT_POSITIONS | snap
+        lg = load_ledger()
+        snap = set(lg.get("pre_bot_snapshot", []))
+        base = PRE_BOT_POSITIONS | snap
+        # If we know current holdings, protect everything not bot-bought
+        if held_symbols is not None:
+            bot_owned = set(lg.get("bot_owned", []))
+            base = base | (set(held_symbols) - bot_owned)
+        return base
     except Exception:
         return PRE_BOT_POSITIONS
 STOCK_OPT_PCT    = 0.50   # 50% stock options (primary strategy)
@@ -466,6 +476,15 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
         record_trade_result(profit, "stock")
         update_win_rate(profit)
 
+        # TAX ACCRUAL (background) — track tax owed on short-term gains.
+        # Does NOT touch trading. Just accumulates so we know how much
+        # ETF to sell later to cover it. Swings/options run full speed.
+        if profit > 0:
+            from ledger import load_ledger as _ll, save_ledger as _sl
+            _tl = _ll()
+            _tl["ytd_tax_owed"] = _tl.get("ytd_tax_owed", 0.0) + profit * 0.3775
+            _sl(_tl)
+
         if profit > 0:
             msg_sell = "[ OUT ] " + symbol + " +" + f"{profit:,.2f}" + "\n━━━━━━━━━━━━━━━━━━\nETF    +" + f"{split['etf_cut']:,.2f}" + "\nCASH   +" + f"{split['cash_cut']:,.2f}" + "\nBOT    +" + f"{split['bot_cut']:,.2f}"
             send_alert(msg_sell)
@@ -549,6 +568,8 @@ def run_strategy():
 
         # ── Sell signals + dynamic stops + delta trail ──
         sold_this_run = set()
+        # Whole-portfolio protection: all current holdings (for hands-off check)
+        held_syms = {p["instrument"]["symbol"] for p in positions}
         for pos in positions:
             sym = pos["instrument"]["symbol"]
             if sym not in BOT_STOCKS or sym in sold_this_run:
@@ -567,7 +588,7 @@ def run_strategy():
             # Extra income on a swing that's profitable but stalling.
             # Only 100+ shares (whole contract), no existing call, weak momentum.
             try:
-                if qty >= 100 and sym not in get_pre_bot_positions():
+                if qty >= 100 and sym not in get_pre_bot_positions(held_syms):
                     bt = load_ledger().get("open_trades", {}).get(sym, {})
                     buy_p = bt.get("buy_price", 0)
                     if buy_p > 0 and price > buy_p:  # GREEN only
@@ -592,7 +613,7 @@ def run_strategy():
             # ── TP1 / TP2 scale-out — only for bot-entered positions ──
             bot_trade = load_ledger().get("open_trades", {}).get(sym, {})
             # Skip TP1/TP2 for pre-bot positions and positions not in ledger
-            if sym in get_pre_bot_positions():
+            if sym in get_pre_bot_positions(held_syms):
                 bot_trade = {}
             if trail_info and not trigger and bot_trade:
                 buy_px  = trail_info["buy_price"]
@@ -724,9 +745,11 @@ def run_strategy():
                     continue
 
                 # Max 3 swing positions at once
-                open_count = len(load_ledger().get("open_trades", {}))
+                # Count only ACTIVE bot swings toward max — pre-owned excluded
+                _ot = load_ledger().get("open_trades", {})
+                open_count = sum(1 for t in _ot.values() if not t.get("pre_owned", False))
                 if open_count >= MAX_SWING_POSITIONS:
-                    print(f"  {symbol}: skip — max {MAX_SWING_POSITIONS} positions open")
+                    print(f"  {symbol}: skip — max {MAX_SWING_POSITIONS} bot swings open (pre-owned not counted)")
                     break
 
                 # MTF conviction sizing
@@ -1416,14 +1439,35 @@ def poll_telegram_commands():
                 threading.Thread(target=_run, daemon=True).start()
             elif text == "/tax":
                 try:
-                    from tax import get_tax_report
-                    r = get_tax_report()
+                    from ledger import load_ledger as _ll
+                    from roadmap import get_etf_tax_coverage
+                    accts = requests.get(
+                        "https://api.schwabapi.com/trader/v1/accounts/accountNumbers",
+                        headers={"Authorization": f"Bearer {get_valid_token()}"}
+                    ).json()
+                    enc = accts[0]["hashValue"]
+
+                    tax_owed = _ll().get("ytd_tax_owed", 0.0)
+                    cov = get_etf_tax_coverage(enc)
+
                     parts = [
-                        "[ CIRCUIT ] TAX " + str(r["year"]),
-                        "ST GAINS  " + f"{r['short_term_gains']:,.2f}",
-                        "LT GAINS  " + f"{r['long_term_gains']:,.2f}",
-                        "TAX OWED  " + f"{r['total_tax_owed']:,.2f}",
+                        "[ CIRCUIT ] TAX PLAN",
+                        "━━━━━━━━━━━━━━━━━━",
+                        "TAX OWED  $" + f"{tax_owed:,.2f}",
+                        "(short-term swing/options)",
+                        "",
                     ]
+                    if cov["plan"]:
+                        parts.append("TO COVER — sell ETF:")
+                        for p in cov["plan"]:
+                            parts.append(f"  {p['symbol']}: {p['shares']} sh = ${p['proceeds']:,.0f}")
+                            parts.append(f"    ({p['shares_left']} left after)")
+                        if not cov["covered"]:
+                            parts.append(f"SHORTFALL $" + f"{cov['shortfall']:,.2f}")
+                        parts.append("")
+                        parts.append("You sell manually when ready")
+                    else:
+                        parts.append(cov.get("note", "No tax action needed"))
                     send_alert("\n".join(parts))
                 except Exception as ex:
                     send_alert("Tax error: " + str(ex))

@@ -113,19 +113,45 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
         tag = "first run" if first_run else "new deploy"
         print(f"Auto-snapshot ({tag}): {len(pre_bot_snapshot)} hands-off from live Schwab: {sorted(pre_bot_snapshot)}")
 
-    # Combine hardcoded pre-bot + live-verified auto-snapshot
-    PRE_BOT = {"LCID", "OPEN"} | pre_bot_snapshot
+    # ETFs are the ONLY hands-off-from-selling positions (tax anchor — never stop-loss).
+    # Everything else (LCID/OPEN/swings) is managed with trail/TP/sell.
+    # ETFs are still BUILT toward 100 via the roadmap sweep, just never stop-lossed.
+    KNOWN_ETFS = {
+        "SCHB", "SCHG", "SCHD", "SCHA", "SCHF", "SCHE", "SCHX", "SCHZ",
+        "VOO", "VTI", "VUG", "VYM", "VIG", "VXUS", "VEA", "VWO", "BND",
+        "QQQ", "QQQM", "SPY", "IVV", "DIA", "IWM", "JEPI", "JEPQ", "SGOV",
+        "DGRO", "HDV", "NOBL", "SPLG", "SPYG", "SPYD", "RSP",
+    }
+    # ETFs held = protected from stop-loss (build/hold for tax efficiency)
+    held_etfs = held_now & KNOWN_ETFS
+
+    # PRE_BOT (never stop-loss) = ETFs only. LCID/OPEN now MANAGED like swings.
+    PRE_BOT = held_etfs
+
+    bot_owned = set(lg_snap.get("bot_owned", []))
 
     for p in positions:
         sym = p["instrument"]["symbol"]
-        if sym in PRE_BOT:
-            continue  # skip pre-bot / pre-existing positions (hands-off)
-        if sym not in BOT_STOCKS:
+
+        # ETFs: never register for stop-loss management (build/hold for tax).
+        # They're handled by the roadmap sweep (buy toward 100), not trailing stops.
+        if sym in PRE_BOT:  # PRE_BOT = held ETFs
             continue
+
+        # Manage: bot's own stocks (BOT_STOCKS) OR pre-owned stocks like LCID/OPEN.
+        # A stock is managed if it's a known bot stock OR already held (pre-owned).
+        is_managed_stock = sym in BOT_STOCKS
+        if not is_managed_stock:
+            continue  # not a stock we manage (leaves unknown tickers alone)
+
         qty  = p["longQuantity"]
         avg  = p["averagePrice"]
         cost = qty * avg
         bot_value += cost
+
+        # Is this pre-owned (existed before bot bought it) or a bot trade?
+        # pre_owned = held but NOT in bot_owned registry → doesn't count toward max
+        is_pre_owned = sym not in bot_owned
 
         # Register position if not already tracked
         if sym not in open_trades:
@@ -134,7 +160,9 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
                 "buy_price":  avg,
                 "cost":       cost,
                 "high_price": avg,  # initialize peak price at registration
-                "bought_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                "bought_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "pre_owned":  is_pre_owned,  # True = managed but excluded from max count
+                "term":       "long" if not is_pre_owned else "short",  # tax tracking
             }
             new_found.append(sym)
         else:
@@ -142,6 +170,7 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
             open_trades[sym]["quantity"]  = qty
             open_trades[sym]["buy_price"] = avg
             open_trades[sym]["cost"]      = cost
+            open_trades[sym].setdefault("pre_owned", is_pre_owned)
 
     # SNAPSHOT RELEASE: if a pre-existing position was SOLD (no longer held),
     # remove it from the snapshot so a future bot buy of that ticker CAN be managed.
@@ -264,6 +293,11 @@ def record_buy(symbol: str, quantity: int, price: float, cost: float,
         "tp2_hit":     False,
         "bought_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
+    # BOT-OWNED REGISTRY: tag this as a position the BOT bought.
+    # Anything NOT in this list is a pre-existing/manual holding = hands-off.
+    bot_owned = set(ledger.get("bot_owned", []))
+    bot_owned.add(symbol)
+    ledger["bot_owned"] = list(bot_owned)
     save_ledger(ledger)
 
 
@@ -591,6 +625,10 @@ def record_sell_and_split(symbol: str, quantity: int, sell_price: float, proceed
             "closed_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         })
         del ledger["open_trades"][symbol]
+        # Remove from bot_owned — position closed, ticker freed for future
+        bot_owned = set(ledger.get("bot_owned", []))
+        bot_owned.discard(symbol)
+        ledger["bot_owned"] = list(bot_owned)
 
     # Split profit immediately on every sell
     if profit > 0:
