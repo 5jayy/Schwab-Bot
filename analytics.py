@@ -10,7 +10,7 @@ import requests
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from auth import get_valid_token
 
 BASE_URL    = "https://api.schwabapi.com/trader/v1"
@@ -36,7 +36,7 @@ def load_ledger() -> dict:
 
 def get_schwab_trades(encrypted: str, days_back: int = 30) -> list:
     """Pull all TRADE transactions from Schwab."""
-    end   = datetime.utcnow()
+    end   = datetime.now(timezone.utc)
     start = end - timedelta(days=days_back)
     try:
         resp = requests.get(
@@ -292,7 +292,7 @@ def run_analytics(days_back: int = 30):
     path = "/data/analytics_results.json" if os.path.exists("/data") else "analytics_results.json"
     with open(path, "w") as f:
         json.dump({
-            "run_date":    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "run_date":    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "days_back":   days_back,
             "total":       total,
             "win_rate":    round(win_rate, 1),

@@ -1,5 +1,5 @@
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from auth import get_valid_token
 
 BASE_URL = "https://api.schwabapi.com/trader/v1"
@@ -14,7 +14,7 @@ def get_recent_dividends(encrypted: str, days_back: int = 2) -> list:
     Fetch recent DIVIDEND_OR_INTEREST transactions from Schwab.
     Returns list of dividend events with symbol, amount, and whether reinvested.
     """
-    end = datetime.utcnow()
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=days_back)
 
     try:

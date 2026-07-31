@@ -9,7 +9,7 @@ import signal
 import schedule
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 from dotenv import load_dotenv
 from auth import get_valid_token
@@ -1296,7 +1296,7 @@ def check_dividends(encrypted: str):
 
 def get_schwab_transactions(encrypted: str, days_back: int = 1) -> list:
     from datetime import timedelta
-    end   = datetime.utcnow()
+    end   = datetime.now(timezone.utc)
     start = end - timedelta(days=days_back)
     try:
         resp = requests.get(

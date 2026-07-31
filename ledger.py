@@ -82,7 +82,10 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
     # AUTO-SNAPSHOT: uses LIVE Schwab holdings (the 'positions' pulled from the
     # Schwab API this very run) as the source of truth. On first run OR a new deploy,
     # it reconciles the hands-off list against what Schwab actually shows right now.
-    lg_snap = load_ledger()
+    # Reuse the already-loaded 'ledger' object (loaded above) so the snapshot
+    # flag persists through the final save_ledger(ledger) — avoids the
+    # double-load overwrite that made 'first run' repeat every cycle.
+    lg_snap = ledger
     pre_bot_snapshot = set(lg_snap.get("pre_bot_snapshot", []))
 
     # Live Schwab holdings this run (source of truth)
@@ -109,7 +112,7 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
         lg_snap["pre_bot_snapshot"] = list(pre_bot_snapshot)
         lg_snap["snapshot_taken"]   = True
         lg_snap["last_deploy_id"]   = deploy_id
-        save_ledger(lg_snap)
+        # No separate save here — lg_snap IS ledger, saved at function end.
         tag = "first run" if first_run else "new deploy"
         print(f"Auto-snapshot ({tag}): {len(pre_bot_snapshot)} hands-off from live Schwab: {sorted(pre_bot_snapshot)}")
 
@@ -178,11 +181,10 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
     if pre_bot_snapshot:
         released = [s for s in pre_bot_snapshot if s not in held_symbols]
         if released:
-            lg_rel = load_ledger()
-            snap = set(lg_rel.get("pre_bot_snapshot", []))
+            # Operate on the same 'ledger' object (saved at function end)
+            snap = set(ledger.get("pre_bot_snapshot", []))
             snap -= set(released)
-            lg_rel["pre_bot_snapshot"] = list(snap)
-            save_ledger(lg_rel)
+            ledger["pre_bot_snapshot"] = list(snap)
             print(f"Snapshot release: sold pre-existing positions freed for bot: {released}")
 
     # Remove positions from ledger that no longer exist in Schwab

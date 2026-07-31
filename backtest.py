@@ -10,7 +10,7 @@ import requests
 import time
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from auth import get_valid_token
 from scanner import (
     get_tier, ema, rsi, macd_hist, calc_adx, calc_atr,
@@ -29,7 +29,7 @@ def headers():
 def get_historical_candles(symbol: str, days: int = 90, frequency: int = 30) -> list:
     """Pull historical daily candles for backtesting."""
     try:
-        end   = datetime.utcnow()
+        end   = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
         resp  = requests.get(
             f"{BASE_URL}/pricehistory", headers=headers(),
@@ -368,7 +368,7 @@ def run_backtest(days: int = 60, bot_capital: float = 2400):
 
     # Save results
     output = {
-        "run_date":    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_date":    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "days_tested": days,
         "symbols":     TEST_SYMBOLS,
         "rankings":    ranked,

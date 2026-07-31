@@ -427,9 +427,33 @@ def scan_etf_options_live(cash_available: float = 0, positions: list = None) -> 
     """
     opportunities = []
     ledger        = load_ledger()
-    owned_etfs    = ledger.get("owned_etfs", {})
 
-    # Count how many ETFs we can write calls on
+    # Build owned_etfs from LIVE positions (passed in from Schwab) so the
+    # 100-share check reflects reality, not a stale cached dict.
+    # Falls back to the stored dict only if no live positions were provided.
+    KNOWN_ETFS = {
+        "SCHB", "SCHG", "SCHD", "SCHA", "SCHF", "SCHE", "SCHX", "SCHZ",
+        "VOO", "VTI", "VUG", "VYM", "VIG", "VXUS", "VEA", "VWO", "BND",
+        "QQQ", "QQQM", "SPY", "IVV", "DIA", "IWM", "JEPI", "JEPQ",
+        "DGRO", "HDV", "NOBL", "SPLG", "SPYG", "SPYD", "RSP",
+    }
+    owned_etfs = {}
+    if positions:
+        for p in positions:
+            try:
+                sym = p["instrument"]["symbol"]
+                if sym in KNOWN_ETFS:
+                    owned_etfs[sym] = {
+                        "shares":    p.get("longQuantity", 0),
+                        "avg_price": p.get("averagePrice", 0),
+                    }
+            except Exception:
+                continue
+    if not owned_etfs:
+        # Fallback to stored dict if no live positions available
+        owned_etfs = ledger.get("owned_etfs", {})
+
+    # Count how many ETFs we can write calls on (live share counts)
     writable = [s for s, d in owned_etfs.items() if d.get("shares", 0) >= 100]
     if not writable and not positions:
         print(f"  ETF options: no ETF with 100+ shares yet — accumulating")
