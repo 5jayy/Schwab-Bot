@@ -383,7 +383,7 @@ def candle_strength(candles: list) -> float:
             return 0  # only bullish candles
 
         score = (body_pct * 40) + (close_pct * 40) + (wick_low * 20)
-        return round(score * 100, 1)
+        return round(score, 1)  # already 0-100
     except Exception:
         return 0
 
