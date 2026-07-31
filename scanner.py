@@ -506,10 +506,15 @@ def score_stock(symbol: str, max_price: float, tier_cfg: dict) -> dict | None:
     }
 
 
-def scan_best_stocks(cash: float, bot_capital: float = 2400) -> list:
+def scan_best_stocks(cash: float, bot_capital: float = 2400, swing_budget: float = 0) -> list:
     """Scan live movers, score with dynamic tier filters, return top N."""
     tier_name, tier_cfg = get_tier(bot_capital)
-    position_size = cash * tier_cfg["pos_pct"]
+    # SIZING: respect the swing allocation (40%/3 positions) if passed in.
+    # Tier config is used for QUALITY screening only (score/adx/rsi), not sizing.
+    if swing_budget > 0:
+        position_size = swing_budget  # already = SWING_PCT * cash / MAX_POSITIONS
+    else:
+        position_size = cash * tier_cfg["pos_pct"]  # fallback (legacy)
     top_n         = tier_cfg["top_n"]
 
     universe = get_dynamic_universe()

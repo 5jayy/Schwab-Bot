@@ -724,7 +724,8 @@ def run_strategy():
 
         # ── Buy signals ──
         if cash >= 10:
-            top_stocks = scan_best_stocks(cash, bot_capital=capital)
+            swing_per_position = (cash * SWING_PCT) / MAX_SWING_POSITIONS
+            top_stocks = scan_best_stocks(cash, bot_capital=capital, swing_budget=swing_per_position)
             bought_this_run = set()
 
             for stock in top_stocks:
@@ -1141,7 +1142,8 @@ def run_options(encrypted: str, positions: list, cash: float, stats: dict, capit
     if cash < 200:
         return
     print(f"\n-- Cash secured puts | ${cash:,.2f} --")
-    candidates = scan_best_stocks(cash, bot_capital=capital)
+    swing_per_position = (cash * SWING_PCT) / MAX_SWING_POSITIONS
+    candidates = scan_best_stocks(cash, bot_capital=capital, swing_budget=swing_per_position)
     for stock in candidates:
         sym   = stock["symbol"]
         price = stock["price"]
