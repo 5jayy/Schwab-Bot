@@ -78,13 +78,48 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
     bot_value   = 0.0
     new_found   = []
 
-    # Pre-bot positions — never register these (they corrupt win rate)
-    PRE_BOT = {"LCID", "OPEN"}
+    # Pre-bot positions — never register these (they corrupt win rate & max trades)
+    # AUTO-SNAPSHOT: uses LIVE Schwab holdings (the 'positions' pulled from the
+    # Schwab API this very run) as the source of truth. On first run OR a new deploy,
+    # it reconciles the hands-off list against what Schwab actually shows right now.
+    lg_snap = load_ledger()
+    pre_bot_snapshot = set(lg_snap.get("pre_bot_snapshot", []))
+
+    # Live Schwab holdings this run (source of truth)
+    held_now = {p["instrument"]["symbol"] for p in positions}
+
+    # Detect a new deploy via a build marker (env var set at deploy, or first run)
+    import os as _os
+    deploy_id = _os.getenv("FLY_MACHINE_VERSION", "") or _os.getenv("FLY_IMAGE_REF", "") or "manual"
+    last_deploy = lg_snap.get("last_deploy_id", "")
+
+    first_run    = not lg_snap.get("snapshot_taken", False)
+    new_deploy   = deploy_id != last_deploy
+
+    if first_run or new_deploy:
+        # Reconcile snapshot with LIVE Schwab holdings:
+        # keep tracking anything already in snapshot that's STILL held,
+        # and on first run, snapshot everything currently held.
+        if first_run:
+            pre_bot_snapshot = set(held_now)  # everything held now = pre-existing
+        else:
+            # New deploy — keep existing snapshot but drop anything no longer held
+            pre_bot_snapshot = pre_bot_snapshot & held_now
+
+        lg_snap["pre_bot_snapshot"] = list(pre_bot_snapshot)
+        lg_snap["snapshot_taken"]   = True
+        lg_snap["last_deploy_id"]   = deploy_id
+        save_ledger(lg_snap)
+        tag = "first run" if first_run else "new deploy"
+        print(f"Auto-snapshot ({tag}): {len(pre_bot_snapshot)} hands-off from live Schwab: {sorted(pre_bot_snapshot)}")
+
+    # Combine hardcoded pre-bot + live-verified auto-snapshot
+    PRE_BOT = {"LCID", "OPEN"} | pre_bot_snapshot
 
     for p in positions:
         sym = p["instrument"]["symbol"]
         if sym in PRE_BOT:
-            continue  # skip pre-bot covered call positions
+            continue  # skip pre-bot / pre-existing positions (hands-off)
         if sym not in BOT_STOCKS:
             continue
         qty  = p["longQuantity"]
@@ -107,6 +142,19 @@ def sync_ledger_from_schwab(encrypted: str) -> dict:
             open_trades[sym]["quantity"]  = qty
             open_trades[sym]["buy_price"] = avg
             open_trades[sym]["cost"]      = cost
+
+    # SNAPSHOT RELEASE: if a pre-existing position was SOLD (no longer held),
+    # remove it from the snapshot so a future bot buy of that ticker CAN be managed.
+    held_symbols = {p["instrument"]["symbol"] for p in positions}
+    if pre_bot_snapshot:
+        released = [s for s in pre_bot_snapshot if s not in held_symbols]
+        if released:
+            lg_rel = load_ledger()
+            snap = set(lg_rel.get("pre_bot_snapshot", []))
+            snap -= set(released)
+            lg_rel["pre_bot_snapshot"] = list(snap)
+            save_ledger(lg_rel)
+            print(f"Snapshot release: sold pre-existing positions freed for bot: {released}")
 
     # Remove positions from ledger that no longer exist in Schwab
     symbols_in_schwab = {p["instrument"]["symbol"] for p in positions if p["instrument"]["symbol"] in BOT_STOCKS}
@@ -406,20 +454,44 @@ def get_tax_report() -> dict:
 
 
 def get_dynamic_stop(buy_price: float, high_price: float, current_price: float,
-                      base_trail: float = 0.07, candles: list = None) -> dict:
+                      base_trail: float = 0.07, candles: list = None,
+                      bought_at: str = None) -> dict:
     """
     Dynamic trailing stop — tightens based on candle strength not fixed % tiers.
 
     Breakeven always locks at +2% (never lose on a winner).
-    After breakeven, trail tightens based on how strong recent candles are:
-    - Strong candles (buyers in control) → give room (wider trail)
-    - Weak candles (momentum fading)    → tighten immediately
-    - Very strong breakout candles      → trail tight to lock gains
+    After breakeven, trail tightens based on how strong recent candles are.
+
+    FAST-POP RULE: if profit came FAST (mover spike), tighten immediately.
+    A +4% gain in <60 min is a spike that often fades — lock it before it reverses.
+    A slow +4% over days is a trend — give it room to run.
     """
     if buy_price <= 0:
         return {"stop_price": 0, "trail_pct": base_trail, "reason": "invalid", "profit_pct": 0}
 
     profit_pct = (current_price - buy_price) / buy_price
+
+    # ── FAST-POP DETECTION ──
+    # If we hit +4% within 60 min of entry, it's a mover spike — tighten hard
+    fast_pop = False
+    if bought_at and profit_pct >= 0.04:
+        try:
+            from datetime import datetime as _dt
+            entry = _dt.strptime(bought_at[:19], "%Y-%m-%dT%H:%M:%S")
+            mins_held = (_dt.utcnow() - entry).total_seconds() / 60
+            if mins_held <= 60:  # fast pop — spike likely to fade
+                fast_pop = True
+        except Exception:
+            pass
+
+    if fast_pop:
+        # Tight 2.5% trail to lock the quick pop before it fades
+        return {
+            "stop_price": high_price * (1 - 0.025),
+            "trail_pct":  0.025,
+            "reason":     "fast_pop_lock",
+            "profit_pct": profit_pct
+        }
 
     # Breakeven — always at 2%, non-negotiable
     if 0.02 <= profit_pct < 0.05:
@@ -457,29 +529,30 @@ def get_dynamic_stop(buy_price: float, high_price: float, current_price: float,
 
         avg_strength = sum(strengths) / len(strengths) if strengths else 0.5
 
-        # Dynamic trail based on candle strength
+        # Dynamic trail — TIGHTER for movers (bought mid-run, less room left)
+        # Movers are already extended, so protect gains fast to avoid green-to-red
         if avg_strength >= 0.75:
-            trail_pct = 0.03  # very strong candles — tight trail locks gains
+            trail_pct = 0.02  # very strong — tight, lock gains (was 3%)
             reason    = "trail_candle_strong"
         elif avg_strength >= 0.55:
-            trail_pct = 0.04  # solid candles — moderate trail
+            trail_pct = 0.03  # solid — moderate tight (was 4%)
             reason    = "trail_candle_moderate"
         elif avg_strength >= 0.35:
-            trail_pct = 0.05  # average candles — give some room
+            trail_pct = 0.035  # average — still tight (was 5%)
             reason    = "trail_candle_weak"
         else:
-            trail_pct = 0.06  # very weak candles — momentum fading, widen slightly
+            trail_pct = 0.04  # weak — momentum fading, exit near peak (was 6%)
             reason    = "trail_candle_fading"
     else:
         # No candle data — use profit-based fallback
         if profit_pct >= 0.20:
-            trail_pct = 0.03
+            trail_pct = 0.02
             reason    = "trail_profit_20pct"
         elif profit_pct >= 0.10:
-            trail_pct = 0.04
+            trail_pct = 0.03
             reason    = "trail_profit_10pct"
         else:
-            trail_pct = 0.05
+            trail_pct = 0.035
             reason    = "trail_profit_5pct"
 
     stop_price = high_price * (1 - trail_pct)

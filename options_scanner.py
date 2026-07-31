@@ -45,8 +45,8 @@ MONTHLY_MIN_YIELD = 0.10   # 10%+ annualized for monthly
 # ── Liquidity ──
 DAILY_MIN_OI   = 200   # daily needs more liquidity
 DAILY_MIN_VOL  = 50
-WEEKLY_MIN_OI  = 100
-WEEKLY_MIN_VOL = 20
+WEEKLY_MIN_OI  = 500   # raised for liquidity — tighter spreads, consistent fills
+WEEKLY_MIN_VOL = 100   # raised for liquidity — active options only
 MONTHLY_MIN_OI = 50
 MONTHLY_MIN_VOL = 5
 

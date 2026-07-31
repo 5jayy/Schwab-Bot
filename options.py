@@ -767,6 +767,92 @@ def run_wheel(encrypted: str, positions: list, cash_available: float):
 
 # ── Cash secured puts ─────────────────────────────────────────────────────────
 
+
+
+def find_swing_covered_call(symbol: str, shares_owned: int, buy_price: float) -> dict | None:
+    """
+    Find a covered call to sell on a PROFITABLE SWING position.
+    Short DTE (3-10) to match the swing cycle — not the 14-45 monthly.
+    Strike above current price so assignment still = profit.
+    Only returns if the call premium is worth collecting.
+    """
+    if shares_owned < 100:
+        return None
+
+    chain = get_option_chain(symbol, option_type="CALL")
+    if not chain:
+        return None
+
+    underlying_price = chain.get("underlyingPrice", 0)
+    if underlying_price <= 0:
+        return None
+
+    # Only sell calls if swing is GREEN (don't cap a loser)
+    if underlying_price <= buy_price:
+        return None
+
+    call_map  = chain.get("callExpDateMap", {})
+    contracts = shares_owned // 100
+    best      = None
+
+    for expiry, strikes in call_map.items():
+        try:
+            dte = int(expiry.split(":")[1])
+        except Exception:
+            continue
+        # Short DTE for swings — 3 to 10 days
+        if not (2 <= dte <= 10):
+            continue
+
+        for strike_str, options in strikes.items():
+            strike = float(strike_str)
+            # Strike 2-6% above current (OTM, room to profit before called away)
+            if not (underlying_price * 1.02 <= strike <= underlying_price * 1.06):
+                continue
+
+            opt = options[0] if options else None
+            if not opt:
+                continue
+
+            bid    = opt.get("bid", 0)
+            ask    = opt.get("ask", 0)
+            volume = opt.get("totalVolume", 0)
+            oi     = opt.get("openInterest", 0)
+            delta  = abs(opt.get("delta", 0))
+
+            # Liquidity — must be tradeable
+            if oi < 100 or bid <= 0:
+                continue
+            # Delta 0.15-0.35 — OTM but meaningful premium
+            if not (0.15 <= delta <= 0.35):
+                continue
+
+            mid = (bid + ask) / 2 if ask > 0 else bid
+            premium_total = mid * 100 * contracts
+
+            # Must collect at least $15/contract to be worth it
+            if mid * 100 < 15:
+                continue
+
+            # Score by premium yield
+            yield_pct = (mid / strike) if strike > 0 else 0
+            if best is None or yield_pct > best["yield_pct"]:
+                best = {
+                    "symbol":      symbol,
+                    "opt_symbol":  opt.get("symbol", ""),
+                    "strike":      strike,
+                    "premium":     round(mid, 2),
+                    "total_prem":  round(premium_total, 2),
+                    "delta":       round(delta, 3),
+                    "dte":         dte,
+                    "contracts":   contracts,
+                    "yield_pct":   yield_pct,
+                    "underlying":  underlying_price,
+                }
+
+    return best
+
+
 def find_best_cash_secured_put(symbol: str, current_price: float, cash_available: float) -> dict | None:
     """
     Find the best cash secured put to sell.
@@ -948,5 +1034,80 @@ def check_covered_call_already_open(encrypted: str, symbol: str) -> bool:
         if opt_symbol.startswith(symbol) and opt.get("shortQuantity", 0) > 0:
             return True
     return False
+
+
+def close_swing_call(encrypted: str, symbol: str, contracts_to_close: int = 0) -> dict:
+    """
+    Buy-to-close covered call(s) on a swing position.
+    Used when a swing exits — the call must close WITH the swing (never independent).
+
+    contracts_to_close = 0 means close ALL contracts (full swing exit).
+    contracts_to_close > 0 means close that many whole contracts (TP1/TP2 scaling).
+
+    CRITICAL: always keeps the call covered — closes call BEFORE shares sell.
+    Returns {closed: bool, contracts: int, symbol: str}.
+    """
+    open_options = get_open_options(encrypted)
+    for opt in open_options:
+        inst       = opt.get("instrument", {})
+        opt_symbol = inst.get("symbol", "")
+        short_qty  = int(opt.get("shortQuantity", 0))
+
+        # Match: same underlying, short position, is a CALL
+        if not opt_symbol.startswith(symbol) or short_qty <= 0:
+            continue
+        is_call = "C" in opt_symbol[-10:] and "P" not in opt_symbol[-9:]
+        if not is_call:
+            continue
+
+        # How many contracts to close
+        if contracts_to_close <= 0 or contracts_to_close >= short_qty:
+            qty = short_qty  # close all
+        else:
+            qty = contracts_to_close  # partial (whole contracts only)
+
+        try:
+            order = {
+                "orderType":          "MARKET",
+                "session":            "NORMAL",
+                "duration":           "DAY",
+                "orderStrategyType":  "SINGLE",
+                "orderLegCollection": [{
+                    "instruction": "BUY_TO_CLOSE",
+                    "quantity":    qty,
+                    "instrument": {
+                        "symbol":    opt_symbol,
+                        "assetType": "OPTION"
+                    }
+                }]
+            }
+            resp = requests.post(
+                f"{TRADER_URL}/accounts/{encrypted}/orders",
+                headers=headers(),
+                json=order,
+                timeout=15
+            )
+            if resp.ok or resp.status_code == 201:
+                return {"closed": True, "contracts": qty, "symbol": symbol}
+        except Exception as ex:
+            print(f"  Close swing call error {symbol}: {ex}")
+            return {"closed": False, "contracts": 0, "symbol": symbol}
+
+    return {"closed": False, "contracts": 0, "symbol": symbol}
+
+
+def get_swing_call_contracts(encrypted: str, symbol: str) -> int:
+    """How many covered call contracts are open on this swing symbol."""
+    for opt in get_open_options(encrypted):
+        inst       = opt.get("instrument", {})
+        opt_symbol = inst.get("symbol", "")
+        short_qty  = int(opt.get("shortQuantity", 0))
+        if opt_symbol.startswith(symbol) and short_qty > 0:
+            is_call = "C" in opt_symbol[-10:] and "P" not in opt_symbol[-9:]
+            if is_call:
+                return short_qty
+    return 0
+
+
 
 

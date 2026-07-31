@@ -48,13 +48,21 @@ SWING_PCT        = 0.40   # 40% swing trades (up to 3 positions)
 
 # Pre-bot positions — never apply TP1/TP2/trail to these
 # These were held before the bot started trading
-PRE_BOT_POSITIONS = {"LCID", "OPEN"}  # add any others here
+PRE_BOT_POSITIONS = {"LCID", "OPEN"}  # hardcoded base; snapshot merged at runtime
+
+def get_pre_bot_positions():
+    """Pre-bot base + auto-snapshot of pre-existing holdings (hands-off)."""
+    try:
+        snap = set(load_ledger().get("pre_bot_snapshot", []))
+        return PRE_BOT_POSITIONS | snap
+    except Exception:
+        return PRE_BOT_POSITIONS
 STOCK_OPT_PCT    = 0.50   # 50% stock options (primary strategy)
 ETF_OPT_PCT      = 0.00   # ETF options self-fund from ETF portfolio (not trading cash)
 RESERVE_PCT      = 0.10   # 10% SGOV/reserve
 MAX_SWING_POSITIONS = 3
 MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled
-ETF_OPTIONS_SPLIT = {"etf": 0.50, "cash": 0.50, "bot": 0.00}
+ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.40, "bot": 0.40}
 COMMISSION_PER_CONTRACT = 0.65
 
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
@@ -63,8 +71,8 @@ TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 # ── Profit splits ─────────────────────────────────────────────────────────────
-STOCK_SPLIT  = {"etf": 0.30, "cash": 0.50, "bot": 0.20}
-OPTIONS_SPLIT = {"etf": 0.30, "cash": 0.50, "bot": 0.20}
+STOCK_SPLIT  = {"etf": 0.20, "cash": 0.40, "bot": 0.40}
+OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.40, "bot": 0.40}
 ETF_SPLITS   = {
     "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
     "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
@@ -439,6 +447,15 @@ def check_delta_trail(symbol: str, entry_px: float, high_px: float,
 def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
                  cash: float, reason: str = "signal", star: int = 0) -> float:
     try:
+        # CALL FOLLOWS SWING: if a covered call is open on this swing,
+        # buy-to-close it FIRST (never leave a naked call) before selling shares.
+        from options import get_swing_call_contracts, close_swing_call
+        call_contracts = get_swing_call_contracts(encrypted, symbol)
+        if call_contracts > 0:
+            res = close_swing_call(encrypted, symbol, 0)  # close ALL on full exit
+            if res["closed"]:
+                send_alert("[ CALL CLOSE ] " + symbol + " x" + str(res["contracts"]) + "\nfollows swing exit")
+
         place_equity_order(encrypted, symbol, quantity, "SELL")
         proceeds = quantity * price
         split    = record_sell_and_split(symbol, quantity, price, proceeds,
@@ -546,10 +563,36 @@ def run_strategy():
             trail_info = get_trailing_stop_info(sym)  # always fresh from ledger
             trigger    = None
 
+            # ── COVERED CALL ON SWING — sell when green + momentum fading ──
+            # Extra income on a swing that's profitable but stalling.
+            # Only 100+ shares (whole contract), no existing call, weak momentum.
+            try:
+                if qty >= 100 and sym not in get_pre_bot_positions():
+                    bt = load_ledger().get("open_trades", {}).get(sym, {})
+                    buy_p = bt.get("buy_price", 0)
+                    if buy_p > 0 and price > buy_p:  # GREEN only
+                        # Momentum check — sell call only if FADING (won't moonshot)
+                        conv_now = get_mtf_conviction(sym)
+                        if conv_now <= 2:  # weak/fading — safe to cap with a call
+                            from options import find_swing_covered_call, place_covered_call, check_covered_call_already_open
+                            if not check_covered_call_already_open(encrypted, sym):
+                                call = find_swing_covered_call(sym, qty, buy_p)
+                                if call:
+                                    place_covered_call(encrypted, call["opt_symbol"],
+                                                       call["contracts"], call["premium"])
+                                    msg  = "[ SWING CALL ] " + sym + "\n"
+                                    msg += "STRIKE " + str(call["strike"]) + " x" + str(call["contracts"]) + "\n"
+                                    msg += "PREM   $" + f"{call['total_prem']:.2f}" + " income\n"
+                                    msg += "DTE    " + str(call["dte"]) + "d | follows swing"
+                                    send_alert(msg)
+                                    print(f"  Swing call sold: {sym} strike {call['strike']} ${call['total_prem']:.2f}")
+            except Exception as ex:
+                print(f"Swing call error {sym}: {ex}")
+
             # ── TP1 / TP2 scale-out — only for bot-entered positions ──
             bot_trade = load_ledger().get("open_trades", {}).get(sym, {})
             # Skip TP1/TP2 for pre-bot positions and positions not in ledger
-            if sym in PRE_BOT_POSITIONS:
+            if sym in get_pre_bot_positions():
                 bot_trade = {}
             if trail_info and not trigger and bot_trade:
                 buy_px  = trail_info["buy_price"]
@@ -562,6 +605,20 @@ def run_strategy():
                 if not tp1_hit and price >= tp1_px:
                     tp1_qty = max(1, qty // 3)
                     try:
+                        # CALL FOLLOWS SWING (scale): after selling tp1_qty shares,
+                        # remaining shares must still cover the call. Close whole
+                        # contracts to stay covered (never naked).
+                        from options import get_swing_call_contracts, close_swing_call
+                        call_ct = get_swing_call_contracts(encrypted, sym)
+                        if call_ct > 0:
+                            shares_after = qty - tp1_qty
+                            contracts_still_covered = shares_after // 100
+                            contracts_to_close = call_ct - contracts_still_covered
+                            if contracts_to_close > 0:
+                                res = close_swing_call(encrypted, sym, contracts_to_close)
+                                if res["closed"]:
+                                    send_alert("[ CALL SCALE ] " + sym + " -" + str(res["contracts"]) + " contract(s)\nstays covered")
+
                         place_equity_order(encrypted, sym, tp1_qty, "SELL")
                         profit_tp1 = round(tp1_qty * (price - buy_px), 2)
                         pct_gain   = round((price / buy_px - 1) * 100, 1)
@@ -584,6 +641,18 @@ def run_strategy():
                 elif tp1_hit and not tp2_hit and price >= tp2_px:
                     tp2_qty = max(1, qty // 3)
                     try:
+                        # CALL FOLLOWS SWING (scale) — keep covered on TP2 too
+                        from options import get_swing_call_contracts, close_swing_call
+                        call_ct2 = get_swing_call_contracts(encrypted, sym)
+                        if call_ct2 > 0:
+                            shares_after2 = qty - tp2_qty
+                            covered2 = shares_after2 // 100
+                            to_close2 = call_ct2 - covered2
+                            if to_close2 > 0:
+                                res2 = close_swing_call(encrypted, sym, to_close2)
+                                if res2["closed"]:
+                                    send_alert("[ CALL SCALE ] " + sym + " -" + str(res2["contracts"]) + " contract(s)\nstays covered")
+
                         place_equity_order(encrypted, sym, tp2_qty, "SELL")
                         profit_tp2 = round(tp2_qty * (price - buy_px), 2)
                         pct_gain2  = round((price / buy_px - 1) * 100, 1)
@@ -622,7 +691,8 @@ def run_strategy():
                         _candles = _gph(sym)
                     except Exception:
                         _candles = None
-                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles)
+                    bought_at = bot_trade.get("bought_at") if bot_trade else None
+                    stop_info = get_dynamic_stop(buy_px, high_px, price, TRAILING_STOP_PCT, _candles, bought_at)
                     if price <= stop_info["stop_price"]:
                         trigger = stop_info["reason"]
                         if stop_info["reason"] == "breakeven":
@@ -670,6 +740,15 @@ def run_strategy():
                 position_size = min(position_size, cash)
 
                 quantity = int(position_size // price)
+
+                # COVERED-CALL PREP: if we're close to 100 shares (80-99),
+                # and cash allows, round up to 100 to enable selling a covered
+                # call on the swing later (double income: swing + call premium)
+                if 80 <= quantity < 100:
+                    cost_for_100 = 100 * price
+                    if cost_for_100 <= cash * 0.95:  # leave 5% buffer
+                        quantity = 100
+
                 if quantity < 1:
                     continue
 
@@ -704,12 +783,20 @@ def run_strategy():
         # ── Monitor open option positions — exit at 50% profit ──
         try:
             open_opts = get_open_options(encrypted)
+            swing_syms = set(load_ledger().get("open_trades", {}).keys())
             for opt_pos in open_opts:
                 inst       = opt_pos.get("instrument", {})
                 opt_sym    = inst.get("symbol", "")
                 short_qty  = opt_pos.get("shortQuantity", 0)
                 if short_qty <= 0:
                     continue
+                # CALLS ON SWINGS FOLLOW THE SWING — skip the 50% rule for them.
+                # If this option's underlying is an open swing AND it's a call,
+                # let the swing exit logic handle it, not the standalone monitor.
+                underlying = opt_sym[:opt_sym.find(" ")] if " " in opt_sym else opt_sym[:4].strip()
+                is_call    = "C" in opt_sym[-10:] and "P" not in opt_sym[-9:]
+                if is_call and underlying in swing_syms:
+                    continue  # covered call on a swing — follows swing, not 50%
                 # Get current mark price
                 mkt_val    = abs(opt_pos.get("marketValue", 0))
                 avg_price  = abs(opt_pos.get("averagePrice", 0))
@@ -767,10 +854,7 @@ def run_strategy():
                             msg  = "[ " + label + " ] " + underlying + "\n"
                             msg += "PREM $" + f"{avg_price:.2f}" + " → $" + f"{mkt_val/100:.2f}" + "\n"
                             msg += "PROFIT +$" + f"{profit:.2f}" + " (50% hit)\n"
-                            if is_etf_call:
-                                msg += "SPLIT  50% ETF | 50% CASH"
-                            else:
-                                msg += "SPLIT  30% ETF | 50% CASH | 20% BOT"
+                            msg += "SPLIT  20% ETF | 40% CASH | 40% BOT"
                             send_alert(msg)
                             print(f"  {label}: {opt_sym} at 50% profit ${profit:.2f}")
                     except Exception as ex:
