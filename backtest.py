@@ -173,8 +173,10 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
         # 5. Liquidity sweep bonus
         sweep_bonus = liquidity_sweep(window) if strategy.get("use_sweep") else 0
 
-        # Total score
-        score = candle_score * 0.7 + sweep_bonus + wick_bonus + (change_pct * 2 if (change_pct := (current - candles[i-1]["close"]) / candles[i-1]["close"] * 100 if candles[i-1]["close"] > 0 else 0) else 0)
+        # Total score — clean, safe computation
+        prev_close = candles[i-1]["close"]
+        change_pct = ((current - prev_close) / prev_close * 100) if prev_close > 0 else 0
+        score = candle_score * 0.7 + sweep_bonus + wick_bonus + (change_pct * 2)
 
         if score < min_score:
             continue
@@ -185,12 +187,6 @@ def simulate_strategy(candles: list, strategy: dict, hold_bars: int = 12,
         high_px   = entry_px
         bars_held = 0
         continue
-
-    # Count missed — signal qualified but we were already in a trade
-    if in_trade:
-        missed_signals += 0  # already handled above
-    elif score >= min_score:
-        missed_signals += 1  # signal fired but filtered by something
 
     if not trades:
         return {}
