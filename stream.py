@@ -92,10 +92,71 @@ def build_acct_activity_request(info: dict) -> dict:
     }
 
 
+def parse_account_activity(content_item: dict) -> dict:
+    """
+    PHASE 2A: interpret one ACCT_ACTIVITY content item.
+
+    Known field layout (from Schwab streamer):
+      "1" = account number
+      "2" = activity/message type (e.g. "SUBSCRIBED", or an activity type
+            like "OrderFill"/"OrderEntryRequest" on real events)
+      "3" = payload (JSON string or text; may be "Feature not supported")
+
+    Returns a dict describing what we THINK the message is. Does NOT write
+    to the ledger yet — that's Phase 2B, once we've seen a real fill Monday.
+    Everything here is wrapped so a weird message can never crash the stream.
+    """
+    result = {"kind": "unknown", "raw": content_item}
+    try:
+        acct     = content_item.get("1", "")
+        activity = content_item.get("2", "")
+        payload  = content_item.get("3", "")
+
+        result["account"]  = acct
+        result["activity"] = activity
+
+        # Status/subscription messages
+        if activity == "SUBSCRIBED":
+            result["kind"] = "status"
+            return result
+
+        # Known Schwab after-hours quirk — handle gracefully, never crash
+        if payload == "Feature not supported":
+            result["kind"] = "unsupported"
+            return result
+
+        # Real activity — try to interpret the type
+        act_lower = str(activity).lower()
+        if "fill" in act_lower or "execution" in act_lower:
+            result["kind"] = "fill"
+        elif "order" in act_lower:
+            result["kind"] = "order_update"
+        elif "cancel" in act_lower:
+            result["kind"] = "cancel"
+        else:
+            result["kind"] = "activity"
+
+        # Try to parse the payload if it looks like JSON (real fills carry
+        # structured data here — we'll learn the exact shape Monday)
+        if payload and payload.strip().startswith(("{", "[")):
+            try:
+                result["payload"] = json.loads(payload)
+            except Exception:
+                result["payload_raw"] = payload[:500]
+        else:
+            result["payload_raw"] = payload[:500]
+
+    except Exception as ex:
+        # Never let a parse error crash the stream
+        result["kind"] = "parse_error"
+        result["error"] = str(ex)
+    return result
+
+
 def handle_message(msg: str):
     """
-    PHASE 1: just log everything received. No trading, no ledger writes.
-    Later phases parse ACCT_ACTIVITY data and update positions/cash/history.
+    PHASE 2A: parse + interpret + LOG. Still NO ledger writes, NO trading.
+    Bulletproof — any error is caught so the stream connection never dies.
     """
     try:
         data = json.loads(msg)
@@ -103,28 +164,50 @@ def handle_message(msg: str):
         print(f"[STREAM] raw (non-JSON): {msg[:200]}")
         return
 
-    # Response messages (login/subscribe acks)
-    if "response" in data:
-        for r in data["response"]:
-            svc  = r.get("service", "?")
-            cmd  = r.get("command", "?")
-            code = r.get("content", {}).get("code", "?")
-            txt  = r.get("content", {}).get("msg", "")
-            print(f"[STREAM] response {svc}/{cmd} code={code} {txt}")
+    try:
+        # Response messages (login/subscribe acks)
+        if "response" in data:
+            for r in data["response"]:
+                svc  = r.get("service", "?")
+                cmd  = r.get("command", "?")
+                code = r.get("content", {}).get("code", "?")
+                txt  = r.get("content", {}).get("msg", "")
+                print(f"[STREAM] response {svc}/{cmd} code={code} {txt}")
 
-    # Notify messages (heartbeats, connection notices)
-    if "notify" in data:
-        for n in data["notify"]:
-            if "heartbeat" in n:
-                print(f"[STREAM] heartbeat {n['heartbeat']}")
-            else:
-                print(f"[STREAM] notify {json.dumps(n)[:200]}")
+        # Notify messages (heartbeats, connection notices)
+        if "notify" in data:
+            for n in data["notify"]:
+                if "heartbeat" in n:
+                    print(f"[STREAM] heartbeat {n['heartbeat']}")
+                else:
+                    print(f"[STREAM] notify {json.dumps(n)[:200]}")
 
-    # Data messages (the actual account activity — fills, orders, etc.)
-    if "data" in data:
-        for d in data["data"]:
-            svc = d.get("service", "?")
-            print(f"[STREAM] DATA {svc}: {json.dumps(d)[:400]}")
+        # Data messages — the account activity we care about
+        if "data" in data:
+            for d in data["data"]:
+                svc = d.get("service", "?")
+                if svc == "ACCT_ACTIVITY":
+                    for item in d.get("content", []):
+                        parsed = parse_account_activity(item)
+                        kind = parsed["kind"]
+                        if kind == "status":
+                            print(f"[STREAM] ACCT status: {parsed.get('activity')}")
+                        elif kind == "unsupported":
+                            print("[STREAM] ACCT: feature not supported "
+                                  "(normal after-hours) — ignoring")
+                        elif kind == "fill":
+                            print(f"[STREAM] *** FILL detected *** {json.dumps(parsed)[:500]}")
+                            print("[STREAM] (Phase 2A: logged only — ledger wiring is Phase 2B)")
+                        elif kind == "order_update":
+                            print(f"[STREAM] order update: {json.dumps(parsed)[:400]}")
+                        else:
+                            print(f"[STREAM] activity ({kind}): {json.dumps(parsed)[:400]}")
+                else:
+                    print(f"[STREAM] DATA {svc}: {json.dumps(d)[:300]}")
+
+    except Exception as ex:
+        # Absolute safety net — a bad message must never kill the stream
+        print(f"[STREAM] handler error (caught, stream continues): {ex}")
 
 
 async def run_stream():
