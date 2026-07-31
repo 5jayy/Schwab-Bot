@@ -381,20 +381,23 @@ def scan_stock_options(cash_available: float) -> list:
 
 # ── SCANNER 2: ETF Options (Roadmap Building) ─────────────────────────────────
 
-def scan_etf_options_live(cash_available: float, positions: list = None) -> list:
-    if cash_available < 100:
-        print(f"  ETF options: budget ${cash_available:.0f} too small — skip")
-        return []
+def scan_etf_options_live(cash_available: float = 0, positions: list = None) -> list:
     """
-    ETF options scanner — roadmap building.
-    Covered calls on owned ETFs first (any DTE).
-    Puts on ETFs near 100 shares.
-    Budget: 10% of swing cash.
+    ETF options scanner — SELF-FUNDING from ETF portfolio.
+    Covered calls on owned ETF shares (100+ shares required).
+    Premium collected builds more ETF shares — compounds within the ETF sleeve.
+    Uses ZERO trading cash — income comes from the ETF holdings themselves.
     """
     opportunities = []
     ledger        = load_ledger()
-    live_etfs     = ledger.get("live_etf_opportunities", [])
     owned_etfs    = ledger.get("owned_etfs", {})
+
+    # Count how many ETFs we can write calls on
+    writable = [s for s, d in owned_etfs.items() if d.get("shares", 0) >= 100]
+    if not writable and not positions:
+        print(f"  ETF options: no ETF with 100+ shares yet — accumulating")
+        return []
+    print(f"  ETF options: {len(writable)} ETF(s) with 100+ shares — writing covered calls")
 
     # 1. Covered calls on owned ETFs (100+ shares) — all tiers
     if positions:
@@ -426,40 +429,36 @@ def scan_etf_options_live(cash_available: float, positions: list = None) -> list
 
             time.sleep(0.15)
 
-    # 2. Puts on ETFs from live scanner
+    # 2. Covered calls on owned ETFs from live scanner (NO cash-secured puts)
+    # ETF options income comes from ETF SHARES you own, not trading capital.
+    # If you own 100+ shares of an ETF, sell a covered call against it.
     scanned = {o["symbol"] for o in opportunities}
-    sorted_live = sorted(live_etfs, key=lambda x: x.get("score", 0), reverse=True)
 
-    for etf in sorted_live[:10]:
-        sym   = etf.get("symbol", "")
-        price = etf.get("price", 0)
-        if not sym or price <= 0 or sym in scanned:
+    for sym, data in owned_etfs.items():
+        if sym in scanned:
+            continue
+        shares_owned = data.get("shares", 0)
+        avg_cost     = data.get("avg_price", 0)
+        # Need at least 100 shares to write 1 covered call
+        if shares_owned < 100 or avg_cost <= 0:
             continue
 
-        shares_owned  = owned_etfs.get(sym, {}).get("shares", 0)
-        pct_to_call   = int(shares_owned / 100 * 100)
-        collat_needed = price * 0.97 * 100
-        if collat_needed > cash_available:
-            continue
-
-        # ETF puts — weekly only (1-7 DTE), same as stock options
-        # More cycles = more premium even with lower ETF IV
+        # Covered call — weekly then monthly
         for tier, dmin, dmax, dymin, doi, dvol, dmin_d, dmax_d in [
-            ("weekly", WEEKLY_DTE_MIN, WEEKLY_DTE_MAX, WEEKLY_MIN_YIELD, WEEKLY_MIN_OI, WEEKLY_MIN_VOL, WEEKLY_DELTA_MIN, WEEKLY_DELTA_MAX),
+            ("weekly",  WEEKLY_DTE_MIN,  WEEKLY_DTE_MAX,  WEEKLY_MIN_YIELD,  WEEKLY_MIN_OI,  WEEKLY_MIN_VOL,  WEEKLY_DELTA_MIN,  WEEKLY_DELTA_MAX),
+            ("monthly", MONTHLY_DTE_MIN, MONTHLY_DTE_MAX, MONTHLY_MIN_YIELD, MONTHLY_MIN_OI, MONTHLY_MIN_VOL, MONTHLY_DELTA_MIN, MONTHLY_DELTA_MAX),
         ]:
-            put = find_best_put_tiered(
-                sym, cash_available,
+            call = find_best_call_tiered(
+                sym, shares_owned, avg_cost,
                 dmin, dmax, dmin_d, dmax_d,
-                dymin, doi, dvol, tier,
-                strike_min_pct=0.90,
-                strike_max_pct=0.99,
+                dymin, doi, dvol, tier
             )
-            if put:
-                put["category"]      = "etf_put_weekly"
-                put["exit_at"]       = round(put["premium"] * 0.50, 2)
-                put["roadmap_note"]  = str(pct_to_call) + "% to call | weekly"
-                put["shares_owned"]  = shares_owned
-                opportunities.append(put)
+            if call:
+                call["category"]     = "etf_call_owned"
+                call["exit_at"]      = round(call["premium"] * 0.50, 2)
+                call["roadmap_note"] = str(shares_owned) + " ETF shares owned"
+                call["shares_owned"] = shares_owned
+                opportunities.append(call)
                 scanned.add(sym)
                 break
 

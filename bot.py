@@ -44,17 +44,17 @@ from ledger import (
 load_dotenv()
 
 DAY_PCT          = 0.00   # No day trades
-SWING_PCT        = 0.65   # 65% swing trades (up to 3 positions)
+SWING_PCT        = 0.40   # 40% swing trades (up to 3 positions)
 
 # Pre-bot positions — never apply TP1/TP2/trail to these
 # These were held before the bot started trading
 PRE_BOT_POSITIONS = {"LCID", "OPEN"}  # add any others here
-STOCK_OPT_PCT    = 0.15   # 15% stock options (monthly high IV)
-ETF_OPT_PCT      = 0.10   # 10% ETF options (builds toward roadmap)
+STOCK_OPT_PCT    = 0.50   # 50% stock options (primary strategy)
+ETF_OPT_PCT      = 0.00   # ETF options self-fund from ETF portfolio (not trading cash)
 RESERVE_PCT      = 0.10   # 10% SGOV/reserve
 MAX_SWING_POSITIONS = 3
 MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled
-ETF_OPTIONS_SPLIT = {"etf": 0.30, "cash": 0.50, "bot": 0.10}
+ETF_OPTIONS_SPLIT = {"etf": 0.50, "cash": 0.50, "bot": 0.00}
 COMMISSION_PER_CONTRACT = 0.65
 
 BASE_URL          = "https://api.schwabapi.com/trader/v1"
@@ -63,8 +63,8 @@ TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.07))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", 30))
 
 # ── Profit splits ─────────────────────────────────────────────────────────────
-STOCK_SPLIT  = {"etf": 0.30, "cash": 0.50, "bot": 0.10}
-OPTIONS_SPLIT = {"etf": 0.30, "cash": 0.50, "bot": 0.10}
+STOCK_SPLIT  = {"etf": 0.30, "cash": 0.50, "bot": 0.20}
+OPTIONS_SPLIT = {"etf": 0.30, "cash": 0.50, "bot": 0.20}
 ETF_SPLITS   = {
     "Level 1": {"bot": 0.60, "cash": 0.30, "etf": 0.10},
     "Level 2": {"bot": 0.50, "cash": 0.30, "etf": 0.20},
@@ -742,8 +742,37 @@ def run_strategy():
                         if resp.ok or resp.status_code == 201:
                             profit = (avg_price - mkt_val / 100) * short_qty * 100
                             underlying = opt_sym[:4].strip()
-                            send_alert("[ OPT EXIT ] " + underlying + "\nPREM $" + f"{avg_price:.2f}" + " → $" + f"{mkt_val/100:.2f}" + "\nPROFIT +$" + f"{profit:.2f}" + " (50% hit)")
-                            print(f"  Option exit: {opt_sym} at 50% profit ${profit:.2f}")
+                            is_call = "C" in opt_sym[-10:] and "P" not in opt_sym[-9:]
+
+                            # Route profit: ETF covered calls use 50/50, stock puts use 30/50/20
+                            from ledger import load_ledger, save_ledger
+                            owned_etfs = load_ledger().get("owned_etfs", {})
+                            is_etf_call = is_call and underlying in owned_etfs
+
+                            if is_etf_call:
+                                split = ETF_OPTIONS_SPLIT
+                                label = "ETF OPT EXIT"
+                            else:
+                                split = OPTIONS_SPLIT
+                                label = "STOCK OPT EXIT"
+
+                            # Book profit to buckets
+                            lg = load_ledger()
+                            lg["etf_bucket"]  = lg.get("etf_bucket", 0)  + profit * split["etf"]
+                            lg["cash_bucket"] = lg.get("cash_bucket", 0) + profit * split["cash"]
+                            lg["trading_capital"] = lg.get("trading_capital", 0) + profit * split["bot"]
+                            save_ledger(lg)
+
+                            # Private-style alert — shows P&L and split, hides totals
+                            msg  = "[ " + label + " ] " + underlying + "\n"
+                            msg += "PREM $" + f"{avg_price:.2f}" + " → $" + f"{mkt_val/100:.2f}" + "\n"
+                            msg += "PROFIT +$" + f"{profit:.2f}" + " (50% hit)\n"
+                            if is_etf_call:
+                                msg += "SPLIT  50% ETF | 50% CASH"
+                            else:
+                                msg += "SPLIT  30% ETF | 50% CASH | 20% BOT"
+                            send_alert(msg)
+                            print(f"  {label}: {opt_sym} at 50% profit ${profit:.2f}")
                     except Exception as ex:
                         print(f"Option exit error {opt_sym}: {ex}")
         except Exception as ex:
@@ -773,9 +802,10 @@ def run_strategy():
         # ── ETF Options (10% of cash, builds toward roadmap) ──
         try:
             # imports at top level
-            etf_opt_budget = cash * ETF_OPT_PCT
+            # ETF options = covered calls on owned ETF shares (income from holdings, not cash)
+            # Pass a nominal budget just for the guard; real source is owned_etfs shares
             etf_opts = scan_etf_options_live(
-                cash_available=etf_opt_budget,
+                cash_available=999999,  # covered calls don't use trading cash
                 positions=positions
             )
 
@@ -784,11 +814,12 @@ def run_strategy():
                 typ  = opp["type"]
                 prem = opp["premium"]
 
-                if typ == "put":
-                    if check_put_already_open(encrypted, sym):
+                if typ == "call":
+                    if check_covered_call_already_open(encrypted, sym):
                         continue
-                    place_cash_secured_put(encrypted, opp["opt_symbol"], prem)
-                    msg  = "[ ETF OPT ] " + sym + " PUT\n"
+                    contracts = opp.get("shares_owned", 100) // 100
+                    place_covered_call(encrypted, opp["opt_symbol"], contracts, prem)
+                    msg  = "[ ETF OPT ] " + sym + " CALL\n"
                     msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
                     msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
                     msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
