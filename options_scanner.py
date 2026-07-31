@@ -14,6 +14,7 @@ import time
 import json
 import os
 from auth import get_valid_token
+from scanner import get_mtf_conviction
 
 MARKET_URL  = "https://api.schwabapi.com/marketdata/v1"
 COMMISSION  = 0.65
@@ -353,6 +354,15 @@ def scan_stock_options(cash_available: float) -> list:
         # Skip penny stocks under $2 (poor liquidity)
         if price < 2:
             continue
+
+        # ── DIRECTIONAL FILTER ──
+        # Selling a put = bet the stock WON'T crash below strike.
+        # Only sell puts on stocks that are flat-to-bullish (conviction >= 2/4).
+        # This uses the same MTF signal that drives the 64.9% swing win rate.
+        # Skips falling knives — the one scenario where put selling loses.
+        conviction = get_mtf_conviction(sym)
+        if conviction < 2:
+            continue  # bearish/weak — don't sell puts into a downtrend
 
         # Weekly only — 1-7 DTE
         w = find_best_put_tiered(
