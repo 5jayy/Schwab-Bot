@@ -310,6 +310,8 @@ def get_test_symbols(bot_capital: float = 2400) -> list:
 
 
 def run_backtest(days: int = 60, bot_capital: float = 2400):
+    # Resolve the test symbols from the function (fixes undefined TEST_SYMBOLS)
+    TEST_SYMBOLS = get_test_symbols(bot_capital)
     print(f"\n{'='*50}")
     print(f"BACKTEST — Last {days} days | {len(TEST_SYMBOLS)} symbols | {len(STRATEGIES)} strategies")
     print(f"{'='*50}\n")
