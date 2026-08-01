@@ -118,6 +118,7 @@ def backtest_symbol(symbol: str, hold_bars: int = 12):
              "HARD_stop":  exit_hard_stop,
              "COMBO":      exit_combo}
     results = {k: [] for k in rules}
+    results["BUY_HOLD"] = []  # market-average benchmark: enter, hold, exit at end
 
     # Simulate entering every ~4 bars, hold up to hold_bars forward
     for i in range(0, len(candles) - hold_bars - 1, 4):
@@ -128,6 +129,8 @@ def backtest_symbol(symbol: str, hold_bars: int = 12):
         for name, fn in rules.items():
             exit_px, _ = fn(entry, fwd)
             results[name].append((exit_px - entry) / entry * 100)  # % return
+        # BUY_HOLD = enter and do nothing, exit at end (the market-avg benchmark)
+        results["BUY_HOLD"].append((fwd[-1]["close"] - entry) / entry * 100)
     return results
 
 
@@ -138,18 +141,19 @@ def run(symbols):
     print("Entry assumed each bar; measures EXIT rule on forward path.")
     print("LIVE = your current trailing (no hard stop until green).\n")
 
-    agg = {"LIVE_trail": [], "HARD_stop": [], "COMBO": []}
+    agg = {"LIVE_trail": [], "HARD_stop": [], "COMBO": [], "BUY_HOLD": []}
     for sym in symbols:
         r = backtest_symbol(sym)
         if r:
             for k in agg:
-                agg[k].extend(r[k])
+                agg[k].extend(r.get(k, []))
             print(f"  tested {sym}")
         time.sleep(0.3)
 
     print(f"\n{'-'*58}")
     print(f"{'RULE':<14}{'trades':>8}{'win%':>8}{'avg':>9}{'worst':>9}{'total':>10}")
     print(f"{'-'*58}")
+    avgs = {}
     for name, rets in agg.items():
         if not rets:
             continue
@@ -159,14 +163,28 @@ def run(symbols):
         avg    = sum(rets) / n
         worst  = min(rets)
         total  = sum(rets)
-        print(f"{name:<14}{n:>8}{winpct:>7.0f}%{avg:>8.2f}%{worst:>8.1f}%{total:>9.1f}%")
+        avgs[name] = avg
+        tag = "  <-- market avg" if name == "BUY_HOLD" else ""
+        print(f"{name:<14}{n:>8}{winpct:>7.0f}%{avg:>8.2f}%{worst:>8.1f}%{total:>9.1f}%{tag}")
 
+    # --- Verdict vs market average (add / remove / complete) ---
     print(f"\n{'-'*58}")
-    print("READ: 'worst' is the single biggest loss the rule allowed.")
-    print("Your LIVE rule's worst should be a big negative (the leak).")
-    print("If HARD or COMBO has a much smaller 'worst' AND similar/better")
-    print("total, that's the fix — a hard stop from entry caps disasters.")
-    print("NOTE: ~10 days of 30-min data = directional, not exact dollars.")
+    print("VERDICT vs MARKET AVERAGE (buy & hold):")
+    bh = avgs.get("BUY_HOLD", 0)
+    best_rule = max((k for k in avgs if k != "BUY_HOLD"), key=lambda k: avgs[k], default=None)
+    if best_rule:
+        best = avgs[best_rule]
+        print(f"  Best trading rule: {best_rule} (avg {best:+.2f}%/trade)")
+        print(f"  Market average (buy-hold): {bh:+.2f}%/trade")
+        if best > bh and best > 0:
+            print("  -> COMPLETE: trading BEATS holding and is positive. Keep + refine.")
+        elif best > bh:
+            print("  -> MIXED: trading beats holding but both negative (bad window).")
+            print("     Rules add value, but entries still need work.")
+        else:
+            print("  -> REMOVE/RETHINK: holding BEATS your trading rules.")
+            print("     The swing logic is destroying value vs doing nothing.")
+    print("  NOTE: ~10 days of 30-min data = directional, small sample.")
     print(f"{'='*58}\n")
 
 

@@ -500,7 +500,7 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
 # ── Daily summary ─────────────────────────────────────────────────────────────
 
 def send_daily_summary():
-    """Send 4 PM daily summary with consistency tracking."""
+    """Send 4 PM daily summary — put-selling focused."""
     ledger = load_ledger()
     stats  = get_daily_stats()
     wr_history = ledger.get("win_rate_history", [])
@@ -513,29 +513,18 @@ def send_daily_summary():
     consistency = sum(1 for d in daily_history if d > 0) / len(daily_history) * 100 if daily_history else 0
     save_ledger(ledger)
 
-    capital    = get_trading_capital()
-    stock_cap  = capital * 0.02
-    stock_used = stats["daily_loss_stock"] / stock_cap * 100 if stock_cap > 0 else 0
-
-    # Conviction breakdown
-    c4 = ledger.get("conviction_4_count", 0)
-    c3 = ledger.get("conviction_3_count", 0)
-    c2 = ledger.get("conviction_2_count", 0)
-    c1 = ledger.get("conviction_1_count", 0)
-
-    # Reset conviction counts for tomorrow
-    for k in ["conviction_4_count", "conviction_3_count", "conviction_2_count", "conviction_1_count"]:
-        ledger[k] = 0
-    save_ledger(ledger)
+    # Count open short puts (the primary strategy now)
+    open_puts = ledger.get("open_puts", {})
+    n_puts = len(open_puts) if isinstance(open_puts, dict) else 0
 
     trades_today = stats['trades_today']
     daily_profit = stats['daily_profit']
     daily_peak   = stats['daily_peak']
-    msg = "Daily Summary\n"
+    msg = "Daily Summary (Put Selling)\n"
     msg += f"Trades: {trades_today} | P&L: ${daily_profit:+,.0f} | Peak: ${daily_peak:,.0f}\n"
     msg += f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
-    msg += f"Stock cap used: {stock_used:.0f}%\n"
-    msg += f"Signals: 4/4={c4} | 3/4={c3} | 2/4={c2} | 1/4={c1}"
+    msg += f"Open puts: {n_puts}\n"
+    msg += f"Strategy: IV-filtered put selling (MIN_IV 40%+)"
     send_alert("📊 " + msg)
 
 
