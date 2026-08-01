@@ -40,6 +40,10 @@ MONTHLY_DELTA_MAX = 0.35
 # ── Minimum yields ──
 DAILY_MIN_YIELD   = 0.50   # 50%+ annualized for daily (very high)
 WEEKLY_MIN_YIELD  = 0.25   # 25%+ annualized for weekly
+# IV FILTER — the backtest showed put selling is only POSITIVE at elevated IV.
+# Low-IV puts (thin premium) had negative expectancy; high-IV puts were positive.
+# Only sell puts when the contract's implied volatility is above this threshold.
+MIN_IV = 0.40   # 40%+ IV required (backtest: IV~50% was the positive config)
 MONTHLY_MIN_YIELD = 0.10   # 10%+ annualized for monthly
 
 # ── Liquidity ──
@@ -185,6 +189,14 @@ def find_best_put_tiered(symbol: str, cash_available: float,
             if not (delta_min <= delta <= delta_max):
                 continue
 
+            # ── IV FILTER (positive-edge filter from backtest) ──
+            # Only sell when IV elevated — premium then covers crater risk.
+            iv = opt.get("volatility", 0) or 0
+            if iv and iv > 3:   # Schwab may give IV as percent (45.0)
+                iv = iv / 100.0
+            if iv < MIN_IV:
+                continue  # IV too low — skip, negative edge
+
             bid   = opt.get("bid", 0)
             ask   = opt.get("ask", 0)
             prem  = (bid + ask) / 2
@@ -269,6 +281,14 @@ def find_best_call_tiered(symbol: str, shares: int, avg_cost: float,
             delta = abs(opt.get("delta", 0) or 0)
             if not (delta_min <= delta <= delta_max):
                 continue
+
+            # ── IV FILTER (positive-edge filter from backtest) ──
+            # Only sell when IV elevated — premium then covers crater risk.
+            iv = opt.get("volatility", 0) or 0
+            if iv and iv > 3:   # Schwab may give IV as percent (45.0)
+                iv = iv / 100.0
+            if iv < MIN_IV:
+                continue  # IV too low — skip, negative edge
 
             bid   = opt.get("bid", 0)
             ask   = opt.get("ask", 0)

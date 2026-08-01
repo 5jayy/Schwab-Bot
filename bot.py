@@ -45,7 +45,7 @@ from ledger import (
 load_dotenv()
 
 DAY_PCT          = 0.00   # No day trades
-SWING_PCT        = 0.40   # 40% swing trades (up to 3 positions)
+SWING_PCT        = 0.00   # swings DISABLED — backtested negative (redefined ~line 72)
 
 # Pre-bot positions — never apply TP1/TP2/trail to these
 # These were held before the bot started trading
@@ -68,11 +68,12 @@ def get_pre_bot_positions(held_symbols=None):
         return base
     except Exception:
         return PRE_BOT_POSITIONS
-STOCK_OPT_PCT    = 0.50   # 50% stock options (primary strategy)
+STOCK_OPT_PCT    = 0.85   # 85% to put selling (PRIMARY — the positive-edge strategy)
+SWING_PCT        = 0.00   # swings DISABLED — backtested negative on real data
 ETF_OPT_PCT      = 0.00   # ETF options self-fund from ETF portfolio (not trading cash)
-RESERVE_PCT      = 0.10   # 10% SGOV/reserve
+RESERVE_PCT      = 0.15   # 15% SGOV/reserve (kept safe)
 MAX_SWING_POSITIONS = 3
-MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled
+MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled (backtested negative)
 ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.40, "bot": 0.40}
 COMMISSION_PER_CONTRACT = 0.65
 
@@ -822,6 +823,52 @@ def run_strategy():
                 avg_price  = abs(opt_pos.get("averagePrice", 0))
                 if avg_price <= 0:
                     continue
+                # STOP-LOSS: close a losing short option before it runs.
+                # If buying it back now costs >= 2x what we sold it for,
+                # the loss is ~1x the premium — cut it here instead of
+                # letting it bleed to -3x/-6x (which is what caused the
+                # net-negative P&L: avg loss was ~6x avg win).
+                current_prem = mkt_val / 100  # per-share cost to close now
+                STOP_MULTIPLE = 2.0
+                if avg_price > 0 and current_prem >= avg_price * STOP_MULTIPLE:
+                    try:
+                        resp = requests.post(
+                            f"https://api.schwabapi.com/trader/v1/accounts/{encrypted}/orders",
+                            headers={"Authorization": f"Bearer {get_valid_token()}", "Content-Type": "application/json"},
+                            json={
+                                "orderType": "MARKET",
+                                "session": "NORMAL",
+                                "duration": "DAY",
+                                "orderStrategyType": "SINGLE",
+                                "orderLegCollection": [{
+                                    "instruction": "BUY_TO_CLOSE",
+                                    "quantity": short_qty,
+                                    "instrument": {
+                                        "symbol":            opt_sym,
+                                        "assetType":         "OPTION",
+                                        "putCall":           "PUT" if "P" in opt_sym[-10:] else "CALL",
+                                        "underlyingSymbol":  opt_sym[:4].strip()
+                                    }
+                                }]
+                            },
+                            timeout=15
+                        )
+                        if resp.ok or resp.status_code == 201:
+                            loss = (avg_price - current_prem) * short_qty * 100  # negative
+                            underlying = opt_sym[:4].strip()
+                            # Losses reduce trading capital; no profit split on a loss
+                            lg = load_ledger()
+                            lg["trading_capital"] = lg.get("trading_capital", 0) + loss
+                            save_ledger(lg)
+                            msg  = "[ OPT STOP ] " + underlying + "\n"
+                            msg += "PREM $" + f"{avg_price:.2f}" + " → $" + f"{current_prem:.2f}" + "\n"
+                            msg += "LOSS $" + f"{loss:.2f}" + " (2x stop — cut early)"
+                            send_alert(msg)
+                            print(f"  OPT STOP: {opt_sym} cut at 2x premium, loss ${loss:.2f}")
+                            continue  # closed — skip the profit check
+                    except Exception as ex:
+                        print(f"Option stop-loss error {opt_sym}: {ex}")
+
                 # Exit at 50% profit (current value ≤ 50% of entry premium)
                 if mkt_val <= avg_price * 0.50:
                     try:
