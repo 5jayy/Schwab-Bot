@@ -1249,7 +1249,7 @@ def run_sgov_parking(encrypted: str, cash: float, capital: float):
             lg["sgov_shares"] = lg.get("sgov_shares", 0) + shares
             lg["sgov_value"]  = lg.get("sgov_value", 0) + shares * sgov_px
             save_ledger(lg)
-            send_alert("[ CIRCUIT ] SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_px:.2f}" + "\nRESERVE ~5%/yr")
+            send_alert("🔐 THE VAULT · SGOV PARK\nSGOV x" + str(shares) + " @ $" + f"{sgov_px:.2f}" + "\nRESERVE ~5%/yr")
     except Exception as ex:
         print(f"SGOV error: {ex}")
 
@@ -1552,11 +1552,11 @@ def poll_telegram_commands():
             if text == "/pause":
                 ledger["bot_paused"] = True
                 save_ledger(ledger)
-                send_alert("[ CIRCUIT ] PAUSED\nTrading stopped\nPositions held")
+                send_alert("🔐 THE VAULT · PAUSED\nTrading stopped · positions held")
             elif text == "/resume":
                 ledger["bot_paused"] = False
                 save_ledger(ledger)
-                send_alert("[ CIRCUIT ] RESUMED\nTrading active")
+                send_alert("🔐 THE VAULT · RESUMED\nTrading active")
             elif text == "/status":
                 capital = ledger.get("trading_capital", 0)
                 cash_b  = ledger.get("cash_bucket", 0)
@@ -1565,20 +1565,23 @@ def poll_telegram_commands():
                 open_t  = list(ledger.get("open_trades", {}).keys())
                 state   = "PAUSED" if ledger.get("bot_paused") else "LIVE"
                 wr      = ledger.get("current_win_rate", 0)
+                ws_ok, ws_detail = check_websocket_health()
                 parts   = [
-                    "[ CIRCUIT ] STATUS",
-                    "STATE  " + state,
-                    "CAP    " + f"{capital:,.2f}",
-                    "SWING  ON",
-                    "ETF    " + f"{etf_b:,.2f}",
-                    "CASH   " + f"{cash_b:,.2f}",
-                    "PDT    " + str(pdt) + "/3",
-                    "WIN    " + f"{wr:.1%}",
-                    "OPEN   " + (", ".join(open_t) if open_t else "none"),
+                    "🔐 THE VAULT · STATUS",
+                    "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️",
+                    "STATE   · " + state,
+                    "CAP     · $" + f"{capital:,.2f}",
+                    "CALLS   · 70% covered",
+                    "PUTS    · 25% cash-secured",
+                    "ETF BKT · $" + f"{etf_b:,.2f}",
+                    "CASH    · $" + f"{cash_b:,.2f}",
+                    "WIN     · " + f"{wr:.0%}",
+                    "SOCKET  · " + ("🟢 " if ws_ok else "🔴 ") + ws_detail,
+                    "OPEN    · " + (", ".join(open_t) if open_t else "none"),
                 ]
                 send_alert("\n".join(parts))
             elif text == "/backtest":
-                send_alert("[ CIRCUIT ] BACKTEST\nRunning 14d...\nResults in ~5 min")
+                send_alert("🔐 THE VAULT · BACKTEST\nRunning...\nResults shortly")
                 import threading
                 def _run():
                     from backtest import run_backtest
@@ -1597,7 +1600,7 @@ def poll_telegram_commands():
                     cov = get_etf_tax_coverage(enc)
 
                     parts = [
-                        "[ CIRCUIT ] TAX PLAN",
+                        "🔐 THE VAULT · TAX PLAN",
                         "━━━━━━━━━━━━━━━━━━",
                         "TAX OWED  $" + f"{tax_owed:,.2f}",
                         "(short-term swing/options)",
@@ -1629,7 +1632,7 @@ def poll_telegram_commands():
                     send_alert("Roadmap error: " + str(ex))
             elif text == "/help":
                 parts = [
-                    "[ CIRCUIT ] COMMANDS",
+                    "🔐 THE VAULT · COMMANDS",
                     "━━━━━━━━━━━━━━━━━━",
                     "/status   — capital, buckets, win rate",
                     "/pause    — stop trading, hold positions",
@@ -1683,7 +1686,15 @@ def main():
 
         pulse    = get_market_pulse() if is_market_open() else ""
         hold_str = f" | 🔒 ${on_hold:,.0f}" if on_hold > 0 else ""
-        msg = "[ CIRCUIT ] LIVE\n━━━━━━━━━━━━━━━━━━\n" + "CAP    " + f"{capital:,.2f}" + "\nSWING  " + f"{capital:,.2f}" + "\nCASH   " + f"{cash_ready:,.2f}" + "\nMODE   SWING + OPTIONS"
+        cc_cap   = capital * ETF_OPT_PCT
+        put_cap  = capital * STOCK_OPT_PCT
+        msg  = "🔐 THE VAULT · ONLINE\n"
+        msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+        msg += "CAP     · $" + f"{capital:,.2f}" + "\n"
+        msg += "CALLS   · $" + f"{cc_cap:,.0f}" + " (70%)\n"
+        msg += "PUTS    · $" + f"{put_cap:,.0f}" + " (25%)\n"
+        msg += "RESERVE · SGOV 5%\n"
+        msg += "MODE    · covered calls + cash puts · IV 40%+"
         if pulse:
             msg += f"\n{pulse}"
         send_alert(msg)
