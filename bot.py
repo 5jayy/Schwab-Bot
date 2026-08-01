@@ -68,10 +68,10 @@ def get_pre_bot_positions(held_symbols=None):
         return base
     except Exception:
         return PRE_BOT_POSITIONS
-STOCK_OPT_PCT    = 0.85   # 85% to put selling (PRIMARY — the positive-edge strategy)
+STOCK_OPT_PCT    = 0.25   # 25% cash-secured puts
+ETF_OPT_PCT      = 0.70   # 70% covered calls (own stock + sell calls — bigger exp/trade)
 SWING_PCT        = 0.00   # swings DISABLED — backtested negative on real data
-ETF_OPT_PCT      = 0.00   # ETF options self-fund from ETF portfolio (not trading cash)
-RESERVE_PCT      = 0.15   # 15% SGOV/reserve (kept safe)
+RESERVE_PCT      = 0.05   # 5% SGOV/reserve
 MAX_SWING_POSITIONS = 3
 MAX_DAY_TRADES_PER_WEEK = 0  # Day trades disabled (backtested negative)
 ETF_OPTIONS_SPLIT = {"etf": 0.20, "cash": 0.40, "bot": 0.40}
@@ -499,33 +499,93 @@ def execute_sell(encrypted: str, symbol: str, quantity: int, price: float,
 
 # ── Daily summary ─────────────────────────────────────────────────────────────
 
-def send_daily_summary():
-    """Send 4 PM daily summary — put-selling focused."""
+def check_websocket_health():
+    """
+    Check WebSocket/stream connection health. Returns (ok: bool, detail: str).
+    Reads the last heartbeat the stream wrote to the ledger/status.
+    """
+    try:
+        ledger = load_ledger()
+        last_hb = ledger.get("ws_last_heartbeat", 0)  # epoch seconds
+        ws_status = ledger.get("ws_status", "unknown")
+        if last_hb:
+            age = time.time() - last_hb
+            if age < 600:  # heartbeat within 10 min = healthy
+                return True, f"connected ({int(age)}s ago)"
+            return False, f"stale ({int(age/60)}m ago)"
+        return (ws_status == "connected"), ws_status
+    except Exception as e:
+        return False, f"check error: {e}"
+
+
+def _vault_report_body():
+    """Build the shared Vault report body: positions + P&L + websocket health."""
     ledger = load_ledger()
-    stats  = get_daily_stats()
-    wr_history = ledger.get("win_rate_history", [])
-    win_rate   = sum(wr_history) / len(wr_history) * 100 if wr_history else 0
-
-    # Consistency % — how many of last 10 days were profitable
-    daily_history = ledger.get("daily_pnl_history", [])
-    daily_history.append(stats["daily_profit"])
-    ledger["daily_pnl_history"] = daily_history[-10:]
-    consistency = sum(1 for d in daily_history if d > 0) / len(daily_history) * 100 if daily_history else 0
-    save_ledger(ledger)
-
-    # Count open short puts (the primary strategy now)
     open_puts = ledger.get("open_puts", {})
     n_puts = len(open_puts) if isinstance(open_puts, dict) else 0
+    open_calls = ledger.get("open_covered_calls", {})
+    n_calls = len(open_calls) if isinstance(open_calls, dict) else 0
 
-    trades_today = stats['trades_today']
-    daily_profit = stats['daily_profit']
-    daily_peak   = stats['daily_peak']
-    msg = "Daily Summary (Put Selling)\n"
-    msg += f"Trades: {trades_today} | P&L: ${daily_profit:+,.0f} | Peak: ${daily_peak:,.0f}\n"
-    msg += f"Win rate: {win_rate:.0f}% | Consistency: {consistency:.0f}%\n"
-    msg += f"Open puts: {n_puts}\n"
-    msg += f"Strategy: IV-filtered put selling (MIN_IV 40%+)"
-    send_alert("📊 " + msg)
+    wr_history = ledger.get("win_rate_history", [])
+    win_rate = sum(wr_history) / len(wr_history) * 100 if wr_history else 0
+    streak = ledger.get("win_streak", 0)
+
+    ws_ok, ws_detail = check_websocket_health()
+    ws_icon = "🟢" if ws_ok else "🔴"
+
+    lines = []
+    lines.append(f"WIN     · {win_rate:.0f}% · streak {streak}")
+    lines.append(f"OPEN    · {n_calls} calls · {n_puts} puts")
+    lines.append(f"RESERVE · SGOV 5%")
+    lines.append(f"SOCKET  · {ws_icon} {ws_detail}")
+    return "\n".join(lines)
+
+
+def send_vault_weekly():
+    """THE VAULT weekly report: backtest + summary + websocket health, one message."""
+    try:
+        from backtest_report import build_report_lines
+        bt = build_report_lines("WEEKLY")
+    except Exception:
+        bt = ["(backtest unavailable)"]
+
+    msg = "🔐 THE VAULT · WEEKLY REPORT\n"
+    msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+    msg += _vault_report_body() + "\n"
+    msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+    msg += "\n".join(bt) + "\n"
+    msg += "🔒 secured · private"
+    send_alert(msg)
+
+
+def send_vault_monthly_if_first():
+    """Send monthly Vault report only on the 1st of the month."""
+    from datetime import datetime, timezone
+    if datetime.now(timezone.utc).day != 1:
+        return
+    try:
+        from backtest_report import build_report_lines
+        bt = build_report_lines("MONTHLY")
+    except Exception:
+        bt = ["(backtest unavailable)"]
+
+    msg = "🔐 THE VAULT · MONTHLY REPORT\n"
+    msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+    msg += _vault_report_body() + "\n"
+    msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+    msg += "\n".join(bt) + "\n"
+    msg += "🔒 secured · private"
+    send_alert(msg)
+
+
+def alert_websocket_break(detail: str):
+    """Instant alert when the WebSocket drops or breaks — doesn't wait for weekly."""
+    msg = "🔴 THE VAULT · SOCKET ALERT\n"
+    msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+    msg += f"STATUS  · connection issue\n"
+    msg += f"DETAIL  · {detail}\n"
+    msg += "🔒 needs attention"
+    send_alert(msg)
 
 
 # ── Main strategy ─────────────────────────────────────────────────────────────
@@ -945,11 +1005,14 @@ def run_strategy():
                 budget_left -= collateral
                 puts_opened += 1
 
-                msg  = "[ STOCK OPT ] " + sym + " PUT\n"
-                msg += "STRIKE " + str(opp["strike"]) + " delta " + str(opp["delta"]) + "\n"
-                msg += "PREM   $" + f"{opp['total_prem']:.2f}" + " net\n"
-                msg += "YIELD  " + str(opp["ann_yield"]) + "%/yr\n"
-                msg += "DTE    " + str(opp["dte"]) + "d weekly\nEXIT @ $" + str(opp.get("exit_at", "50%"))
+                msg  = "🔐 THE VAULT · POSITION OPENED\n"
+                msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+                msg += "ASSET   · " + sym + "\n"
+                msg += "TYPE    · CASH PUT\n"
+                msg += "STRIKE  · $" + str(opp["strike"]) + "P · " + str(opp["dte"]) + "DTE · Δ" + str(opp["delta"]) + "\n"
+                msg += "SECURED · +$" + f"{opp['total_prem']:.0f}" + " prem\n"
+                msg += "YIELD   · " + str(opp["ann_yield"]) + "%/yr\n"
+                msg += "🔒 secured · logged"
                 send_alert(msg)
 
             if puts_opened > 0:
@@ -957,7 +1020,58 @@ def run_strategy():
         except Exception as ex:
             print(f"Stock options error: {ex}")
 
-        # ── ETF Options (10% of cash, builds toward roadmap) ──
+        # ── COVERED CALLS on STOCKS (70% = buy shares + write IV-filtered calls) ──
+        # PRIMARY strategy: buy 100-share lots of flat/bullish names, sell OTM calls.
+        # NEVER naked — always owns the shares first. IV filter applied in scanner.
+        try:
+            from options_scanner import scan_covered_call_candidates
+            cc_budget = cash * ETF_OPT_PCT
+            cc_candidates = scan_covered_call_candidates(budget=cc_budget)
+
+            cc_budget_left = cc_budget
+            calls_opened = 0
+            MAX_COVERED_CALLS = 5  # diversify across names
+            for cand in cc_candidates:
+                if calls_opened >= MAX_COVERED_CALLS:
+                    break
+                sym       = cand["symbol"]
+                cost_100  = cand.get("cost_100", cand.get("stock_price", 0) * 100)
+
+                # Must afford the 100 shares within remaining budget
+                if cost_100 > cc_budget_left:
+                    continue
+                # Skip if we already have a covered call open on this name
+                if check_covered_call_already_open(encrypted, sym):
+                    continue
+
+                # 1) BUY 100 shares (required to be covered, never naked)
+                buy_resp = place_equity_order(encrypted, sym, 100, "BUY")
+                if not buy_resp:
+                    continue
+
+                # 2) SELL the covered call against those shares
+                place_covered_call(encrypted, cand["opt_symbol"], 1, cand["premium"])
+
+                cc_budget_left -= cost_100
+                calls_opened += 1
+
+                msg  = "🔐 THE VAULT · POSITION OPENED\n"
+                msg += "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️\n"
+                msg += "ASSET   · " + sym + "\n"
+                msg += "TYPE    · COVERED CALL\n"
+                msg += "ENTRY   · 100 sh @ $" + f"{cand.get('stock_price', 0):.2f}" + "\n"
+                msg += "CALL    · $" + str(cand["strike"]) + "C · " + str(cand.get("dte", "")) + "DTE · Δ" + str(cand.get("delta", "")) + "\n"
+                msg += "SECURED · +$" + f"{cand.get('total_prem', 0):.0f}" + " prem\n"
+                msg += "YIELD   · " + str(cand.get("ann_yield", "")) + "%/yr\n"
+                msg += "🔒 secured · logged"
+                send_alert(msg)
+
+            if calls_opened > 0:
+                print(f"  Covered calls: opened {calls_opened} | ${cc_budget - cc_budget_left:.0f} deployed | ${cc_budget_left:.0f} left")
+        except Exception as ex:
+            print(f"Covered call error: {ex}")
+
+        # ── ETF Options (future scale: covered calls on ETF bucket shares) ──
         try:
             # imports at top level
             # ETF options = covered calls on owned ETF shares (income from holdings, not cash)
@@ -1583,8 +1697,10 @@ def main():
     schedule.every(CHECK_INTERVAL).minutes.do(run_strategy_safe)
     schedule.every(1).minutes.do(poll_telegram_commands)
     schedule.every(5).minutes.do(check_balance_24_7)
-    # Daily summary at 4 PM ET
-    schedule.every().day.at("16:00").do(send_daily_summary)
+    # THE VAULT reports — weekly (Sunday) + monthly (1st). Backtest + summary
+    # + websocket health, all in one. No daily spam. Breaks alert instantly.
+    schedule.every().sunday.at("17:00").do(send_vault_weekly)
+    schedule.every().day.at("17:05").do(send_vault_monthly_if_first)
 
     while True:
         schedule.run_pending()

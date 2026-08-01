@@ -28,6 +28,35 @@ from auth import get_valid_token
 BASE_URL = "https://api.schwabapi.com/trader/v1"
 
 
+def _mark_ws_status(status: str, heartbeat: bool = False):
+    """
+    Write WebSocket health to the ledger so the bot's weekly report and health
+    check can read it. Safe — best-effort, never crashes the stream.
+    """
+    try:
+        from ledger import load_ledger, save_ledger
+        led = load_ledger()
+        led["ws_status"] = status
+        if heartbeat:
+            led["ws_last_heartbeat"] = time.time()
+        save_ledger(led)
+    except Exception:
+        pass  # health logging must never break the stream
+
+
+def _alert_ws_break(detail: str):
+    """Fire the instant Vault socket-break alert. Best-effort."""
+    try:
+        from bot import alert_websocket_break
+        alert_websocket_break(detail)
+    except Exception:
+        try:
+            from telegram import send_alert
+            send_alert(f"🔴 THE VAULT · SOCKET ALERT\ndetail · {detail}")
+        except Exception:
+            pass
+
+
 def get_streamer_info() -> dict:
     """
     Fetch the streamer connection details from the user preferences endpoint.
@@ -179,6 +208,7 @@ def handle_message(msg: str):
             for n in data["notify"]:
                 if "heartbeat" in n:
                     print(f"[STREAM] heartbeat {n['heartbeat']}")
+                    _mark_ws_status("connected", heartbeat=True)
                 else:
                     print(f"[STREAM] notify {json.dumps(n)[:200]}")
 
@@ -241,6 +271,7 @@ async def run_stream():
                 handle_message(sub_resp)
 
                 print("[STREAM] subscribed to ACCT_ACTIVITY — listening (log-only)")
+                _mark_ws_status("connected", heartbeat=True)
                 backoff = 2  # reset backoff after a successful connect
 
                 # 3. Listen forever, logging everything
@@ -249,6 +280,10 @@ async def run_stream():
 
         except Exception as ex:
             print(f"[STREAM] connection error: {ex}")
+            _mark_ws_status(f"dropped: {str(ex)[:60]}")
+            # Only alert on a real drop (not the very first connect attempt)
+            if backoff > 2:
+                _alert_ws_break(f"reconnecting, backoff {backoff}s")
             print(f"[STREAM] reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 120)  # exponential backoff, cap 120s

@@ -79,6 +79,7 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
             volume  = opt.get("totalVolume", 0)
             oi      = opt.get("openInterest", 0)
             premium = (bid + ask) / 2
+            iv      = opt.get("volatility", 0) or 0
 
             if premium < 0.05 or bid <= 0:
                 continue
@@ -86,6 +87,7 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
                 continue
 
             total_premium = premium * 100 * contracts
+            ann_yield     = (premium / underlying_price) * (365 / max(dte, 1)) * 100
             score         = (premium / underlying_price) * 100 + (volume * 0.01)
 
             if best is None or score > best["score"]:
@@ -93,6 +95,7 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
                     "type":             "covered_call",
                     "symbol":           symbol,
                     "option_symbol":    opt.get("symbol", ""),
+                    "opt_symbol":       opt.get("symbol", ""),
                     "strike":           strike,
                     "expiry":           expiry.split(":")[0],
                     "dte":              dte,
@@ -100,6 +103,10 @@ def find_best_covered_call(symbol: str, shares_owned: int) -> dict | None:
                     "ask":              ask,
                     "premium":          premium,
                     "total_premium":    total_premium,
+                    "total_prem":       round(total_premium, 2),
+                    "ann_yield":        round(ann_yield, 1),
+                    "iv":               iv,
+                    "delta":            round(abs(opt.get("delta", 0) or 0), 3),
                     "contracts":        contracts,
                     "underlying_price": underlying_price,
                     "score":            score,

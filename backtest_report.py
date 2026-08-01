@@ -1,9 +1,10 @@
 """
 WEEKLY/MONTHLY BACKTEST REPORT — full backtest + summary to Telegram.
 
-Runs the put-selling + ETF-call backtest on real EODHD data, computes full
-per-config expectancy, and sends the COMPLETE breakdown + summary to Telegram.
-Flags if the edge turns negative. Schedule weekly and monthly.
+Reports BOTH primary strategies (matching the live bot):
+  • COVERED CALLS (70% — buy stock + sell call, IV-filtered)
+  • CASH-SECURED PUTS (25% — sell put, IV-filtered)
+Real EODHD data, modeled premiums. Flags if either edge turns negative.
 
 Run:  python3 backtest_report.py WEEKLY   (or MONTHLY)
 """
@@ -20,30 +21,31 @@ TOKEN = "demo"
 SLIPPAGE = 0.02
 RISK_FREE = 0.045
 DTE = 5
-ETF_IV = 0.15
 
-# Put configs (same sweep as backtest_options_real)
+# Put configs (cash-secured)
 PUT_CONFIGS = [
-    ("d15 iv35", 0.15, 0.35, 0.50, 2.0),
-    ("d20 iv35", 0.20, 0.35, 0.50, 2.0),
-    ("d30 iv35", 0.30, 0.35, 0.50, 2.0),
-    ("d20 iv50", 0.20, 0.50, 0.50, 2.0),  # the positive live config
-    ("d20 hold", 0.20, 0.35, 0.99, 9.0),
+    ("PUT d20 iv35", 0.20, 0.35, "put"),
+    ("PUT d20 iv50", 0.20, 0.50, "put"),
+]
+# Covered call configs
+CALL_CONFIGS = [
+    ("CC 2%OTM iv35", 1.02, 0.35, "call"),
+    ("CC 2%OTM iv50", 1.02, 0.50, "call"),
+    ("CC 3%OTM iv50", 1.03, 0.50, "call"),
 ]
 
 def fetch(t):
     try:
         r = requests.get(EODHD.format(t), params={"api_token":TOKEN,"interval":"5m","fmt":"json"}, timeout=20)
-        r.raise_for_status(); d = r.json()
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+        r.raise_for_status(); d=r.json()
+        return d if isinstance(d,list) else []
+    except Exception: return []
 
 def to_daily(bars):
-    days = {}
+    days={}
     for b in bars:
         if b.get("close") is None: continue
-        days[b.get("datetime","")[:10]] = b["close"]
+        days[b.get("datetime","")[:10]]=b["close"]
     return [days[d] for d in sorted(days)]
 
 def _ncdf(x): return 0.5*(1+math.erf(x/math.sqrt(2)))
@@ -73,34 +75,42 @@ def expectancy(rets):
     wr=len(wins)/n; aw=sum(wins)/len(wins) if wins else 0; al=sum(losses)/len(losses) if losses else 0
     return {"n":n,"wr":wr*100,"exp":wr*aw+(1-wr)*al,"total":sum(rets)}
 
-def backtest_puts(closes, dt, iv, ep, sm):
+def bt_put(closes,td,iv):
     if len(closes)<30: return []
     T=DTE/365; rets=[]; i=20
     while i<len(closes)-DTE:
-        S=closes[i]; K=strike_for_delta(S,dt,T,RISK_FREE,iv); p0=bs_put(S,K,T,RISK_FREE,iv)
+        S=closes[i]; K=strike_for_delta(S,td,T,RISK_FREE,iv); p0=bs_put(S,K,T,RISK_FREE,iv)
         if p0<=0.02: i+=DTE; continue
         exited=False
         for d in range(1,DTE+1):
             if i+d>=len(closes): break
             S2=closes[i+d]; Tl=max((DTE-d)/365,1e-4); p=bs_put(S2,K,Tl,RISK_FREE,iv)
-            if p<=p0*(1-ep): rets.append((p0-p)/K*100-SLIPPAGE); exited=True; i+=d; break
-            if p>=p0*sm: rets.append((p0-p)/K*100-SLIPPAGE); exited=True; i+=d; break
+            if p<=p0*0.5: rets.append((p0-p)/K*100-SLIPPAGE); exited=True; i+=d; break
+            if p>=p0*2: rets.append((p0-p)/K*100-SLIPPAGE); exited=True; i+=d; break
         if not exited:
             Sf=closes[min(i+DTE,len(closes)-1)]; pf=max(0,K-Sf)
             rets.append((p0-pf)/K*100-SLIPPAGE); i+=DTE
     return rets
 
-def backtest_etf_calls(closes):
+def bt_call(closes,otm,iv):
     if len(closes)<30: return []
     T=DTE/365; rets=[]; i=20
     while i<len(closes)-DTE:
-        S=closes[i]; K=round(S*1.02); p0=bs_call(S,K,T,RISK_FREE,ETF_IV)
+        S=closes[i]; K=round(S*otm); p0=bs_call(S,K,T,RISK_FREE,iv)
         if p0<=0.02: i+=DTE; continue
-        Sf=closes[min(i+DTE,len(closes)-1)]
-        rets.append(p0/S*100 - max(0,(Sf-K))/S*100 - SLIPPAGE); i+=DTE
+        exited=False
+        for d in range(1,DTE+1):
+            if i+d>=len(closes): break
+            S2=closes[i+d]; Tl=max((DTE-d)/365,1e-4); p=bs_call(S2,K,Tl,RISK_FREE,iv)
+            if p<=p0*0.5: rets.append((p0-p)/S*100-SLIPPAGE); exited=True; i+=d; break
+            if p>=p0*2: rets.append((p0-p)/S*100-SLIPPAGE); exited=True; i+=d; break
+        if not exited:
+            Sf=closes[min(i+DTE,len(closes)-1)]
+            rets.append(p0/S*100 - max(0,(Sf-K))/S*100 - SLIPPAGE); i+=DTE
     return rets
 
-def run(period="WEEKLY"):
+def build_report_lines(period="WEEKLY"):
+    """Build backtest report lines (Vault format) — returns list of strings."""
     tickers=["AAPL.US","TSLA.US","AMZN.US","VTI.US"]
     allc={}
     for t in tickers:
@@ -108,50 +118,50 @@ def run(period="WEEKLY"):
         if len(c)>=30: allc[t]=c
         time.sleep(0.4)
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    lines = [f"[ {period} BACKTEST + SUMMARY ] {ts}", ""]
-    lines.append("── PUT SELLING (real data, modeled premium) ──")
-
-    best = None
-    for (label, dt, iv, ep, sm) in PUT_CONFIGS:
+    lines=[]
+    lines.append("CALLS ·")
+    call_best=None
+    for (label,otm,iv,_) in CALL_CONFIGS:
         rets=[]
-        for t,c in allc.items(): rets += backtest_puts(c, dt, iv, ep, sm)
-        e = expectancy(rets)
+        for t,c in allc.items(): rets+=bt_call(c,otm,iv)
+        e=expectancy(rets)
         if e:
-            mark = "✅" if e["exp"]>0 else "⚠️"
-            star = " ⭐LIVE" if label=="d20 iv50" else ""
-            lines.append(f"{mark} {label}: {e['n']}tr {e['wr']:.0f}%win exp {e['exp']:+.3f}%{star}")
-            if best is None or e["exp"]>best[1]:
-                best = (label, e["exp"])
+            mk="✅" if e["exp"]>0 else "⚠️"
+            star="⭐" if label=="CC 2%OTM iv50" else ""
+            lines.append(f" {mk} {label} {e['exp']:+.3f}%{star}")
+            if call_best is None or e["exp"]>call_best[1]: call_best=(label,e["exp"])
+    lines.append("PUTS ·")
+    put_best=None
+    for (label,td,iv,_) in PUT_CONFIGS:
+        rets=[]
+        for t,c in allc.items(): rets+=bt_put(c,td,iv)
+        e=expectancy(rets)
+        if e:
+            mk="✅" if e["exp"]>0 else "⚠️"
+            star="⭐" if label=="PUT d20 iv50" else ""
+            lines.append(f" {mk} {label} {e['exp']:+.3f}%{star}")
+            if put_best is None or e["exp"]>put_best[1]: put_best=(label,e["exp"])
 
-    # ETF calls
-    er=[]
-    for t,c in allc.items():
-        if t.startswith(("VTI","SPY","QQQ","VOO")): er+=backtest_etf_calls(c)
-    if er:
-        e=expectancy(er)
-        mark = "✅" if e["exp"]>0 else "⚠️"
-        lines.append("")
-        lines.append("── ETF COVERED CALLS ──")
-        lines.append(f"{mark} {e['n']}tr {e['wr']:.0f}%win exp {e['exp']:+.3f}%")
+    neg = (call_best and call_best[1]<=0) and (put_best and put_best[1]<=0)
+    lines.append(f"EDGE    · {'⚠️ negative — review' if neg else 'holding'}")
+    lines.append("🔒 modeled · confirm live")
+    return lines
 
-    # SUMMARY
-    lines.append("")
-    lines.append("── SUMMARY ──")
-    if best:
-        if best[1] > 0:
-            lines.append(f"✅ Best: {best[0]} at {best[1]:+.3f}%/trade")
-            lines.append("Edge holding. Run small, track real vs modeled.")
-        else:
-            lines.append(f"⚠️ Best: {best[0]} at {best[1]:+.3f}% — ALL NEGATIVE")
-            lines.append("Edge gone. Pause new puts, review IV filter.")
-    lines.append("")
-    lines.append("(Premiums modeled — confirm real premiums live.)")
 
-    msg = "\n".join(lines)
+def run(period="WEEKLY"):
+    """Standalone run — prints and sends the backtest report."""
+    from datetime import datetime, timezone
+    try:
+        from telegram import send_alert
+    except Exception:
+        def send_alert(m): print(m)
+    ts=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines=[f"🔐 THE VAULT · {period} BACKTEST", "▪️▪️▪️▪️▪️▪️▪️▪️▪️▪️", ts, ""]
+    lines += build_report_lines(period)
+    msg="\n".join(lines)
     send_alert(msg)
     print(msg)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     import sys
     run(sys.argv[1] if len(sys.argv)>1 else "WEEKLY")
